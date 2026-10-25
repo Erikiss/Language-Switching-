@@ -60,6 +60,17 @@ Mindesteffektgrenze nicht ausschließt, gilt als „offen“, nicht als Nullbefu
 11. B(x)(λ) für State 2143 bei 98k/99k: Vorzeichen des Nutzens bei λ_rel = 3 gegenüber
     λ = 0 (zweiseitig; Erwartung offen).
 
+12. Domänen-Kompass (Stufe I): Domänenprofil der State-2143-Richtung `ent` am Zustand
+    h₂₀₇ (Logit-Lens-Proxy, z-Werte gegen 32 Zufallsrichtungen); Bericht, ob `law` das
+    höchste z erhält (Atlas-Erwartung). Kein Test, Dokumentation.
+13. Richtung × Domäne: T(K=8, C1) und B(x) für `dom_culture_politics` (nach
+    Gegensteuern gegen `dom_law`) vs. `dom_law` vs. `lang_dom`, getrennt nach
+    Familiendomäne (Kultur/Politik F13–F16, Jura F17–F18, Alltag F01–F12);
+    vorab festgelegter Kontrast: B(dom_culture_politics) − B(lang_dom) auf
+    Kultur/Politik-Familien, Familien-Bootstrap, Mindesteffekt 0,05 nats.
+14. Head-Arm: B bei Steering am schlechtesten Head (Auswahl auf Entwicklungsfamilien
+    eingefroren) vs. am Residualstrom bei gleicher relativer Dosis; zweiseitig.
+
 ## 4. Ausschlussregeln (vor Sichtung der Modellwerte)
 
 - Variante ausgeschlossen, wenn Ziel-ID oder Tail-Token-IDs vom K=0-Fall abweichen

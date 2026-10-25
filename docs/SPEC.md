@@ -276,6 +276,38 @@ lam=0 decreases g monotonically and respects d_max; with a large lam the endpoin
 lambda_sweep returns one Trajectory per lambda; feature_lambda_correlation on a synthetic
 SAE (TopKSAE.from_tensors) returns finite rho; endpoint_effects B=0 for the unperturbed state.
 
+## `lsne/atlas.py`  (domain compass / susceptibility-atlas proxy, DESIGN §4.7)
+
+Data: `data/lexicon/domains.json` = {"domains": {"law": {"E": [...], "D": [...]}, "politics": ..., "economy": ..., "culture_values": ..., "family": ..., "religion": ..., "wellbeing": ..., "science": ..., "everyday": ...}, "templates": {"E": ["The discussion was about {w}.", ...], "D": ["Die Diskussion handelte von {w}.", ...]}} with ≥ 40 words per domain and language.
+```python
+def load_domains(path=None) -> dict
+def domain_token_ids(tokenizer, domains: dict, lang: str="E") -> dict[str, list[int]]   # single-token words with leading space only (report dropped words in meta)
+def keyword_readout(mb, h: Tensor[d], direction: Tensor[d]|None=None, eps: float=0.05, top_k: int=50) -> dict(promoted: list[(token, delta_logit)], suppressed: ...)
+    # logit lens of h + make_dose_delta(h, direction, eps) minus logit lens of h; direction None -> logit lens of h itself
+def domain_profile(mb, h, direction=None, eps=0.05, domains_ids: dict=None, n_random: int=32, seed: int=0) -> DataFrame(domain, mass, mass_random_mean, mass_random_sd, z)
+    # mass = sum of softmax probability mass (lens) on the domain's token ids after the step minus before; z against random directions of the same dose
+def sae_feature_domain_profile(mb, sae, feature_idx: int, domains_ids) -> DataFrame   # unembedding projection of W_dec[feature] onto domain ids (mean logit per domain, z vs all tokens)
+def domain_axis(mb, tokenizer, domain: str, site: HookSite, contrast: str|list[str]="everyday", lang: str="E", n_templates: int|None=None) -> Direction   # name "dom_<domain>": diff-of-means of last-token residuals on template sentences filled with domain words vs contrast domain words (lsne.directions.diff_of_means, denoise_pcs=1)
+def counter_steer(h: Tensor[d], remove: Direction|Tensor, then: Direction|Tensor, eps_remove: float|None, eps_then: float) -> Tensor[d]
+    # 1) project out the `remove` component of (h - mean) if eps_remove is None, else subtract eps_remove*RMS(h)*unit(remove); 2) add make_dose_delta(h, then, eps_then)
+def load_atlas_extraction(path: str) -> list[dict(cluster_id, keywords: list[str], raw: str)]   # tolerant parser: blocks separated by blank lines; lines of the form "<id>: kw1, kw2, ..." or "- kw"; returns [] if the file does not exist
+def atlas_domain_overlap(clusters, domains) -> DataFrame(cluster_id, domain, n_overlap, jaccard)
+```
+
+## `lsne/heads.py`  (per-head attribution and head-level steering, DESIGN §4.7)
+
+```python
+def head_slices(mb, layer: int) -> list[slice]                    # slices of the dense (W_O) input per head
+def head_contributions(mb, input_ids, layer: int) -> Tensor[H, T, d]   # per-head direct contribution to the residual at this layer: x_h @ W_O[:, slice_h].T, captured with a forward pre-hook on layers[layer].attention.dense (verify against the attention output: sum over heads + bias == attention output)
+def head_direct_logit_effect(mb, input_ids, layer: int, target_id: int, position: int=-1) -> Tensor[H]   # lens of each head's contribution at `position` projected on the target logit (logit lens through final LN linearised at the residual: use lsne.model.logit_lens on (h + c_h) - logit_lens(h))
+def ablate_heads(mb, layer: int, heads: list[int], mode: str="mean", mean_source: Tensor|None=None) -> context manager   # zero or mean-ablate the chosen head slices at the dense input
+def head_ablation_effects(mb, variants: list, layer_grid: list[int], target_id_attr: str="target_id", mode="mean") -> DataFrame(family_id, K, C, layer, head, logp_base, logp_ablated, delta)
+def worst_head(effects: DataFrame, families_weak: list[str], families_stable: list[str]) -> dict(layer, head, score, table)   # score = mean delta on weak families - mean delta on stable families (largest loss when ablated on weak families)
+class HeadInjector: context manager adding delta (Tensor[dh] in head space or Tensor[d] in residual space mapped through the pseudo-inverse of W_O slice) to head h's dense input at positions
+def steer_at_head(mb, input_ids, layer: int, head: int, direction: Tensor[d], eps: float, position: int) -> Tensor[V]   # last-position logits with the residual-space direction applied through head h (least-squares pre-image through W_O slice), dose relative to RMS of the head's contribution
+```
+Tests (pythia-14m): head_contributions sum (+ dense bias) equals the attention module output (atol 1e-4); ablating all heads equals replacing the attention output by its bias (zero mode); head_direct_logit_effect returns H finite values; ablate_heads context restores the model afterwards; steer_at_head changes only the last-position logits; worst_head picks the head with the largest planted difference on a synthetic effects table.
+
 ## `lsne/stats.py`
 
 `cluster_bootstrap(df, value_col, cluster_col, n_boot=10000, seed=0, stat=np.mean) -> dict(mean, ci_low, ci_high, n_clusters)`;

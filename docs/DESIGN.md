@@ -331,6 +331,39 @@ Sprachwechsel bleibt das Mittel: Die Zielklassen-Dichte stammt aus echten
 Sprachwechselzuständen, und K, C modulieren deren Umschließung (§4.4), also das λ, das
 nötig ist, um sie zu erreichen.
 
+### 4.7 Wohin steuern? Domänen-Kompass, Suszeptibilitätsatlas, schlechtester Head
+
+Präzisierung des Auftraggebers (25.10.2026, vierte Rückmeldung): Die Atlas-Abfrage
+(Schlüsselwörter einzelner Tokens im Pythia-Suszeptibilitätsatlas) hatte State 2143 in die
+Nähe von **Jura** (Recht) gelegt. Soll der Kontext in Richtung *mehr* Sprachwechsel
+bewegt werden, muss die Richtung **weg von Jura und hin zu Kultur/Politik** zeigen,
+gegebenenfalls erst gegensteuern (Jura-Anteil entfernen), dann steuern. Der
+ChronoCulture-Benchmark (Infografik, 10 360 Zeitpaare aus 72 Ländern, WVS/ISSP) zeigt,
+dass Sprachmodelle genau dort am schwächsten sind: kulturelle Dynamik in Politik und
+Wirtschaft (Demokratie 17 %, Ungleichheit 20 % Genauigkeit), stabile Einstellungen
+(Familie, Wohlbefinden) deutlich besser (≈ 40 %), nicht-westliche Regionen doppelt so
+schlecht. Paradigma: Modellqualität verbessert man am schlechtesten Head. Wo das Modell am
+schwächsten ist, hat lineares Steuern die höchste Treffsicherheit.
+
+Umsetzung (Module `lsne.atlas`, `lsne.heads`; Daten `data/lexicon/domains.json`):
+
+| Baustein | Umsetzung |
+|---|---|
+| Domänen-Lexika | Schlüsselwortbänke E/D für `law` (Jura), `politics`, `economy`, `culture_values`, `family`, `religion`, `wellbeing`, `science`, `everyday`; nur Ein-Token-Wörter (mit führendem Leerzeichen) werden für Projektionen verwendet |
+| Suszeptibilitäts-Abfrage (lokaler Proxy) | Für einen Zustand h oder eine Richtung d: beförderte/unterdrückte Tokens unter Logit-Lens (h + ε·d vs. h) und Unembedding-Projektion der SAE-Decoderzeilen; Aggregation zu einem **Domänenprofil** (Masse pro Domäne, z-standardisiert gegen Zufallsrichtungen) |
+| Atlas-Import | Loader für die gespeicherte Atlas-Extraktion des Auftraggebers (D7, `data/atlas/*.txt`): Cluster-Schlüsselwörter werden eingelesen und mit demselben Domänenprofil verglichen; ohne Datei läuft nur der Proxy |
+| Domänenachsen | `dom_law`, `dom_culture_politics` usw.: Difference-of-Means der Residuen auf Domänensätzen (gleiche Satzschablonen, nur Domänenwörter variieren) pro Layer; **Gegensteuern** = Projektion des Jura-Anteils aus h, dann Schritt entlang `dom_culture_politics`; als λ-Dynamik (§4.6) mit Zielklassen-Dichte aus Kultur/Politik-Zuständen |
+| Schlechtester Head | Head-weise Zerlegung der Attention-Ausgabe (W_O-Slices); pro Head: direkter Beitrag zum Ziel-Logit, Ablations-Effekt (Mean-Ablation) auf T (Sprachwechsel-Effekt) und auf B; „schlechtester Head“ = größter Verlust auf Kultur/Politik-Familien relativ zu stabilen Familien; Steering am Head-Ausgang statt am Residualstrom als eigener Arm |
+| Stimuli | Neue Familien F13–F18: Demokratie, Ungleichheit, Werte/Geschlechterrollen, Religion/Migration (ChronoCulture-Schwachdomänen) sowie zwei Jura-Familien (Nähe zu State 2143) als Domänenkontrolle; bestehende Familien = Alltag/stabil |
+
+Vorab definierte Vergleiche: (a) Domänenprofil der State-2143-Richtung `ent` und des
+Zustands h₂₀₇ (erwartet laut Atlas: Jura-nah); (b) T(K) und B(x) für `dom_culture_politics`
+vs. `dom_law` vs. `lang_dom` vs. Zufall, getrennt nach Familiendomäne; (c) Interaktion
+Richtung × Domäne der Familie (ist Steuern in der Schwachdomäne treffsicherer?);
+(d) Head-Arm: Steering am schlechtesten Head vs. am Residualstrom bei gleicher Dosis.
+Alles explorativ, bis die Bestätigung auf Testfamilien läuft; der Atlas bleibt die
+Instanz für die Richtungswahl, wenn Befunde mehrdeutig sind.
+
 ### 4.3 Dossier-Kernkontraste (Frage 2 und Replikation)
 
 T(K, C), B(x) pro Richtung, I(K, C). Wechselwirkung K × C, Transfer `ent` von
@@ -407,6 +440,7 @@ Shard schreibt eigene Ergebnisdateien, `lsne.cli merge` fügt zusammen.
 | D Nicht-Gleichgewicht | D1–D9, Phasendiagramme | `03_nonequilibrium` | Primärer Endpunkt λ (Präregistrierung) |
 | G Geometrie + Trajektorie | G0–G3 (lokale Geometrie unter Sprachwechsel), T1–T5 (Trajektorie) | `06_geometry_trajectory` | G0 muss bestehen, sonst keine Interpretation; T3 entscheidet über die Steering-Lesart |
 | H λ-Dynamik | Alg. 1 im Aktivierungsraum, λ-Sweep, SAE-Features und Pfadgeometrie vs. λ, B(x)(λ) | `07_lambda_dynamics` | Korrelationen mit λ auf Entwicklungsfamilien gefunden, auf Testfamilien bestätigt |
+| I Kompass + Heads | Domänenprofile (Atlas-Proxy/-Import), Domänenachsen mit Gegensteuern, Head-Attribution, Steering am schlechtesten Head | `08_compass_heads` | Domänenprofil von `ent` dokumentiert; Richtung × Domäne-Interaktion auf Entwicklungsfamilien |
 | E Tensornetz | lineare Antwort, TNCO vs. opt_einsum, Nichtlinearität | `04_tn_linear_response` | Berichtet Kosten/Laufzeit/Fehler; kein Hypothesentest |
 | F Skala & Verlauf | 410M/1B/1.4B, Checkpoint-Sweep; BF16-Vergleich | `05_scale_and_checkpoints` | Shards, Drive-Export |
 
