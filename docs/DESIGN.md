@@ -485,6 +485,17 @@ im Quellmodell operationalisiert und gemessen wurde; dass ein 2018–2022-Modell
 Fork 2016 kennt; dass eine Transplantation ohne Alignment-Güte über der Permutationsnull
 interpretierbar ist.
 
+**Machbarkeitsergebnis (25.10.2026, `docs/BLOCKGPT_FEASIBILITY.md`):** Es existieren
+keine BlockGPT-Gewichte und kein offizieller Code (von den BlockScan-Autoren unabhängig
+bestätigt); die beiden inoffiziellen Repositories sind unvollständig und ohne Daten.
+Empfohlener Weg: ein eigenes BlockGPT-artiges Causal-LM (8 Layer, d = 512, Kontext 512)
+auf den frei verfügbaren Xatu-Parquet-Traces (ethPandaOps, CC BY 4.0, 2016 vollständig
+abgedeckt, kein Node nötig) trainieren; „Teilen“-Labels aus den Transfer-Tabellen
+(fan_out/fan_in pro Transaktion, DAO/WithdrawDAO-Beteiligung, Fork-Block 1 920 000)
+ableiten und die Richtung im Quellmodell daraus bestimmen. Die Transplantationsmaschinerie
+ist mit Stand-in-Quellmodellen validiert (20 Tests, adversarielle Prüfung, eine
+Fix-Runde).
+
 ### 4.3 Dossier-Kernkontraste (Frage 2 und Replikation)
 
 T(K, C), B(x) pro Richtung, I(K, C). Wechselwirkung K × C, Transfer `ent` von
