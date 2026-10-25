@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 import re
 import warnings
+import zlib
 from typing import Callable, Optional, Sequence
 
 import numpy as np
@@ -432,8 +433,14 @@ TAU_BOUNDS = (0.5, 1000.0)
 B_MIN = 0.05
 #: Significance level of the F-test "exponential response vs. constant" for an identifiable tau.
 FIT_ALPHA = 0.05
-_FIT_KEYS = ("a", "b", "tau", "tau_raw", "b_se", "r2", "rss", "rss_const", "f_stat", "f_pvalue", "n", "n_eff",
-             "tau_censored", "identifiable", "reason")
+#: Monte-Carlo null series behind the window-calibrated F-test p-value (resolution 1/200).
+N_NULL_F = 199
+#: Default number of between-sample bootstrap resamples of :func:`relaxation`.
+N_BOOT_RELAX = 200
+_FIT_KEYS = ("a", "b", "tau", "tau_raw", "b_se", "b_se_hac", "r2", "rss", "rss_const", "f_stat", "f_pvalue",
+             "f_pvalue_iid", "n", "n_eff", "vif", "n_null", "tau_censored", "identifiable", "criterion", "reason")
+_F_NULL_CACHE: dict = {}
+_F_NULL_CACHE_MAX = 64
 
 
 def _relax_model(t, a, b, tau, t_on):
@@ -441,11 +448,109 @@ def _relax_model(t, a, b, tau, t_on):
 
 
 def _fit_result(**kw) -> dict:
-    out = dict(a=np.nan, b=np.nan, tau=np.nan, tau_raw=np.nan, b_se=np.nan, r2=np.nan, rss=np.nan,
-               rss_const=np.nan, f_stat=np.nan, f_pvalue=np.nan, n=0, n_eff=0.0, tau_censored=False,
-               identifiable=False, reason="")
+    out = dict(a=np.nan, b=np.nan, tau=np.nan, tau_raw=np.nan, b_se=np.nan, b_se_hac=np.nan, r2=np.nan, rss=np.nan,
+               rss_const=np.nan, f_stat=np.nan, f_pvalue=np.nan, f_pvalue_iid=np.nan, n=0, n_eff=0.0, vif=np.nan,
+               n_null=0, tau_censored=False, identifiable=False, criterion="series", reason="")
     out.update(kw)
     return out
+
+
+def _fit_curve(y: np.ndarray, tt: np.ndarray, t_on: int):
+    """Bounded 3-parameter least-squares fit of ``y(tt)``; ``(popt, pcov)`` or ``None``."""
+    tau0 = float(np.clip(max(1.0, (tt[-1] - tt[0]) / 4.0), *TAU_BOUNDS))
+    p0 = [float(y[0]), float(y[-1] - y[0]), tau0]
+    lo = [-np.inf, -np.inf, TAU_BOUNDS[0]]
+    hi = [np.inf, np.inf, TAU_BOUNDS[1]]
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            popt, pcov = optimize.curve_fit(lambda x, a, b, tau: _relax_model(x, a, b, tau, t_on),
+                                            tt, y, p0=p0, bounds=(lo, hi), maxfev=2000)
+    except (RuntimeError, ValueError, TypeError, optimize.OptimizeWarning):
+        return None
+    if not np.all(np.isfinite(popt)):
+        return None
+    return popt, pcov
+
+
+def _f_iid(rss: float, rss_const: float, n: int) -> float:
+    """F statistic of the two extra parameters (b, tau) against the constant model with
+    the plain degrees of freedom ``(2, n - 3)``; ``inf`` for a perfect fit."""
+    if rss_const <= 0 or n <= 3:
+        return float("nan")
+    if rss <= 0.0:
+        return float("inf")
+    return float(((rss_const - rss) / 2.0) / (rss / (n - 3.0)))
+
+
+def ma_correlation(tt: np.ndarray, window: int) -> np.ndarray:
+    """Correlation matrix of a trailing-window mean of width ``window`` of white noise
+    sampled at the (integer) times ``tt``: triangular, ``max(0, 1 - |t_i - t_j| / window)``
+    (the identity for ``window <= 1``)."""
+    tt = np.asarray(tt, dtype=np.float64)
+    w = max(1, int(window))
+    return np.clip(1.0 - np.abs(tt[:, None] - tt[None, :]) / w, 0.0, None)
+
+
+def f_null_distribution(tt: np.ndarray, t_on: int, window: int, n_null: int = N_NULL_F) -> np.ndarray:
+    """Sorted Monte-Carlo null distribution of the F statistic of :func:`fit_relaxation`
+    on the time grid ``tt`` (the points ``>= t_on``) for Gaussian noise with the
+    autocorrelation of a trailing-window mean of width ``window`` (:func:`ma_correlation`).
+
+    The statistic is location and scale free, so the null depends only on the grid, the
+    window and ``t_on``; it is generated with a seed derived from that key and cached
+    (:data:`N_NULL_F` series, one bounded 3-parameter fit each).  It calibrates the test
+    for both the autocorrelation and the free time constant (a smooth noise excursion
+    can always be matched by some ``tau``), which a fixed-design correction of the
+    degrees of freedom does not."""
+    tt = np.asarray(tt, dtype=np.float64)
+    w = max(1, int(window))
+    rel = tuple(np.round(tt - float(t_on), 6).tolist())
+    key = (w, int(n_null), rel)
+    cached = _F_NULL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    seed = zlib.crc32(repr(key).encode("utf-8"))
+    rng = np.random.default_rng(seed)
+    t_min, t_max = int(np.floor(tt.min())), int(np.ceil(tt.max()))
+    span = t_max - t_min + 1
+    idx = np.clip(np.round(tt - t_min).astype(int), 0, span - 1)
+    n = tt.shape[0]
+    out = np.zeros(int(n_null))
+    for i in range(int(n_null)):
+        z = rng.standard_normal(span + w - 1)
+        ma = np.convolve(z, np.ones(w) / w, mode="valid")        # exact triangular MA(w) correlation
+        y = ma[idx]
+        fit = _fit_curve(y, tt, t_on)
+        if fit is None:
+            continue                                               # counted as F = 0 (no evidence)
+        a, b, tau = (float(v) for v in fit[0])
+        rss = float(np.sum((y - _relax_model(tt, a, b, tau, t_on)) ** 2))
+        out[i] = _f_iid(rss, float(np.sum((y - y.mean()) ** 2)), n)
+    out = np.sort(out)
+    if len(_F_NULL_CACHE) >= _F_NULL_CACHE_MAX:
+        _F_NULL_CACHE.clear()
+    _F_NULL_CACHE[key] = out
+    return out
+
+
+def _sandwich(tt: np.ndarray, b: float, tau: float, t_on: int, R: np.ndarray, sigma2: float) -> tuple[float, float]:
+    """``(vif, b_se_hac)``: variance inflation of the two response directions of the
+    fitted model under the error correlation ``R`` (``tr(P_extra R) / rank``, 1 for iid
+    noise, up to ``window`` for a smooth response) and the sandwich standard error of
+    ``b`` (``sigma2 * (J'J)^+ J'RJ (J'J)^+``)."""
+    x = tt - float(t_on)
+    e = np.exp(-x / tau)
+    J = np.stack([np.ones_like(x), 1.0 - e, -b * x / tau ** 2 * e], axis=1)
+    JtJ_inv = np.linalg.pinv(J.T @ J, rcond=1e-10)
+    P_full = J @ JtJ_inv @ J.T
+    n = tt.shape[0]
+    P = P_full - np.full((n, n), 1.0 / n)
+    rank = max(1, int(round(float(np.trace(P)))))
+    vif = float(np.trace(P @ R)) / rank
+    V = sigma2 * JtJ_inv @ (J.T @ R @ J) @ JtJ_inv
+    se = float(np.sqrt(V[1, 1])) if np.isfinite(V[1, 1]) and V[1, 1] >= 0 else float("nan")
+    return (vif if np.isfinite(vif) and vif > 0 else 1.0), se
 
 
 def fit_relaxation(fD_t: np.ndarray, t_on: int, t: Optional[np.ndarray] = None, b_min: float = B_MIN,
@@ -461,21 +566,31 @@ def fit_relaxation(fD_t: np.ndarray, t_on: int, t: Optional[np.ndarray] = None, 
 
     * the amplitude is not negligible: ``|b| >= b_min`` (default :data:`B_MIN`), and
     * the fit improves on the constant model ``y = mean(y)``: F-test of the two extra
-      parameters with ``f_pvalue <= alpha`` (default :data:`FIT_ALPHA`).  The residual
-      degrees of freedom use the effective sample size ``n_eff = n / window`` because a
-      running-window fraction (``window`` = the label window of :func:`relaxation`) is
-      autocorrelated over ``window`` steps; ``window=1`` is the plain iid test.
+      parameters with ``f_pvalue <= alpha`` (default :data:`FIT_ALPHA`).  The F statistic
+      keeps its plain degrees of freedom ``(2, n - 3)``; for ``window > 1`` (the label
+      window of :func:`relaxation`, over which a running-window fraction is
+      autocorrelated) its p-value is calibrated against the Monte-Carlo null of the same
+      statistic on the same time grid under triangular MA(``window``) noise
+      (:func:`f_null_distribution`; ``f_pvalue_iid`` keeps the uncorrected value).  The
+      residual degrees of freedom are *not* shrunk by the window: the mean over samples
+      of a running-window fraction is not ``window`` times fewer observations, and a
+      shrunk F-test with three residual degrees of freedom rejects real, strong responses.
 
     ``tau_censored`` flags a fit at either bound of ``TAU_BOUNDS`` (upper bound: no
     relaxation within the window, lower bound: a step within one token); such a ``tau``
     is kept but should be masked in phase diagrams.  ``b_se`` is the standard error of
-    ``b`` from the fit covariance (NaN when the covariance is singular), ``r2`` the
-    coefficient of determination, ``rss`` / ``rss_const`` the residual sums of squares of
-    the fit and of the constant model, ``reason`` why ``tau`` is NaN (empty if it is not).
+    ``b`` from the fit covariance (NaN when the covariance is singular), ``b_se_hac`` the
+    sandwich standard error under the MA(``window``) correlation, ``vif`` the variance
+    inflation of the response directions under that correlation (1 for ``window=1``) and
+    ``n_eff = n / vif`` the corresponding effective sample size (reported, not used as
+    degrees of freedom), ``n_null`` the number of Monte-Carlo null series (0 for the iid
+    test), ``r2`` the coefficient of determination, ``rss`` / ``rss_const`` the residual
+    sums of squares of the fit and of the constant model, ``criterion`` the gate applied
+    (``"series"`` here; :func:`relaxation` adds the between-sample bootstrap), ``reason``
+    why ``tau`` is NaN (empty if it is not).
 
-    Returns ``dict(a, b, tau, tau_raw, b_se, r2, rss, rss_const, f_stat, f_pvalue, n,
-    n_eff, tau_censored, identifiable, reason)`` with ``a``, ``b``, ``tau`` NaN if the
-    series is constant, has fewer than four finite points, or the fit fails."""
+    Returns a dict with the keys ``_FIT_KEYS`` (``a``, ``b``, ``tau`` NaN if the series is
+    constant, has fewer than four finite points, or the fit fails)."""
     y = np.asarray(fD_t, dtype=np.float64)
     tt = np.arange(y.shape[0], dtype=np.float64) if t is None else np.asarray(t, dtype=np.float64)
     m = (tt >= t_on) & np.isfinite(y)
@@ -485,36 +600,37 @@ def fit_relaxation(fD_t: np.ndarray, t_on: int, t: Optional[np.ndarray] = None, 
         return _fit_result(n=n, reason="fewer than four finite points")
     if np.ptp(y) == 0.0:
         return _fit_result(a=float(y[0]), b=0.0, n=n, reason="constant series")
-    tau0 = float(np.clip(max(1.0, (tt[-1] - tt[0]) / 4.0), *TAU_BOUNDS))
-    p0 = [float(y[0]), float(y[-1] - y[0]), tau0]
-    lo = [-np.inf, -np.inf, TAU_BOUNDS[0]]
-    hi = [np.inf, np.inf, TAU_BOUNDS[1]]
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            popt, pcov = optimize.curve_fit(lambda x, a, b, tau: _relax_model(x, a, b, tau, t_on),
-                                            tt, y, p0=p0, bounds=(lo, hi), maxfev=2000)
-    except (RuntimeError, ValueError, TypeError, optimize.OptimizeWarning):
+    fit = _fit_curve(y, tt, t_on)
+    if fit is None:
         return _fit_result(n=n, reason="fit failed")
+    popt, pcov = fit
     a, b, tau = (float(v) for v in popt)
-    if not (np.isfinite(tau) and np.isfinite(a) and np.isfinite(b)):
-        return _fit_result(n=n, reason="fit failed")
     resid = y - _relax_model(tt, a, b, tau, t_on)
     rss = float(np.sum(resid ** 2))
     rss_const = float(np.sum((y - y.mean()) ** 2))
     r2 = float(1.0 - rss / rss_const) if rss_const > 0 else 1.0
     b_se = float(np.sqrt(pcov[1, 1])) if (np.ndim(pcov) == 2 and np.isfinite(pcov[1, 1]) and pcov[1, 1] >= 0) else np.nan
     window = max(1, int(window))
-    n_eff = float(n) / window
-    df_resid = n_eff - 3.0
-    if df_resid > 0 and rss_const > 0:
-        if rss <= 0.0:
-            f_stat, f_p = float("inf"), 0.0
-        else:
-            f_stat = float(((rss_const - rss) / 2.0) / (rss / df_resid))
-            f_p = float(sps.f.sf(f_stat, 2, df_resid)) if f_stat > 0 else 1.0
+    df_resid = n - 3
+    f_stat = _f_iid(rss, rss_const, n)
+    if np.isfinite(f_stat):
+        f_p_iid = float(sps.f.sf(f_stat, 2, df_resid)) if f_stat > 0 else 1.0
+    elif f_stat == float("inf"):
+        f_p_iid = 0.0
     else:
-        f_stat, f_p = np.nan, np.nan
+        f_p_iid = np.nan
+    n_null = 0
+    if window > 1 and not np.isnan(f_stat):
+        null = f_null_distribution(tt, t_on, window)
+        n_null = int(null.shape[0])
+        f_p = float((1.0 + np.sum(null >= f_stat)) / (n_null + 1.0))
+    else:
+        f_p = f_p_iid
+    R = ma_correlation(tt, window)
+    sigma2 = rss / df_resid
+    with np.errstate(all="ignore"):
+        vif, b_se_hac = _sandwich(tt, b, tau, t_on, R, sigma2)
+    n_eff = float(n) / vif
     lo_t, hi_t = TAU_BOUNDS
     censored = bool(tau <= lo_t * (1.0 + 1e-6) or tau >= hi_t * (1.0 - 1e-6))
     reasons = []
@@ -522,16 +638,17 @@ def fit_relaxation(fD_t: np.ndarray, t_on: int, t: Optional[np.ndarray] = None, 
         reasons.append(f"|b|={abs(b):.3g} < b_min={float(b_min):.3g}")
     if not (np.isfinite(f_p) and f_p <= float(alpha)):
         reasons.append(f"F-test p={f_p:.3g} > alpha={float(alpha):.3g}" if np.isfinite(f_p)
-                       else "F-test undefined (too few effective points)")
+                       else "F-test undefined (too few points)")
     identifiable = not reasons
-    return _fit_result(a=a, b=b, tau=(tau if identifiable else np.nan), tau_raw=tau, b_se=b_se, r2=r2, rss=rss,
-                       rss_const=rss_const, f_stat=f_stat, f_pvalue=f_p, n=n, n_eff=n_eff, tau_censored=censored,
-                       identifiable=identifiable, reason="; ".join(reasons))
+    return _fit_result(a=a, b=b, tau=(tau if identifiable else np.nan), tau_raw=tau, b_se=b_se, b_se_hac=b_se_hac,
+                       r2=r2, rss=rss, rss_const=rss_const, f_stat=f_stat, f_pvalue=f_p, f_pvalue_iid=f_p_iid, n=n,
+                       n_eff=n_eff, vif=vif, n_null=n_null, tau_censored=censored, identifiable=identifiable,
+                       criterion="series", reason="; ".join(reasons))
 
 
 def relaxation(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, direction, eps: float,
                t_on: int = 16, n_new: int = 64, n_samples: int = 8, seed: int = 0,
-               temperature: float = 1.0, window: int = WINDOW, n_boot: int = 20,
+               temperature: float = 1.0, window: int = WINDOW, n_boot: int = N_BOOT_RELAX,
                b_min: float = B_MIN, alpha: float = FIT_ALPHA) -> dict:
     """D4: response of the German fraction to a dose quench 0 -> eps at generated token
     ``t_on`` (:func:`schedule_quench`).
@@ -540,17 +657,28 @@ def relaxation(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, directi
     window) at generated position ``t`` (NaN-aware); ``entropy_t`` the mean next-token
     entropy.  ``tau`` is the time constant of an exponential fit of ``fD_t[t_on:]`` to
     ``a + b (1 - exp(-(t - t_on)/tau))`` by :func:`fit_relaxation` (with the label
-    ``window`` as autocorrelation length): NaN unless the response is identifiable
-    (``|b| >= b_min`` and the fit beats the constant model), the raw value stays in
-    ``fit['tau_raw']`` and ``fit['tau_censored']`` flags a bound-saturated fit.
-    ``tau_ci`` is a (2.5, 97.5) percentile interval from ``n_boot`` bootstrap resamples
-    of the samples (identifiable taus only; NaN pair if fewer than two resamples yield
-    one); ``b_ci`` the same interval for the raw amplitude ``b`` of the resamples and
-    ``b_ci_excludes_zero`` whether it excludes 0 (NaN/False with fewer than two finite
-    resamples).
+    ``window`` as autocorrelation length).  It is NaN unless the response is
+    *identifiable*, which requires all of
 
-    Returns dict(fD_t, entropy_t, tau, tau_ci, tau_boot, b_boot, b_ci, b_ci_excludes_zero,
-    fit (see :func:`fit_relaxation`), t, t_on, eps, tokens, labels, fD_window, entropies,
+    * ``|b| >= b_min`` and the window-calibrated series F-test ``f_pvalue <= alpha``
+      (:func:`fit_relaxation`), and
+    * the between-sample bootstrap: ``b_ci``, the (2.5, 97.5) percentile interval of the
+      raw amplitude over ``n_boot`` resamples of the ``n_samples`` independent
+      generations, excludes 0 (``b_ci_excludes_zero``).  The samples are the independent
+      replicates of the experiment, so this gate is free of any assumption about the
+      autocorrelation of the labels within a sample; it is skipped (``criterion ==
+      "series"``) when it is uninformative (one sample, or fewer than two finite
+      resamples).
+
+    The raw value stays in ``fit['tau_raw']`` and ``fit['tau_censored']`` flags a
+    bound-saturated fit (mask those in phase diagrams).  ``fit`` is the
+    :func:`fit_relaxation` dict with ``identifiable`` / ``tau`` / ``reason`` /
+    ``criterion`` updated by the combined gate.  ``tau_ci`` is the (2.5, 97.5) percentile
+    interval of the resample taus that pass the series gate (NaN pair if fewer than two
+    do; ``n_tau_boot`` counts them), ``tau_boot`` / ``b_boot`` the per-resample values.
+
+    Returns dict(fD_t, entropy_t, tau, tau_ci, tau_boot, n_tau_boot, b_boot, b_ci,
+    b_ci_excludes_zero, criterion, fit, t, t_on, eps, tokens, labels, fD_window, entropies,
     eps_t, site, n_samples, seed).
     """
     vec = _as_vector(direction, mb)
@@ -585,8 +713,17 @@ def relaxation(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, directi
     b_ci = (float(np.percentile(b_fin, 2.5)), float(np.percentile(b_fin, 97.5))) if b_fin.size >= 2 \
         else (np.nan, np.nan)
     b_excl = bool(np.isfinite(b_ci).all() and (b_ci[0] > 0 or b_ci[1] < 0))
-    return dict(fD_t=fD_t, entropy_t=entropy_t, tau=fit["tau"], tau_ci=tau_ci, tau_boot=taus, b_boot=bs,
-                b_ci=b_ci, b_ci_excludes_zero=b_excl, fit=fit,
+    boot_informative = bool(B >= 2 and b_fin.size >= 2)
+    # combined gate: series test AND between-sample bootstrap (when informative)
+    reasons = [fit["reason"]] if fit["reason"] else []
+    if boot_informative and not b_excl:
+        reasons.append(f"bootstrap CI of b over samples includes 0 [{b_ci[0]:.3g}, {b_ci[1]:.3g}]")
+    identifiable = not reasons
+    fit = dict(fit, identifiable=identifiable, tau=(fit["tau_raw"] if identifiable else np.nan),
+               reason="; ".join(reasons), criterion=("series+bootstrap" if boot_informative else "series"))
+    return dict(fD_t=fD_t, entropy_t=entropy_t, tau=fit["tau"], tau_ci=tau_ci, tau_boot=taus,
+                n_tau_boot=int(finite.size), b_boot=bs, b_ci=b_ci, b_ci_excludes_zero=b_excl,
+                criterion=fit["criterion"], fit=fit,
                 t=t, t_on=t_on, eps=float(eps), tokens=res["tokens"].numpy(), labels=traj["labels"],
                 fD_window=fDw, entropies=ent, eps_t=res["eps"].numpy(), site=site.key,
                 n_samples=int(n_samples), seed=int(seed))

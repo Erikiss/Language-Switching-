@@ -100,7 +100,7 @@ class Limits:
     gen_n_steps: int = 8            # D3 ramp steps
     gen_tokens_per_step: int = 8    # D3 tokens per plateau
     gen_t_on: int = 16              # D4 quench time
-    n_boot_tau: int = 20            # D4 bootstrap resamples for tau
+    n_boot_tau: int = 200           # D4 between-sample bootstrap resamples (gate on b, CI of tau)
     ca_threshold: float = 0.5
     # stage E
     n_families_tn: int = 2          # family ids used in stage E

@@ -12,7 +12,14 @@ from lsne.atlas import (DEFAULT_DOMAINS_PATH, atlas_domain_overlap, counter_stee
                         domain_profile, domain_token_ids, keyword_readout, load_atlas_extraction, load_domains,
                         sae_feature_domain_profile)
 
-DOMAINS = ["law", "politics", "economy", "culture_values", "family", "religion", "wellbeing", "science", "everyday"]
+#: The nine compass domains of DESIGN section 4.7 (disjoint English word lists, >= 30
+#: single-token words each) ...
+CORE_DOMAINS = ["law", "politics", "economy", "culture_values", "family", "religion", "wellbeing", "science", "everyday"]
+#: ... plus the two RDX contrast poles of DESIGN section 4.8b (biomedical vocabulary
+#: overlaps `science` / `wellbeing` by design; rarer nomenclature -> fewer single-token words).
+POLE_DOMAINS = ["biomed_protein", "protein_misfolding"]
+#: Every domain of data/lexicon/domains.json, in file order (profiles have one row per domain).
+DOMAINS = CORE_DOMAINS + POLE_DOMAINS
 
 
 @pytest.fixture(scope="module")
@@ -47,12 +54,16 @@ def test_domains_file_schema(domains):
         ts = domains["templates"][lang]
         assert len(ts) >= 6
         assert all(t.count("{w}") == 1 and t.endswith("{w}") for t in ts)
-    # English word lists are disjoint across domains
+    # English word lists are disjoint across the compass domains (the section-4.8b poles
+    # share biomedical vocabulary with `science` / `wellbeing` by construction and are only
+    # required to be disjoint from each other)
     seen = {}
-    for name in DOMAINS:
+    for name in CORE_DOMAINS:
         for w in domains["domains"][name]["E"]:
             assert w not in seen, (w, name, seen.get(w))
             seen[w] = name
+    pole_words = [set(domains["domains"][n]["E"]) for n in POLE_DOMAINS]
+    assert not (pole_words[0] & pole_words[1]), pole_words[0] & pole_words[1]
     with pytest.raises(FileNotFoundError):
         load_domains("/nonexistent/domains.json")
 
@@ -72,9 +83,11 @@ def test_domain_token_ids_keeps_single_token_words(tok, ids_E):
     assert domain_token_ids(tok, {"domains": toy, "templates": {}}, "E")["x"] == out["x"]
     with pytest.raises(ValueError):
         domain_token_ids(tok, toy, "F")
-    # shipped lexicon: every English domain keeps plenty of single-token words
+    # shipped lexicon: every English compass domain keeps plenty of single-token words; the
+    # protein poles carry rarer nomenclature (prion, amyloid, ... are multi-token) but still
+    # enough ids for a mass readout
     for name in DOMAINS:
-        assert len(ids_E[name]) >= 30, name
+        assert len(ids_E[name]) >= (30 if name in CORE_DOMAINS else 20), (name, len(ids_E[name]))
         for i in ids_E[name]:
             assert tok.decode([i]).startswith(" ")
     assert ids_E.meta["lang"] == "E"
