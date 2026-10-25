@@ -41,6 +41,14 @@ Mindesteffektgrenze nicht ausschließt, gilt als „offen“, nicht als Nullbefu
 4. Hysteresefläche A_hyst(`lang_dom`) − A_hyst(Neustart-Null).
 5. Nichtmonotonie-Index (D2) bei K=8 vs K=0.
 6. Transfer: B(x) mit `ent` (aus State 2143) vs. 32 Zufallsrichtungen auf Testfamilien.
+7. Geometrie-Gate G0 (kein Hypothesentest, Voraussetzung): unter trunkierter
+   Mahalanobis-Distanz, Mean-Pool, Deflation k=5, mittlere Layer: d(A_E, A_D) <
+   d(A_E, B_E) < d(Fremdfamilie) in ≥ 50 % der Layer; sonst werden 8–9 nicht interpretiert.
+8. Kontraktion unter Sprachwechsel G1: Δ log-Vol(K=8, C1) − Δ log-Vol(K=0) (Mean-Pool,
+   k=5) und dasselbe für PR (Last-Token); zweiseitig, Vorzeichen offen.
+9. Steering-Validität T3: Kosinus zwischen der Steuerverschiebung (`lang_dom`, ε = 0,05)
+   und mean(K=8) − mean(K=0) pro Layer, gegen 32 Zufallsrichtungen; Mindesteffekt
+   cos ≥ 0,3 im Layer mit maximaler diskreter Verschiebung.
 
 ## 4. Ausschlussregeln (vor Sichtung der Modellwerte)
 

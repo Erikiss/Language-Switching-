@@ -198,6 +198,51 @@ usable as `opt_einsum.contract(expr, *arrays, optimize=path)`; `r.cost.log10()`.
 `new_tn.output_inds` is a frozenset — keep your own ordered output index tuple.
 If `tnco` is not importable, fall back to `opt_einsum.contract_path(..., optimize='dp' if n<=12 else 'greedy')`.
 
+## `lsne/geometry.py`  (Meaning-Contracts measures, DESIGN §4.4)
+
+Implements the local-geometry measures of Godoy Ortiz 2026 (arXiv:2610.30715) on
+residual snapshots. All inputs are torch or numpy arrays; outputs numpy / DataFrames.
+```python
+def pool_states(resid: Tensor[B,T,d] | ndarray, readout: str, positions: list[int]|None=None) -> ndarray[B,d]
+    # readout "mean": mean over the given positions (default: all); "last": state at the last position
+def deflate(X: ndarray[N,d], k: int, basis: ndarray[k,d]|None=None) -> tuple[ndarray[N,d], ndarray[k,d]]
+    # center X, remove projection on top-k right singular vectors (fit on X if basis None); k=0 -> centered X
+def layer_covariance(X: ndarray[N,d], r: int) -> tuple[ndarray[d,r] U_r, ndarray[r] lam_r]   # eigendecomposition of the covariance, truncated to rank r = min(r, N-1, d)
+def mahalanobis(x: ndarray[d], y: ndarray[d], U_r, lam_r) -> float                          # eq. (1) of the paper
+def log_volume(G: ndarray[n,d], eps: float=1e-8) -> float   # sum_i log max(lambda_i, eps) over ALL n eigenvalues of the centered n x d cloud (economy SVD; one is ~0)
+def participation_ratio(G: ndarray[n,d]) -> float          # (sum lam)^2 / sum lam^2
+def displacement(mean_a: ndarray[d], mean_b: ndarray[d], U_r=None, lam_r=None) -> dict(euclid, mahal)
+def group_geometry(groups: dict[str, ndarray[n_g,d]], r: int=128, deflate_k: tuple=(0,5), ref_group: str|None=None) -> DataFrame
+    # rows: group x k with n, log_volume, participation_ratio, displacement_euclid/mahal from ref_group mean (covariance from the pooled X of all groups)
+def pair_ordering(X: ndarray[N,d], labels: DataFrame(family, formulation, lang), r=128, k=5) -> DataFrame
+    # paper's categories on our bank: exact_translation (same family+formulation, E vs D), same_meaning_same_lang (A vs B, same lang), same_meaning_cross_lang (A_E vs B_D), other_family; mean Mahalanobis + cosine per category -> G0 gate
+def per_position_log_volume(resid_group: ndarray[n,T_aligned,d], eps=1e-8) -> ndarray[T_aligned]   # cloud per aligned position
+def enumerate_unit_masks(K: int, n_units: int=10) -> list[str]
+    # all masks with unit1=E, unit10=E, unit9=D (if K>0), exactly K switches; K=0 -> ["E"*n_units]
+def realization_groups(families, build_fn, K_levels, C_levels) -> dict[(family_id,K,C) -> list[Variant]]
+    # build_fn(family, segment_mask) -> Variant; segment masks from lsne.stimuli.segment_masks_from_unit_mask if available, else a local re-implementation of DESIGN §2.1 (C1/C2/C3) — keep both consistent (test)
+def geometry_table(mb, groups: dict, sites: list[HookSite], readouts=("mean","last"), r_mean=128, r_last=256, deflate_k=(0,5)) -> DataFrame
+    # runs run_with_cache per variant once, pools states per site/readout, calls group_geometry with ref_group = the K=0 group of the same family
+```
+Tests: synthetic Gaussian clouds (log_volume decreases when the cloud shrinks; PR of an
+isotropic cloud ≈ its dimension; Mahalanobis of x vs x is 0 and symmetric; deflate removes
+the top direction exactly); enumerate_unit_masks(2) has 8 masks, all with exactly 2
+switches and the required fixed units; pythia-14m: pair_ordering on 2 families × 2
+formulations × E/D returns all four categories with finite values.
+
+## `lsne/trajectory.py`  (DESIGN §4.5)
+
+```python
+def depth_trajectory(geom_table: DataFrame) -> DataFrame   # per (family,K,C,readout,k): log_volume(l), pr(l), displacement(l), delta_l log_volume, breathing_index = number of sign changes of delta_l, breathing_amplitude = mean |delta_l|, layer_of_max_contraction
+def position_trajectory(mb, group_variants: list, site: HookSite, align: str="tail_from_end", n_prefix_bins: int=8) -> DataFrame   # per-position log-volume along the aligned tail + relative prefix bins; also position relative to last switch
+def steering_tracks_switching(mb, variants_K0: list, variants_K: list, direction, site, eps_list, n_random=32, seed=0) -> DataFrame
+    # per layer snapshot: v_K = mean(K) - mean(K0) (pooled 'last' readout); v_steer(eps) = mean over K0 variants of (h_steered - h) at the same snapshot after injecting eps*dir at the site; cosine(v_steer, v_K), Mahalanobis displacement of steered states relative to the K0 cloud; same for random directions (mean, sd)
+def couple_with_dynamics(depth_traj: DataFrame, damage_lambda_by_layer: DataFrame, lens_kl_by_layer: DataFrame) -> DataFrame   # per-layer correlations (Spearman) between delta_l log_volume and lambda_l / KL_l, per condition
+```
+Tests: synthetic tables for depth_trajectory (breathing index of a monotone series is 0;
+of an alternating series equals n-2 sign changes); steering_tracks_switching on pythia-14m
+with two tiny hand-made groups returns cosines in [-1,1] with random controls.
+
 ## `lsne/stats.py`
 
 `cluster_bootstrap(df, value_col, cluster_col, n_boot=10000, seed=0, stat=np.mean) -> dict(mean, ci_low, ci_high, n_clusters)`;

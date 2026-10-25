@@ -11,6 +11,12 @@ Es enthält keine Messergebnisse. Code: Paket `lsne/`, Notebooks: `notebooks/`.
 
 ## 0. Kurzfassung
 
+Ergänzung 25.10.2026 (zweite Rückmeldung des Auftraggebers): Der Zwischenschritt
+„Verdichtung der lokalen semantischen Geometrie“ (Godoy Ortiz 2026, *Meaning Contracts*,
+arXiv:2610.30715) wird als eigene Stufe G aufgenommen (§4.4) und die darauf aufbauende
+Trajektorien-Analyse als §4.5. Sprachwechsel ist dabei das Mittel, Verdichtung
+kontrolliert zu stellen; der Gegenstand ist nicht die Tokenisierung seltener Wörter.
+
 Das Dossier zeigt für State 2143 (Pythia-160M, 208-Token-Kontext, Ziel „bey“) einen
 reproduzierbaren lokalen Eingriffseffekt, aber keinen Sprachwechselmechanismus: der
 Originalkontext enthält null Sprachwechsel. Das hier aufgesetzte Programm macht
@@ -194,6 +200,85 @@ zweite Zeit = autoregressiver Schritt; langsame Achse = Trainings-Checkpoint.
 Phasendiagramme: jede Kenngröße über (ε, K) und (ε, C), getrennt für `ent`, `lang_dom`,
 `sae_f`, `rand`.
 
+### 4.4 Zwischenschritt: Lokale Geometrie („Meaning Contracts“) unter Sprachwechsel
+
+Godoy Ortiz (2026, arXiv:2610.30715) zeigt für vier Modellfamilien (darunter Pythia-2.8B):
+(i) nach Entfernen der dominanten Varianzrichtungen (Top-k-PCA-Deflation) ordnen sich
+Satzpaare nach semantischer Verwandtschaft; (ii) exakte Übersetzungen bilden unter
+trunkierter Mahalanobis-Distanz den **invarianten Kern** einer Bedeutung, freie
+Realisierungen die weite, anisotrope Streuung darum; (iii) semantische Verfeinerung ist
+**gerichtete Verschiebung in engere Nachbarschaften** (Abnahme des Log-Volumens der
+lokalen Realisierungswolke, über Kontrollen hinaus); (iv) Mean-Pool-Readout zeigt die
+Kontraktion auf Satzebene, Last-Token-Readout schärfere anisotrope Endpunkte (niedrigere
+Participation Ratio); die Pro-Position-Inkremente des Log-Volumens wachsen über späte
+Präfixpositionen. Das Paper manipuliert nicht; die Brücke zur kausalen Intervention ist
+dort explizit offen.
+
+**Was hier geprüft wird (der vom Auftraggeber benannte Zwischenschritt):** Findet man
+eine Größe, die mit dieser Verdichtung korreliert und die man kontrolliert stellen kann?
+Educated guess: Sprachwechsel. Konkret wird die lokale Geometrie des Papers auf dem
+eigenen Stimulusraster **unter Sprachwechsel als Störgröße** gemessen und erst danach die
+Trajektorie betrachtet (§4.5). Es geht ausdrücklich **nicht** um seltene, buchstabierte
+Namen wie „Fewkoom|bey“: deren Tokenisierung ist eine Konfundierung, die kontrolliert
+wird (Zielwörter der neuen Familien sind häufige Ein-Token-Wörter; die Original-Fallstudie
+bleibt getrennt), nicht der Forschungsgegenstand.
+
+Messgrößen (Modul `lsne.geometry`, Definitionen wie im Paper):
+
+| Größe | Definition | Readout |
+|---|---|---|
+| Deflation | X^(−k) = X̃ − (X̃ V_kᵀ) V_k, k ∈ {0, 1, 5, 10}, V_k aus allen gepoolten Zuständen eines Layers | beide |
+| Trunkierte Mahalanobis | d_M² = (x−y)ᵀ U_r Λ_r⁻¹ U_rᵀ (x−y), Σ_ℓ aus allen gepoolten Zuständen des Layers, r = min(128 bzw. 256, N−1, d) | Mean / Last |
+| Log-Volumen | Σ_i log max(λ_i, ε) der Kovarianz der lokalen Realisierungswolke (n Realisierungen) | beide |
+| Participation Ratio | (Σλ_i)² / Σλ_i² | beide (ordinaler Indikator, wie im Paper) |
+| Verschiebung | d(mean(Bedingung), mean(K=0-Bedingung)) euklidisch und Mahalanobis | beide |
+| Pro-Position-Inkrement | Log-Volumen der Wolke an Position t (vom Ende her ausgerichtet auf dem gemeinsamen Schlussabschnitt; Präfix in relativen Positionsbins) | Last-Token je Position |
+
+**Realisierungswolke pro Bedingung (Familie, K, C):** Formulierungen × alle zulässigen
+Masken mit genau K Wechseln (Einheit 1 und 10 E, Einheit 9 D). Für K=2 gibt es 8
+zulässige Einheitsmasken, für K=4 und K=8 mehr; mit zwei Formulierungen sind das ≥ 16
+Realisierungen wie im Paper (n = 16). Für K=0 liegen nur die Formulierungen vor; deshalb
+werden die Familien um die Formulierungen C und D erweitert (Stufe A, Nachtrag), sodass
+auch K=0 eine Wolke mit n ≥ 4 hat und die Dosis-Trajektorie (§4.5) an jeder
+Realisierung gemessen werden kann.
+
+Vorab definierte Tests:
+- G0 *Replikation am Raster:* exakte Übersetzungspaare (A_E, A_D) sind unter
+  Mahalanobis näher als freie Realisierungen (A_E, B_E) und diese näher als
+  Fremdfamilien — die Kern-und-Streuung-Ordnung des Papers muss auf Pythia-160M mit
+  unserem Material sichtbar sein, sonst ist Kontraktion dort nicht interpretierbar.
+- G1 *Korrelation:* Δ log-Vol(K) − Δ log-Vol(K=0) und ΔPR als Funktion von K und C,
+  pro Layer und Readout; Vorzeichen offen (Kontraktion **oder** Expansion sind beides
+  informative Befunde; „Atmen“ = Vorzeichenwechsel über die Tiefe, §4.5).
+- G2 *Kontrollen:* einsprachige Umbaukontrolle (gleiche Segmentierung, alles E),
+  Längen-Kovariate (deutsche Segmente haben mehr Tokens), Deflationsstufe k,
+  Rang r, Familien-Bootstrap.
+- G3 *Positivkontrolle (optional):* die veröffentlichten Verfeinerungsketten des Papers
+  (Repo `adgodoyo/Meaning_Contracts`) auf Pythia-160M nachgerechnet; zeigt, ob das
+  160M-Modell die Verfeinerungskontraktion überhaupt trägt.
+
+### 4.5 Trajektorie: Verdichtung als Ordnungsparameter der Dynamik
+
+Erst wenn G1 ein Signal liefert, wird die **Trajektorie** betrachtet (Modul
+`lsne.trajectory`). Gemeint ist die Bahn der lokalen Geometrie durch die drei Achsen,
+die der Q-Learning-Analogie des Auftraggebers entsprechen: Zustand s ↔ lokale Geometrie
+(Log-Volumen, PR, Verschiebung), zustandsbeschreibender Parameter ↔ Gitterkoordinaten
+(Tiefe ℓ, Position t), θ ↔ Trainings-Checkpoint. Konkret:
+
+| Trajektorie | Messung | Frage |
+|---|---|---|
+| T1 Tiefe | Log-Vol(ℓ), PR(ℓ), Verschiebung(ℓ) je Bedingung; Atem-Index = Zahl der Vorzeichenwechsel von Δ_ℓ log-Vol und Amplitude | kontrahiert der Raum monoton oder „atmet“ er, und ändert Sprachwechsel das Muster? |
+| T2 Position | Pro-Position-Inkremente (Paper, Abb. 6) entlang des Präfixes und des gemeinsamen Schlussabschnitts, relativ zur letzten Wechselstelle | wandert die Verdichtung mit den Wechselstellen? |
+| T3 Dosis | Steering mit `lang_dom`/`sae_f` bei Dosis ε: Verschiebung des gesteuerten Zustands relativ zur K=0-Wolke (Mahalanobis) und Kosinus zwischen Steuerverschiebung und der diskreten K-Verschiebung mean(K) − mean(0) | reproduziert kontinuierliches Steuern die Geometrie echter Wechsel? (Voraussetzung dafür, Sprachwechsel „hochzuskalieren“) |
+| T4 Training | T1–T3 über die Dossier-Checkpoints | wann im Training entsteht das Muster? |
+| T5 Kopplung | Korrelation von Δ_ℓ log-Vol mit der Störungswachstumsrate λ_ℓ (D1) und der Lens-KL (D2) über Layer | ist Verdichtung der Ordnungsparameter der Nicht-Gleichgewichts-Signaturen? |
+
+Auswertung: Familien-Bootstrap; Trajektorien werden als Kurven mit Konfidenzbändern
+berichtet, Phasenlage (Layer des stärksten Inkrements) als Kennzahl. T3 ist der
+entscheidende Validitätstest für die gesamte Steering-Skalierung: fällt er negativ aus,
+werden Dosis-Phasendiagramme (§4.2) nur noch als Eingriffs-, nicht als
+Sprachwechselbefunde interpretiert.
+
 ### 4.3 Dossier-Kernkontraste (Frage 2 und Replikation)
 
 T(K, C), B(x) pro Richtung, I(K, C). Wechselwirkung K × C, Transfer `ent` von
@@ -268,6 +353,7 @@ Shard schreibt eigene Ergebnisdateien, `lsne.cli merge` fügt zusammen.
 | B Pilot/Richtungen | Baselines, `ent`, `lang_dom`, SAE, Geometrie | `01_baseline_and_directions` | Dosis & Layerraster werden nur auf Entwicklungsfamilien gewählt |
 | C Grid + Counterfactual | T, B, I über K × C; Positions-Patching | `02_switching_grid` | Primärkontrast T(K) auf Testfamilien, Familien-Bootstrap |
 | D Nicht-Gleichgewicht | D1–D9, Phasendiagramme | `03_nonequilibrium` | Primärer Endpunkt λ (Präregistrierung) |
+| G Geometrie + Trajektorie | G0–G3 (lokale Geometrie unter Sprachwechsel), T1–T5 (Trajektorie) | `06_geometry_trajectory` | G0 muss bestehen, sonst keine Interpretation; T3 entscheidet über die Steering-Lesart |
 | E Tensornetz | lineare Antwort, TNCO vs. opt_einsum, Nichtlinearität | `04_tn_linear_response` | Berichtet Kosten/Laufzeit/Fehler; kein Hypothesentest |
 | F Skala & Verlauf | 410M/1B/1.4B, Checkpoint-Sweep; BF16-Vergleich | `05_scale_and_checkpoints` | Shards, Drive-Export |
 
