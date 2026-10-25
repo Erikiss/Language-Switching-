@@ -12,6 +12,7 @@ import datetime as _dt
 import enum
 import importlib.util
 import json
+import logging
 import os
 import platform
 import socket
@@ -28,6 +29,9 @@ PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 DRIVE_MOUNT = "/content/drive/MyDrive"
 DRIVE_ROOT = DRIVE_MOUNT + "/LSNE"
 MANIFEST_NAME = "manifest.json"
+
+logger = logging.getLogger(__name__)
+_parquet_skip_logged = False   # the missing-engine notice is emitted once per process
 
 
 # ======================================================================================
@@ -237,8 +241,10 @@ def _stem(name: str) -> str:
 
 def save_df(df: pd.DataFrame, run_dir, name: str) -> Path:
     """Save ``df`` as ``<name>.csv`` (index dropped) in ``run_dir``, plus ``<name>.parquet``
-    when a parquet engine (pyarrow/fastparquet) is available -- silently skipped
-    otherwise.  Returns the CSV path."""
+    when a parquet engine (pyarrow/fastparquet) is available.  Without an engine the
+    parquet copy is skipped and a warning is logged once per process; the CSV is the
+    record either way.  Returns the CSV path."""
+    global _parquet_skip_logged
     d = _as_dir(run_dir)
     d.mkdir(parents=True, exist_ok=True)
     stem = _stem(name)
@@ -247,8 +253,12 @@ def save_df(df: pd.DataFrame, run_dir, name: str) -> Path:
     pq_path = d / f"{stem}.parquet"
     try:
         df.to_parquet(pq_path, index=False)
-    except Exception:
+    except Exception as e:
         # no parquet engine installed (or unsupported dtypes): the CSV is the record
+        if isinstance(e, ImportError) and not _parquet_skip_logged:
+            _parquet_skip_logged = True
+            logger.warning("parquet copy of %s skipped: no parquet engine (install pyarrow); "
+                           "the CSV is the record -- %s", csv_path, e)
         if pq_path.exists():
             try:
                 pq_path.unlink()

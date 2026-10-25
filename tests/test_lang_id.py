@@ -183,14 +183,41 @@ def test_label_tokens_matches_annotation(variants, tok):
     assert ok / n >= 0.95, errors[:20]
 
 
+#: Largest deficit K - switch_count(label_tokens) measured on the stimulus bank (48
+#: formulations, pythia tokenizer): the count is a lower bound because a one-word
+#: segment that is a name ('N') is transparent (lang_id.switch_count).  C1 and C2 are
+#: exact; at C3 only K = 8 isolates a single segment (``subj_1``, a name, before the
+#: first German run: one switch lost); the segment-alternating conditions isolate every
+#: name subject (two switches lost each; measured 1..5 for K = 16 and 1..9 for K = 28).
+SWITCH_COUNT_MAX_DEFICIT = {"C1": {}, "C2": {}, "C3": {8: 1}, "seg": {16: 5, 28: 9}}   # default 0
+
+
 def test_switch_count_tracks_K(variants, tok):
-    # label-based switch counts should follow the designed K for the sentence-level masks
+    """The label-based switch count equals the designed K for C1 (exact) and is a lower
+    bound within the measured tolerance for C2 / C3 / seg (never above K)."""
+    seen = set()
     for tag, vs in variants.items():
         for v in vs:
-            if v.C != "C1":
-                continue
             labs = L.label_tokens(tok, v.ids)
-            assert abs(L.switch_count(labs) - v.K) <= max(1, v.K // 2), v.tag
+            n = L.switch_count(labs)
+            tol = SWITCH_COUNT_MAX_DEFICIT[v.C].get(v.K, 0)
+            if v.C == "C1":
+                assert n == v.K, (v.tag, n)
+            else:
+                assert v.K - tol <= n <= v.K, (v.tag, n, tol)
+            seen.add(v.C)
+            # the deficit is explained by name-only segments: dropping every segment whose
+            # words are all 'N' from the mask reproduces the count, up to one further
+            # 'N' run of the classifier (two switches) in the dense seg conditions
+            keep = [v.mask[i] for i, s in enumerate(v.segments[:-1]) if any(x != "N" for x in L.label_text(s.text))]
+            expected = S.count_switches(keep + ["E"])
+            assert expected <= v.K and n <= expected
+            assert expected - n <= (2 if v.C == "seg" else 0), (v.tag, n, expected)
+    assert seen == {"C1", "C2", "C3", "seg"}
+    # the lone English subject of unit 1 is the lost run of K=8 / C3
+    v8 = next(v for v in variants["DEV01A"] if (v.K, v.C) == (8, "C3"))
+    assert L.label_text(v8.segments[0].text) == ["N"] and v8.mask[:2] == ["E", "D"]
+    assert L.switch_count(L.label_tokens(tok, v8.ids)) == 7
 
 
 def test_evaluate_on_families_word_level(families):

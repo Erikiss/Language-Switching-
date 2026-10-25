@@ -36,6 +36,10 @@ belongs to (a word is a maximal run of tokens starting at a word-start token; wh
 and punctuation tokens are 'N').  `label_text(text)` labels whitespace-delimited words.
 `evaluate_on_families(families_dir, tokenizer)` reports the accuracy against the segment
 languages of the stimulus bank per (family, formulation, language).
+
+The sequence statistics (`switch_positions`, `switch_count`, `language_runs`, ...) treat
+'N' as transparent, so `switch_count` is a lower bound on the designed number of
+switches: a one-word segment that is a name is invisible (see `switch_count`).
 """
 from __future__ import annotations
 
@@ -451,7 +455,14 @@ def language_fraction(labels: Sequence[str], lang: str = "D") -> float:
 
 def switch_positions(labels: Sequence[str]) -> list[int]:
     """Indices at which the (E/D) language differs from the previous E/D label
-    ('N' items are transparent)."""
+    ('N' items are transparent).
+
+    Because 'N' items are transparent, a language run that consists of 'N' items only
+    is invisible: a one-word segment that is a proper name (``Lena``, ``Kraft``) or a
+    number does not interrupt the surrounding language, so the switch into it and the
+    switch out of it are both missed (one switch when the run opens or closes the
+    text).  The count is therefore a *lower bound* on the designed K of a stimulus,
+    see :func:`switch_count`."""
     out: list[int] = []
     prev: Optional[str] = None
     for i, x in enumerate(labels):
@@ -464,7 +475,18 @@ def switch_positions(labels: Sequence[str]) -> list[int]:
 
 
 def switch_count(labels: Sequence[str]) -> int:
-    """Number of E<->D switches in a label sequence."""
+    """Number of E<->D switches in a label sequence (``len(switch_positions)``).
+
+    This is a **lower bound** on the number of switches in the text: 'N' labels are
+    transparent, so a language run made of 'N' words only - a one-word segment that is a
+    proper name of the stimulus schema or a number - is not seen and its two switches
+    (one at the start or end of the text) are not counted.  On the stimulus bank the
+    label-based count equals K for every C1 and C2 variant; it is K - 1 for K = 8 at C3
+    (``subj_1`` is a lone name in English before the first German run) and K - 1 ... K - 9
+    for the segment-alternating K = 16 / 28 conditions, where every name subject is a
+    one-segment run (measured in ``tests/test_lang_id.py::test_switch_count_tracks_K``).
+    For an exact count of the designed switches use the mask (``stimuli.count_switches``)
+    or the ``boundary`` tokens of ``stimuli.annotate``."""
     return len(switch_positions(labels))
 
 

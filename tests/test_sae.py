@@ -8,8 +8,8 @@ import pytest
 import torch
 
 from lsne.config import SAE_REPOS, HookSite
-from lsne.sae import (TopKSAE, feature_direction, feature_table, fvu, language_selective_features,
-                      sae_fvu, sae_repo_for)
+from lsne.sae import (TopKSAE, check_sparsify_cfg, feature_direction, feature_table, fvu,
+                      language_selective_features, sae_fvu, sae_repo_for)
 
 
 def random_sae(d=32, F=96, k=8, seed=0):
@@ -137,6 +137,40 @@ def test_feature_table_and_selective_features():
     assert torch.allclose(v, sae.W_dec[sel["D"][0]] / sae.W_dec[sel["D"][0]].norm())
     with pytest.raises(ValueError):
         feature_table(sae, acts, labels[:-1])
+
+
+def _sparsify_state(F=8, d=4, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    return {"encoder.weight": torch.randn(F, d, generator=g), "encoder.bias": torch.zeros(F),
+            "W_dec": torch.randn(F, d, generator=g), "b_dec": torch.zeros(d)}
+
+
+def test_from_state_rejects_unsupported_sparsify_configs():
+    """Round 2, G4 item 3: configs whose forward pass is not plain TopK must raise."""
+    tensors = _sparsify_state()
+    base = dict(expansion_factor=2, normalize_decoder=True, num_latents=8, k=2, d_in=4, signed=False)
+    # the published format (sparsify defaults) builds
+    sae = TopKSAE.from_state(tensors, base)
+    assert sae.k == 2 and sae.num_latents == 8 and sae.cfg["signed"] is False
+    assert TopKSAE.from_state(tensors, dict(base, activation="topk", multi_topk=True)).k == 2   # training-only flag
+    for bad, needle in ((dict(base, signed=True), "signed"),
+                        (dict(base, activation="groupmax"), "activation"),
+                        (dict(base, skip_connection=True), "skip_connection"),
+                        (dict(base, transcode=True), "transcode")):
+        with pytest.raises(ValueError, match=needle):
+            TopKSAE.from_state(tensors, bad)
+        with pytest.raises(ValueError, match=needle):
+            check_sparsify_cfg(bad)
+    with pytest.raises(ValueError, match="W_skip"):
+        TopKSAE.from_state(dict(tensors, W_skip=torch.zeros(4, 4)), base)
+    with pytest.raises(ValueError, match="W_skip"):
+        check_sparsify_cfg(base, dict(tensors, W_skip=torch.zeros(4, 4)))
+    # several problems are all reported; missing keys take the defaults (accepted)
+    with pytest.raises(ValueError) as ei:
+        check_sparsify_cfg(dict(k=2, signed=True, transcode=True))
+    assert "signed" in str(ei.value) and "transcode" in str(ei.value)
+    check_sparsify_cfg(dict(k=2))
+    check_sparsify_cfg(None)
 
 
 def test_sae_repo_for():

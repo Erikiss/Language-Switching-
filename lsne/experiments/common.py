@@ -73,6 +73,29 @@ ID_COLS = ("tag", "family", "formulation", "K", "C", "kind", "n_tokens", "tail_s
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
+#: Pre-registered family domain groups (PREREGISTRATION.md section 3, contrast 13):
+#: culture/politics F13-F16, law F17-F18, protein misfolding F19-F20 (DESIGN 4.8b),
+#: everything else (F01-F12, DEV01-DEV04, the original context) = everyday / stable.
+DOMAIN_GROUPS: dict[str, tuple[str, ...]] = {
+    "culture_politics": ("F13", "F14", "F15", "F16"),
+    "law": ("F17", "F18"),
+    "protein_misfolding": ("F19", "F20"),
+}
+DEFAULT_DOMAIN_GROUP = "everyday"
+#: Smoke-preset overrides of the stage G-L limits (see :class:`Limits`).
+SMOKE_GL: dict = dict(
+    g_k_levels=(0, 8), g_c_levels=("C1",), g_max_masks=3, g_deflate_k=(0, 5), g_r_mean=128, g_r_last=256,
+    g_steer_eps=(0.05, 0.5), g_n_subsample=5, g_position_sites=2,
+    h_lambdas_rel=(0.0, 0.3, 3.0, 30.0), h_n_steps=6, h_max_starts=1, h_knn=50, h_cov_rank=32,
+    h_discriminants=("target_logit", "probe", "sae_feature"),
+    i_doses=(0.1,), i_n_templates=1, i_max_words=6, i_head_eps=(0.5,), i_n_random_profile=4,
+    j_n_pile=3, j_pile_max_len=64, j_n_random_bases=4, j_n_pca=4, j_max_variants_per_group=4, j_max_sites=2,
+    k_seq_len=32, k_max_docs=4, k_max_snippets=2, k_mem_steps=3, k_mem_lr=1e-3, k_train_steps=3, k_train_lr=1e-3,
+    k_train_batch=2, k_checkpoints=None, k_eps=0.1,
+    l_source="rotated_self", l_n_texts=12, l_n_prompts=1, l_n_prefix=2, l_eps=1.0, l_n_null=3,
+    synthetic_sae_if_missing=True, synthetic_sae_latents=64,
+)
+
 
 # --------------------------------------------------------------------------------------
 # limits
@@ -89,7 +112,7 @@ class Limits:
     limited: bool = False
     progress: bool = True
     # stage B
-    n_unigram: int = 200            # Pile sequences for the unigram counts (cache/unigram)
+    n_unigram: int = 2000           # Pile sequences for the unigram counts (DESIGN section 3: 2 000; cache/unigram)
     use_sae: bool = False
     n_sae_features: int = 5         # sae_D0..n-1 and sae_E0..n-1 directions
     # stage C
@@ -109,6 +132,64 @@ class Limits:
     tn_n_runs: int = 4
     # stage F
     f_stages: tuple = ("B", "C", "D")
+    # ---- stages G-L (docs/STAGES.md) ---------------------------------------------------
+    # stage G (local geometry / trajectory)
+    g_k_levels: tuple = (0, 2, 4, 8)      # K levels of the realization clouds
+    g_c_levels: tuple = ("C1", "C2", "C3")
+    g_max_masks: int = 8                  # unit masks per (K, C) cloud (seeded subset; K=2 and K=8 have exactly 8)
+    g_deflate_k: tuple = (0, 5)           # deflation levels (PREREG 7/8: k=5)
+    g_r_mean: int = 128                   # Mahalanobis rank, mean readout
+    g_r_last: int = 256                   # Mahalanobis rank, last-token readout
+    g_steer_eps: tuple = (0.05, 0.2, 0.5) # T3 doses (PREREG 9: 0.05)
+    g_n_subsample: int = 20               # seeded draws of the n-matched contraction contrast
+    g_position_sites: int = 3             # sites of the T2 position trajectory (first, middle, dossier)
+    # stage H (lambda dynamics)
+    h_lambdas_rel: tuple = (0.0, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0)   # DESIGN 4.6
+    h_n_steps: int = 100                  # Alg. 1 steps per path
+    h_step_rel: float = 0.02              # step as a fraction of ||h0||
+    h_dmax_rel: float = 1.0               # d_max as a fraction of ||h0|| (l2 ball)
+    h_cross_nats: float = 1.0             # boundary offset of the model-own discriminants (B >= 1 nat / +1 nat entropy)
+    h_max_starts: int = 4                 # start states (K=0 formulations) per family
+    h_knn: int = 50                       # k_nearest of the KDE (the paper's 50)
+    h_cov_rank: int = 32                  # whitening rank of the target cloud
+    h_discriminants: tuple = ("target_logit", "probe", "entropy", "sae_feature")
+    # stage I (compass / heads)
+    i_doses: tuple = (0.01, 0.05, 0.1)    # B(x) doses of the direction x domain table
+    i_n_templates: Optional[int] = None   # template sentences per domain axis (None = all)
+    i_max_words: Optional[int] = None     # domain words per side (None = all)
+    i_head_eps: tuple = (0.1, 0.5)        # relative doses of the head arm
+    i_n_random_profile: int = 32          # random directions of the domain-profile z (PREREG 12: 32)
+    # stage J (RDX / pile / sharing)
+    j_n_pile: int = 2000                  # Pile sequences of the difficulty ranking (PREREG 16: >= 2000)
+    j_pile_max_len: int = 512
+    j_n_random_bases: int = 32            # random bases of the RDX z (PREREG 15: 32)
+    j_n_pca: int = 8                      # principal components of the "pca" basis
+    j_max_variants_per_group: Optional[int] = None
+    j_max_sites: Optional[int] = None     # keep only the last n grid sites (smoke)
+    # stage K (test-time training)
+    k_corpus: str = "data/ttt/dao_fork"
+    k_seq_len: int = 256
+    k_max_docs: Optional[int] = None
+    k_max_snippets: int = 16              # snippets per arm of the memorisation table
+    k_mem_steps: int = 50                 # memorisation_speed steps
+    k_mem_lr: float = 1e-4
+    k_threshold: float = 0.5              # pre-defined NLL threshold (nats) of the "fast phase"
+    k_train_steps: int = 200              # test_time_train steps per arm
+    k_train_lr: float = 1e-4
+    k_train_batch: int = 4
+    k_checkpoints: Optional[tuple] = None # extra revisions of the memorisation table (None = current only)
+    k_eps: float = 0.05                   # dose of the before/after B(x)
+    # stage L (transplant)
+    l_source: str = "rotated_self"        # "rotated_self" | "self" | "model@revision" (HF causal LM)
+    l_n_texts: int = 48                   # paired E/D unit sentences per language
+    l_n_prompts: int = 3                  # prompts of the transplant experiment
+    l_n_prefix: int = 8                   # virtual KV prefix length
+    l_eps: float = 1.0                    # dose of the transferred feature
+    l_n_null: int = 10                    # permuted-pair null draws of the functional test
+    # shared by H / J / K: use a random TopK SAE when no published SAE is available
+    # (smoke runs only: exercises the code paths; every row is marked sae_source)
+    synthetic_sae_if_missing: bool = False
+    synthetic_sae_latents: int = 64
 
     @classmethod
     def smoke(cls, **kw) -> "Limits":
@@ -117,6 +198,7 @@ class Limits:
                     gen_n_steps=2, gen_tokens_per_step=2, gen_t_on=2, n_boot_tau=5,
                     n_families_tn=1, tn_doses=(0.01, 0.1), tn_n_steps=50, tn_n_runs=1,
                     use_sae=False)
+        base.update(SMOKE_GL)
         base.update(kw)
         return cls(**base)
 
@@ -531,9 +613,12 @@ def direction_bank(cfg: RunConfig, mb: ModelBundle, variants: Sequence, site: Ho
     * ``ent``: entropy gradient at ``site`` and the dossier position of the original
       anchor (last context token) if available, else at the last token of the first K=0
       variant; optionally orthogonalised against the ARI axis in ``axis_npz``;
-    * ``lang_dom``: denoised difference of means D - E over segment-final residuals;
+    * ``lang_dom``: denoised difference of means D - E over the segment-final residuals of
+      the paired unit segments (the shared English tail is excluded, ``include_tail=False``,
+      DESIGN section 3);
     * ``lang_probe``: logistic-regression axis on the same activations;
-    * ``freq``: frequency axis from unigram counts (``limits.n_unigram`` Pile sequences);
+    * ``freq``: frequency axis from unigram counts (``limits.n_unigram`` Pile sequences,
+      2 000 by default as in DESIGN section 3; the smoke preset uses 5);
       ``freq_ids`` = the 100 most frequent ids (for ``p_freq``);
     * ``rand_00 .. rand_{n-1}``: ``cfg.n_random_dirs`` isotropic directions (``cfg.seed``);
     * ``sae_D0.., sae_E0..``: decoder rows of language-selective TopK-SAE features when
@@ -567,17 +652,18 @@ def direction_bank(cfg: RunConfig, mb: ModelBundle, variants: Sequence, site: Ho
     # lang_dom / lang_probe
     acts = labels = None
     try:
-        bank.dirs["lang_dom"] = language_axis(mb, std, site, pool="segment_last", denoise_pcs=1)
+        bank.dirs["lang_dom"] = language_axis(mb, std, site, pool="segment_last", denoise_pcs=1, include_tail=False)
     except Exception as e:  # noqa: BLE001
         warnings.warn(f"lang_dom direction skipped: {e!r}")
         bank.meta["skipped"]["lang_dom"] = repr(e)
     try:
-        acts, labels, _meta = collect_activations(mb, std, site, which="segment_last")
+        acts, labels, _meta = collect_activations(mb, std, site, which="segment_last", include_tail=False)
         w, acc = probe_axis(acts, labels)
         bank.dirs["lang_probe"] = Direction("lang_probe", w, site,
                                             dict(train_acc=float(acc), n=int(acts.shape[0]),
                                                  n_E=int(sum(1 for l in labels if l == "E")),
-                                                 n_D=int(sum(1 for l in labels if l == "D"))))
+                                                 n_D=int(sum(1 for l in labels if l == "D")),
+                                                 include_tail=False))
     except Exception as e:  # noqa: BLE001
         warnings.warn(f"lang_probe direction skipped: {e!r}")
         bank.meta["skipped"]["lang_probe"] = repr(e)
@@ -774,6 +860,189 @@ def pearson(x, y) -> float:
     return float(np.corrcoef(x[ok], y[ok])[0, 1])
 
 
+# --------------------------------------------------------------------------------------
+# stages G-L: shared helpers
+# --------------------------------------------------------------------------------------
+def family_domain(family_id: str) -> str:
+    """Pre-registered domain group of a family id (:data:`DOMAIN_GROUPS`; everything
+    else, including ``DEV*`` and the original context, is ``"everyday"``)."""
+    fid = str(family_id)
+    for group, ids in DOMAIN_GROUPS.items():
+        if fid in ids:
+            return group
+    return DEFAULT_DOMAIN_GROUP
+
+
+def families_in_group(variants: Sequence, group: str) -> list[str]:
+    """Sorted family ids of ``variants`` whose :func:`family_domain` is ``group``."""
+    return sorted({str(v.family_id) for v in variants if family_domain(v.family_id) == group})
+
+
+def k_subset(variants: Sequence, K: int, C: Optional[str] = None, standard_only: bool = True) -> list:
+    """Variants with the given ``K`` (and ``C``), standard families only by default."""
+    out = []
+    for v in variants:
+        if standard_only and is_original(v):
+            continue
+        if int(v.K) != int(K):
+            continue
+        if C is not None and str(v.C) != str(C):
+            continue
+        out.append(v)
+    return out
+
+
+def prereg_layer_grid(n_layers: int) -> tuple[int, ...]:
+    """The pre-registered layer grid of stage C ({2, 5, 8, 11} for 12 blocks)."""
+    from .stage_c_grid import attribution_layer_grid   # local import: stage C imports this module
+    return attribution_layer_grid(int(n_layers))
+
+
+def grid_sites(mb: ModelBundle) -> list[HookSite]:
+    """Block inputs of the pre-registered layer grid."""
+    return [HookSite(int(l), "block_input") for l in prereg_layer_grid(mb.n_layers)]
+
+
+def last_state(mb: ModelBundle, v, site: HookSite) -> torch.Tensor:
+    """Residual of variant ``v`` at ``site`` and its last context position (float32 CPU)."""
+    from ..model import run_with_cache
+    co = run_with_cache(mb, ids_tensor(mb, v), [site])
+    return co.resid[site.key][0, -1].detach().float().cpu()
+
+
+class Substages:
+    """Per-substage error capture and timing for a stage runner.
+
+    ``run(name, fn, default)`` calls ``fn()``; an exception is recorded under ``name``
+    (``errors[name]`` = repr, ``tracebacks[name]`` = full traceback, a warning is emitted)
+    and ``default`` is returned, so the remaining substages of the stage still run and
+    the manifest lists what failed (``report()``).  ``seconds[name]`` holds the runtime.
+    """
+
+    def __init__(self, stage: str, verbose: bool = True):
+        self.stage = str(stage)
+        self.verbose = bool(verbose)
+        self.errors: dict[str, str] = {}
+        self.tracebacks: dict[str, str] = {}
+        self.seconds: dict[str, float] = {}
+
+    def run(self, name: str, fn, default=None):
+        t0 = time.perf_counter()
+        try:
+            out = fn()
+        except Exception as e:  # noqa: BLE001 - recorded, the stage goes on
+            self.errors[name] = repr(e)
+            self.tracebacks[name] = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+            warnings.warn(f"stage {self.stage} substage {name!r} failed: {e!r}")
+            out = default() if callable(default) else default
+        self.seconds[name] = time.perf_counter() - t0
+        if self.verbose:
+            status = "FAILED" if name in self.errors else "ok"
+            print(f"[lsne]   {self.stage}/{name} {status} in {self.seconds[name]:.1f} s", flush=True)
+        return out
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+    def report(self) -> dict:
+        return dict(errors=dict(self.errors), seconds={k: round(v, 3) for k, v in self.seconds.items()},
+                    n_failed=len(self.errors))
+
+    def write_tracebacks(self, run_dir) -> Optional[Path]:
+        if not self.tracebacks:
+            return None
+        d = Path(os.fspath(run_dir))
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / "substage_errors.txt"
+        p.write_text("\n\n".join(f"=== {k} ===\n{v}" for k, v in self.tracebacks.items()), encoding="utf-8")
+        return p
+
+
+def synthetic_sae(mb: ModelBundle, n_latents: int = 64, k: int = 8, seed: int = 0):
+    """Random TopK SAE (``TopKSAE.from_tensors``) of the model width - a *placeholder*
+    for code paths that need an SAE when no published one exists (smoke runs); results
+    computed with it are function tests, not findings (rows carry ``sae_source``)."""
+    from ..sae import TopKSAE
+    g = torch.Generator().manual_seed(int(seed))
+    d = mb.d_model
+    F = int(n_latents)
+    W_enc = torch.randn(F, d, generator=g) / float(np.sqrt(d))
+    W_dec = torch.randn(F, d, generator=g) / float(np.sqrt(d))
+    return TopKSAE.from_tensors(W_enc, torch.zeros(F), W_dec, torch.zeros(d), k=int(min(k, F)))
+
+
+def get_sae(mb: ModelBundle, bank: Optional[DirectionBank], limits: Limits, kw: dict) -> tuple[object, str]:
+    """``(sae, source)``: ``kw['sae']`` (``"given"``), the bank's SAE (``"hub:<repo>/<hookpoint>"``),
+    a synthetic placeholder when ``limits.synthetic_sae_if_missing`` (``"synthetic_random"``),
+    else ``(None, "none")``."""
+    if kw.get("sae") is not None:
+        return kw["sae"], "given"
+    if bank is not None and bank.sae is not None:
+        info = bank.meta.get("sae", {}) if isinstance(bank.meta, dict) else {}
+        return bank.sae, f"hub:{info.get('repo', '?')}/{info.get('hookpoint', '?')}"
+    if limits.synthetic_sae_if_missing:
+        return synthetic_sae(mb, n_latents=int(limits.synthetic_sae_latents)), "synthetic_random"
+    return None, "none"
+
+
+def stage_run_dir(cfg: RunConfig, stage: str) -> Optional[Path]:
+    """Run directory of ``stage`` for the same model under ``cfg.out_root`` (None if absent)."""
+    try:
+        rd = RunDir(cfg.out_root, stage, cfg.model, mkdir=False)
+    except Exception:  # noqa: BLE001
+        return None
+    return rd.path if rd.path.is_dir() else None
+
+
+def load_stage_table(cfg: RunConfig, stage: str, name: str) -> Optional[pd.DataFrame]:
+    """``<out_root>/<stage>/<model>@<rev>/<name>.csv`` of an earlier stage, or None."""
+    from ..io import load_df
+    d = stage_run_dir(cfg, stage)
+    if d is None:
+        return None
+    try:
+        return load_df(d, name)
+    except FileNotFoundError:
+        return None
+
+
+def family_text_pairs(fams: Sequence, max_per_lang: Optional[int] = None) -> tuple[list[str], list[str], list[str]]:
+    """Paired English / German unit sentences of standard families (``subj pred adj.`` in
+    both languages, unit by unit) plus the family tails as neutral sentences - the real
+    translation pairs of the stimulus bank, used by stage L as paired source/target
+    items.  Returns ``(texts_E, texts_D, texts_neutral)`` (aligned E/D lists)."""
+    E, D, N = [], [], []
+    for f in fams:
+        if getattr(f, "kind", "standard") != "standard":
+            continue
+        for u in f.units:
+            e = f"{u.E['subj']} {u.E['pred']} {u.E['adj']}."
+            d = f"{u.D['subj']} {u.D['pred']} {u.D['adj']}."
+            if e not in E:
+                E.append(e)
+                D.append(d)
+        tail = str(f.tail_E).strip()
+        if tail and tail not in N:
+            N.append(tail)
+    if max_per_lang is not None:
+        E, D, N = E[: int(max_per_lang)], D[: int(max_per_lang)], N[: int(max_per_lang)]
+    return E, D, N
+
+
+def boot_row(df: pd.DataFrame, value_col: str, n_boot: int, seed: int, cluster_col: str = "family", **keys) -> dict:
+    """One tidy row of a family cluster bootstrap (``stat_level='cluster'`` when the
+    installed :func:`lsne.stats.cluster_bootstrap` supports it, else the row estimator):
+    ``keys`` + ``mean, ci_low, ci_high, se, n_clusters, n_rows``."""
+    from ..stats import cluster_bootstrap
+    try:
+        r = cluster_bootstrap(df, value_col, cluster_col, n_boot=int(n_boot), seed=int(seed), stat_level="cluster")
+    except TypeError:            # older signature without stat_level
+        r = cluster_bootstrap(df, value_col, cluster_col, n_boot=int(n_boot), seed=int(seed))
+    return dict(keys, mean=float(r["mean"]), ci_low=float(r["ci_low"]), ci_high=float(r["ci_high"]),
+                se=float(r.get("se", float("nan"))), n_clusters=int(r["n_clusters"]), n_rows=int(r.get("n_rows", len(df))))
+
+
 __all__ = [
     "PRIORITY", "CORE_CONDITIONS", "MARKER_WORDS", "PATCH_CLASSES", "PREREG_PATCH_CLASS", "ID_COLS", "Limits",
     "smoke_config",
@@ -784,4 +1053,7 @@ __all__ = [
     "reference_of", "Original", "load_original", "DirectionBank", "bank_signature", "unigram_counts",
     "direction_bank", "save_bank", "load_bank", "get_variants", "get_original", "all_variants",
     "get_bank", "marker_lexicon", "finish_stage", "write_error", "pearson",
+    "DOMAIN_GROUPS", "DEFAULT_DOMAIN_GROUP", "SMOKE_GL", "family_domain", "families_in_group", "k_subset",
+    "prereg_layer_grid", "grid_sites", "last_state", "Substages", "synthetic_sae", "get_sae", "stage_run_dir",
+    "load_stage_table", "family_text_pairs", "boot_row",
 ]

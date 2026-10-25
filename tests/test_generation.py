@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -15,26 +17,37 @@ DE = "Der Mann liest den Bericht am Morgen und die Frau schreibt einen Brief."
 # schedules
 # --------------------------------------------------------------------------------------
 def test_schedule_ramp_values_and_length():
+    """DESIGN D3: ramp 0 -> eps_max -> 0 in n_steps steps, i.e. the zero-dose plateaus at
+    both ends are part of the cycle (finding: they were missing, the ramp started at
+    eps_max / n_steps)."""
     eps_max, n_steps, tpt = 1.0, 4, 2
     f = G.schedule_ramp(eps_max, n_steps, tpt)
-    total = 2 * n_steps * tpt
+    n_lev = n_steps + 1
+    total = 2 * n_lev * tpt
     vals = [f(k) for k in range(total)]
     expected = []
-    for level in [1, 2, 3, 4, 4, 3, 2, 1]:
+    for level in [0, 1, 2, 3, 4, 4, 3, 2, 1, 0]:
         expected += [eps_max * level / n_steps] * tpt
     assert vals == pytest.approx(expected)
+    assert vals[:tpt] == [0.0] * tpt and vals[-tpt:] == [0.0] * tpt       # zero-dose plateaus inside the ramp
     assert f(-1) == 0.0 and f(total) == 0.0 and f(total + 5) == 0.0
-    assert sum(1 for k in range(-5, total + 5) if f(k) > 0) == total     # ramp length
+    assert sum(1 for k in range(-5, total + 5) if f(k) > 0) == total - 2 * tpt     # dosed length
     # plateau per step, palindromic (same level on the way up and down)
     for k in range(total):
         assert f(k) == pytest.approx(f(total - 1 - k))
-    assert f.n_new == total and f.n_steps == n_steps and f.tokens_per_step == tpt
-    assert np.allclose(f.levels, G.ramp_levels(eps_max, n_steps))
-    assert np.allclose(G.ramp_levels(0.5, 2), [0.25, 0.5])
+    assert f.n_new == total and f.n_steps == n_steps and f.tokens_per_step == tpt and f.n_levels == n_lev
+    assert np.allclose(f.levels, G.ramp_levels(eps_max, n_steps)) and f.levels.shape == (n_lev,)
+    assert np.allclose(G.ramp_levels(0.5, 2), [0.0, 0.25, 0.5])
     slices = G.ramp_step_slices(n_steps, tpt)
-    assert len(slices) == 2 * n_steps
-    assert [s[2] for s in slices] == [0, 1, 2, 3, 3, 2, 1, 0]
-    assert [s[0] for s in slices] == ["up"] * 4 + ["down"] * 4
+    assert len(slices) == 2 * n_lev
+    assert [s[2] for s in slices] == [0, 1, 2, 3, 4, 4, 3, 2, 1, 0]
+    assert [s[0] for s in slices] == ["up"] * n_lev + ["down"] * n_lev
+    assert [s[1] for s in slices] == list(range(2 * n_lev))
+    assert all(s[3] == slice(s[1] * tpt, (s[1] + 1) * tpt) for s in slices)
+    # production settings: 9 levels, 144 tokens
+    assert G.schedule_ramp(0.1, 8, 8).n_new == 144 and G.ramp_levels(0.1, 8).shape == (9,)
+    with pytest.raises(ValueError):
+        G.schedule_ramp(0.1, 0, 8)
 
 
 def test_schedule_quench_and_const():
@@ -91,7 +104,34 @@ def test_language_trajectory_switches_and_window(tok):
     assert wf[3] == pytest.approx(0.5) and wf[7] == pytest.approx(1.0)
     assert np.isnan(G.window_fraction(list("NNN"), window=2)).all()
     assert G.block_fraction(np.array(list("EDDN"))) == (pytest.approx(2 / 3), 3)
-    assert G.block_fraction(np.array(list("NN"))) == (0.0, 0)
+    assert G.block_fraction(np.array(list("NN"))) == (0.0, 0)                 # lang_id convention
+    f_empty, n_empty = G.block_fraction(np.array(list("NN")), empty=np.nan)   # hysteresis: missing data
+    assert np.isnan(f_empty) and n_empty == 0
+    # per-token indicator: 1 for D, 0 for E, NaN for N (any shape)
+    ind = G.token_indicator(np.array([list("EDN"), list("DDE")]))
+    assert np.array_equal(ind, [[0.0, 1.0, np.nan], [1.0, 1.0, 0.0]], equal_nan=True)
+    assert np.array_equal(G.token_indicator(list("EDN"), lang="E"), [1.0, 0.0, np.nan], equal_nan=True)
+
+
+def test_hysteresis_area_nan_aware():
+    """Finding: a plateau without E/D-labelled tokens entered the branches as f_D = 0 and
+    faked an area.  Such plateaus are NaN now and skipped by the trapezoid; the area is NaN
+    (not 0) when fewer than two levels carry data on both branches."""
+    levels = [0.0, 0.25, 0.5]
+    assert G.hysteresis_area([0.0, 0.0, 0.0], [0.4, 0.6, 0.8], levels) == pytest.approx(0.25 * 0.5 + 0.25 * 0.7)
+    # the middle level is missing on one branch: integrate over the two remaining levels
+    assert G.hysteresis_area([0.0, np.nan, 0.0], [0.4, 0.8, 0.9], levels) == pytest.approx(0.5 * (0.4 + 0.9) / 2)
+    assert G.hysteresis_area([0.0, 0.0, 0.0], [0.4, np.nan, 0.9], levels) == pytest.approx(0.5 * (0.4 + 0.9) / 2)
+    # fewer than two levels with data on both branches: undefined
+    assert np.isnan(G.hysteresis_area([0.1], [0.5], [0.5]))
+    assert np.isnan(G.hysteresis_area([np.nan, 0.0, 0.0], [0.4, np.nan, 0.9], levels))
+    assert np.isnan(G.hysteresis_area([np.nan] * 3, [0.4, 0.5, 0.9], levels))
+    assert G.levels_with_data([0.0, np.nan, 0.0], [0.4, 0.8, 0.9]) == 2
+    assert G.levels_with_data([np.nan, 0.0, 0.0], [0.4, np.nan, 0.9]) == 1
+    assert G.trapezoid([1.0, np.nan, 3.0], [0.0, 1.0, 2.0]) == pytest.approx(4.0)
+    assert np.isnan(G.trapezoid([1.0], [0.0])) and np.isnan(G.trapezoid([], []))
+    # the old behaviour, for the record: a fake 0 at the empty level produced a non-zero area
+    assert G.trapezoid(np.array([0.5, 0.5]) - np.array([0.0, 0.5]), [0.25, 0.5]) == pytest.approx(0.0625)
 
 
 def test_fallback_labeller_word_rules():
@@ -110,47 +150,72 @@ def _direction(mb):
     return torch.randn(mb.d_model, generator=torch.Generator().manual_seed(3))
 
 
+def _finite_in_unit(x):
+    x = np.asarray(x, dtype=np.float64)
+    fin = x[np.isfinite(x)]
+    return bool(((0 <= fin) & (fin <= 1)).all())
+
+
 def test_hysteresis_small(mb, sample_ids):
     site = HookSite(mb.n_layers // 2, "block_input")
     n_steps, tpt, n_samples, n_null, seed = 2, 3, 2, 3, 0
+    n_lev = n_steps + 1
     h = G.hysteresis(mb, sample_ids, site, _direction(mb), eps_max=0.5, n_steps=n_steps,
                      tokens_per_step=tpt, n_samples=n_samples, seed=seed, n_null=n_null)
-    assert h["up"].shape == (n_steps,) and h["down"].shape == (n_steps,)
-    assert h["restart"].shape == (n_steps,) and h["restart_b"].shape == (n_steps,)
-    assert np.allclose(h["eps_levels"], [0.25, 0.5])
+    # n_steps + 1 levels including the zero-dose plateaus at both ends (DESIGN D3)
+    assert h["n_levels"] == n_lev and h["up"].shape == (n_lev,) and h["down"].shape == (n_lev,)
+    assert h["restart"].shape == (n_lev,) and h["restart_b"].shape == (n_lev,)
+    assert np.allclose(h["eps_levels"], [0.0, 0.25, 0.5])
+    # plateaus without E/D tokens are NaN (missing data), everything else is a fraction
     for key in ("up", "down", "restart", "restart_b"):
-        assert np.isfinite(h[key]).all() and (0 <= h[key]).all() and (h[key] <= 1).all()
-    assert np.isfinite(h["area"]) and np.isfinite(h["null_area"])
-    assert h["area"] == pytest.approx(G.hysteresis_area(h["up"], h["down"], h["eps_levels"]))
-    assert h["tokens"].shape == (n_samples, 2 * n_steps * tpt)
+        assert _finite_in_unit(h[key])
+    assert 0 <= h["n_levels_with_data"] <= n_lev
+    assert h["n_levels_with_data"] == G.levels_with_data(h["up"], h["down"])
+    assert np.isfinite(h["area"]) == (h["n_levels_with_data"] >= 2)
+    assert h["area"] == pytest.approx(G.hysteresis_area(h["up"], h["down"], h["eps_levels"]), nan_ok=True)
+    assert h["tokens"].shape == (n_samples, 2 * n_lev * tpt)
     assert h["labels"].shape == h["tokens"].shape and h["fD_window"].shape == h["tokens"].shape
-    assert np.allclose(h["eps"], [0.25] * 3 + [0.5] * 6 + [0.25] * 3)
+    assert np.allclose(h["eps"], [0.0] * 3 + [0.25] * 3 + [0.5] * 6 + [0.25] * 3 + [0.0] * 3)
     curves = h["curves"]
     assert isinstance(curves, pd.DataFrame)
     assert set(curves.columns) >= {"branch", "replicate", "seed", "step", "level", "eps", "fD", "fD_window", "entropy", "n_ED"}
     assert sorted(curves["branch"].unique()) == ["down", "restart_a", "restart_b", "restart_c", "up"]
-    assert (curves["branch"] == "up").sum() == n_steps and (curves["branch"] == "down").sum() == n_steps
+    assert (curves["branch"] == "up").sum() == n_lev and (curves["branch"] == "down").sum() == n_lev
     assert (curves.loc[curves["branch"].isin(["up", "down"]), "replicate"] == -1).all()
+    assert curves.loc[curves["branch"] == "up", "level"].tolist() == list(range(n_lev))
+    assert curves.loc[curves["branch"] == "down", "level"].tolist() == list(range(n_lev))[::-1]
+    # the curve rows agree with the branch arrays; fD is NaN exactly where n_ED == 0
+    assert curves["fD"].isna().to_numpy().tolist() == (curves["n_ED"] == 0).tolist()
+    for branch, arr in (("up", h["up"]), ("down", h["down"])):
+        sub = curves[curves["branch"] == branch].sort_values("level")
+        assert np.allclose(sub["fD"].to_numpy(), arr, equal_nan=True)
     # null model: n_null independent restarts per level, seeds disjoint from the ramp and from
     # each other (no common random numbers across levels, restart[0] != up[0] by construction)
-    assert h["n_null"] == n_null and h["restarts"].shape == (n_null, n_steps)
-    assert np.array_equal(h["restart"], h["restarts"][0]) and np.array_equal(h["restart_b"], h["restarts"][1])
+    assert h["n_null"] == n_null and h["restarts"].shape == (n_null, n_lev)
+    assert np.array_equal(h["restart"], h["restarts"][0], equal_nan=True)
+    assert np.array_equal(h["restart_b"], h["restarts"][1], equal_nan=True)
     seeds = h["restart_seeds"]
-    assert seeds.shape == (n_null, n_steps) and len(set(seeds.reshape(-1).tolist())) == n_null * n_steps
+    assert seeds.shape == (n_null, n_lev) and len(set(seeds.reshape(-1).tolist())) == n_null * n_lev
     assert seed not in set(seeds.reshape(-1).tolist())
-    assert seeds.tolist() == [[G.restart_seed(seed, r, l) for l in range(n_steps)] for r in range(n_null)]
+    assert seeds.tolist() == [[G.restart_seed(seed, r, l) for l in range(n_lev)] for r in range(n_null)]
     assert G.restart_seed(0, 0, 0) == 10_000 and G.restart_seed(3, 1, 2) == 3 + 20_000 + 2
     for r in range(n_null):
         sub = curves[curves["replicate"] == r]
-        assert len(sub) == n_steps and sub["seed"].tolist() == seeds[r].tolist()
+        assert len(sub) == n_lev and sub["seed"].tolist() == seeds[r].tolist()
         assert sub["branch"].unique().tolist() == [f"restart_{'abc'[r]}"]
-    # null distribution: one signed area per replicate pair, symmetric summary statistics
+        assert sub["eps"].tolist() == pytest.approx([0.0, 0.25, 0.5])
+    # null distribution: one signed area per replicate pair, NaN-aware symmetric summaries
     pairs = [(a, b) for a in range(n_null) for b in range(a + 1, n_null)]
     assert h["null_areas"].shape == (len(pairs),)
-    assert np.allclose(h["null_areas"], [G.hysteresis_area(h["restarts"][a], h["restarts"][b], h["eps_levels"]) for a, b in pairs])
-    assert h["null_area"] == pytest.approx(float(np.mean(h["null_areas"])))
-    assert h["null_area_sd"] == pytest.approx(float(np.sqrt(np.mean(h["null_areas"] ** 2))))
-    if h["null_area_sd"] > 0:
+    assert np.allclose(h["null_areas"], [G.hysteresis_area(h["restarts"][a], h["restarts"][b], h["eps_levels"]) for a, b in pairs],
+                       equal_nan=True)
+    fin = h["null_areas"][np.isfinite(h["null_areas"])]
+    if fin.size:
+        assert h["null_area"] == pytest.approx(float(np.mean(fin)))
+        assert h["null_area_sd"] == pytest.approx(float(np.sqrt(np.mean(fin ** 2))))
+    else:
+        assert np.isnan(h["null_area"]) and np.isnan(h["null_area_sd"])
+    if np.isfinite(h["null_area_sd"]) and h["null_area_sd"] > 0 and np.isfinite(h["area"]):
         assert h["area_z"] == pytest.approx(h["area"] / h["null_area_sd"])
     else:
         assert np.isnan(h["area_z"])
@@ -158,7 +223,7 @@ def test_hysteresis_small(mb, sample_ids):
         G.hysteresis(mb, sample_ids, site, _direction(mb), eps_max=0.5, n_steps=1, tokens_per_step=1, n_samples=1, n_null=1)
     # area formula: trapezoid of (down - up) over the dose levels
     assert G.hysteresis_area([0.0, 0.0], [0.4, 0.8], [0.25, 0.5]) == pytest.approx(0.25 * 0.6)
-    assert G.hysteresis_area([0.1], [0.5], [0.5]) == 0.0
+    assert np.isnan(G.hysteresis_area([0.1], [0.5], [0.5]))
 
 
 def test_hysteresis_restart_is_independent_of_ramp(mb, sample_ids):
@@ -170,7 +235,7 @@ def test_hysteresis_restart_is_independent_of_ramp(mb, sample_ids):
     h = G.hysteresis(mb, sample_ids, site, vec, eps_max=0.5, n_steps=n_steps, tokens_per_step=tpt,
                      n_samples=n_samples, seed=seed, n_null=2)
     from lsne.model import generate_steered
-    eps0 = float(h["eps_levels"][0])
+    eps0 = float(h["eps_levels"][0])                   # level 0 is the zero-dose plateau
     ramp_first = h["tokens"][:, :tpt]
     # what the old implementation did: restart with the ramp seed reproduces the first plateau
     same_seed = generate_steered(mb, sample_ids, site, vec, G.schedule_const(eps0), n_new=tpt, n_samples=n_samples,
@@ -186,10 +251,10 @@ def test_hysteresis_restart_is_independent_of_ramp(mb, sample_ids):
 
 def test_relaxation_small(mb, sample_ids):
     site = HookSite(mb.n_layers // 2, "block_input")
-    n_new, t_on, n_samples = 10, 3, 2
+    n_new, t_on, n_samples = 16, 4, 2
     r = G.relaxation(mb, sample_ids, site, _direction(mb), eps=0.5, t_on=t_on, n_new=n_new,
                      n_samples=n_samples, seed=0, n_boot=20)
-    assert r["fD_t"].shape == (n_new,) and r["entropy_t"].shape == (n_new,)
+    assert r["fD_t"].shape == (n_new,) and r["fD_token_t"].shape == (n_new,) and r["entropy_t"].shape == (n_new,)
     assert np.isfinite(r["entropy_t"]).all() and (r["entropy_t"] > 0).all()
     assert np.isfinite(r["tau"]) or np.isnan(r["tau"])
     assert len(r["tau_ci"]) == 2 and r["tau_boot"].shape == (20,) and r["b_boot"].shape == (20,)
@@ -197,18 +262,68 @@ def test_relaxation_small(mb, sample_ids):
     assert set(r["fit"]) == set(G._FIT_KEYS)
     assert (np.isnan(r["tau"]) and np.isnan(r["fit"]["tau"])) or r["tau"] == r["fit"]["tau"]
     assert np.isnan(r["tau"]) or r["fit"]["identifiable"]
-    # the combined gate: series test AND between-sample bootstrap (two samples -> informative)
-    assert r["criterion"] == r["fit"]["criterion"] == "series+bootstrap"
+    # the combined gate: series test AND between-sample bootstrap (two samples -> informative
+    # unless too few resamples yield a fit on this short series)
+    assert r["criterion"] == r["fit"]["criterion"] in ("series+bootstrap", "series")
     assert r["n_tau_boot"] == int(np.isfinite(r["tau_boot"]).sum())
     assert r["fit"]["identifiable"] == (r["fit"]["reason"] == "")
-    if not r["b_ci_excludes_zero"]:
+    if r["criterion"] == "series+bootstrap" and not r["b_ci_excludes_zero"]:
         assert "bootstrap" in r["fit"]["reason"] and np.isnan(r["tau"])
     assert np.allclose(r["eps_t"], [0.0] * t_on + [0.5] * (n_new - t_on))
     assert r["tokens"].shape == (n_samples, n_new) and r["labels"].shape == (n_samples, n_new)
-    # the gate is a pure function of the per-sample fractions (reproducible without a model)
-    g = G.fit_relaxation_samples(r["fD_window"], t_on, r["t"], window=G.WINDOW, n_boot=20, seed=0)
-    assert np.allclose(g["fD_t"], r["fD_t"], equal_nan=True) and g["criterion"] == r["criterion"]
+    # tau is fitted on the unwindowed per-token D indicator (window=1, iid F-test, no MA null);
+    # the running-window series fD_t is kept for plots only
+    assert r["fit_window"] == 1 and r["fit"]["n_null"] == 0
+    if np.isfinite(r["fit"]["vif"]):
+        assert r["fit"]["vif"] == pytest.approx(1.0)
+    assert r["fD_token"].shape == (n_samples, n_new) and r["fD_window"].shape == (n_samples, n_new)
+    assert np.array_equal(r["fD_token"], G.token_indicator(r["labels"]), equal_nan=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        assert np.allclose(r["fD_token_t"], np.nanmean(r["fD_token"], axis=0), equal_nan=True)
+        assert np.allclose(r["fD_t"], np.nanmean(r["fD_window"], axis=0), equal_nan=True)
+    # the gate is a pure function of the per-sample indicator (reproducible without a model)
+    g = G.fit_relaxation_samples(r["fD_token"], t_on, r["t"], window=1, n_boot=20, seed=0)
+    assert np.allclose(g["fD_t"], r["fD_token_t"], equal_nan=True) and g["criterion"] == r["criterion"]
     assert np.allclose(g["b_boot"], r["b_boot"], equal_nan=True) and g["fit"]["reason"] == r["fit"]["reason"]
+    assert g["window"] == 1 and G.fit_relaxation_samples(r["fD_window"], t_on, r["t"], window=8, n_boot=5)["window"] == 8
+
+
+def _bernoulli_labels(rng, p_t, n_samples):
+    lab = rng.random((n_samples, p_t.shape[0])) < p_t[None, :]
+    return np.where(lab, "D", "E")
+
+
+def test_relaxation_tau_floor_of_windowed_series():
+    """Finding: tau was fitted on the running-window fraction (window 8).  The trailing box
+    window turns a step into a rise over 8 tokens, so the fitted tau could not fall below
+    ~window/2 and slower responses were biased by ~(window-1)/2.  The per-token indicator
+    (window=1) has no such floor: a step is censored at TAU_BOUNDS[0], tau = 4 is recovered."""
+    rng = np.random.default_rng(7)
+    t = np.arange(64)
+    t_on, w, B = 16, 8, 400                                    # many samples: a nearly noise-free mean
+
+    def both_fits(p_t):
+        labels = _bernoulli_labels(rng, p_t, B)
+        fw = np.stack([G.window_fraction(labels[b], w) for b in range(B)])
+        f_win = G.fit_relaxation(np.nanmean(fw, axis=0), t_on, t, window=w)
+        f_ind = G.fit_relaxation(np.nanmean(G.token_indicator(labels), axis=0), t_on, t, window=1)
+        return f_win, f_ind
+
+    # instantaneous response (step one token after t_on)
+    f_win, f_ind = both_fits(np.where(t >= t_on + 1, 0.7, 0.1))
+    assert f_win["identifiable"] and f_win["tau_raw"] > 2.5                       # the floor: ~w/2
+    assert f_ind["identifiable"] and f_ind["tau_censored"] and f_ind["tau_raw"] == pytest.approx(G.TAU_BOUNDS[0], rel=0.2)
+    # tau = 4: the indicator recovers it, the windowed series overestimates it by several tokens
+    tau_true = 4.0
+    f_win, f_ind = both_fits(np.where(t >= t_on, 0.1 + 0.6 * (1 - np.exp(-(t - t_on) / tau_true)), 0.1))
+    assert f_ind["identifiable"] and not f_ind["tau_censored"] and abs(f_ind["tau"] - tau_true) < 1.0
+    assert f_win["tau_raw"] > f_ind["tau"] + 2.0
+    # the full gate on per-sample indicators at the production sample size (8) still identifies
+    # a strong response and reports its tau with the iid test (no Monte-Carlo null)
+    p = np.where(t >= t_on, 0.1 + 0.6 * (1 - np.exp(-(t - t_on) / tau_true)), 0.1)
+    g = G.fit_relaxation_samples(G.token_indicator(_bernoulli_labels(rng, p, 8)), t_on, t, n_boot=50, seed=0)
+    assert g["window"] == 1 and g["fit"]["n_null"] == 0 and g["fit"]["identifiable"] and 1.0 < g["tau"] < 12.0
 
 
 def test_fit_relaxation_recovers_tau():

@@ -17,6 +17,10 @@ from .config import HookSite, ModelSpec
 
 DTYPES = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
 
+# Pre-registration §4: a run whose written vector deviates from the intended one by more
+# than this (relative, FP32) is invalid.  Used for `valid` in the generation audit.
+AUDIT_REL_ERR_MAX = 1e-4
+
 
 def resolve_device(device: str) -> torch.device:
     if device == "auto":
@@ -239,6 +243,8 @@ class Injector:
     every_token=True adds a Tensor[d] delta to every position of every chunk the hook sees
     (used for steering during cached generation, where chunks are [B,1,d]).
     `audit` records intended vs. actually written change on the first call (Soll/Ist).
+    A callable delta that carries its own `audit` dict (ScheduledSteer) is adopted
+    instead as soon as it is non-empty, i.e. on the first *dosed* call.
     """
 
     def __init__(self, mb: ModelBundle, site: HookSite, delta, positions=None,
@@ -296,6 +302,14 @@ class Injector:
 
     def _do_audit(self, h, h_new):
         with torch.no_grad():
+            if callable(self.delta) and not isinstance(self.delta, torch.Tensor):
+                own = getattr(self.delta, "audit", None)
+                if isinstance(own, dict):
+                    # self-auditing callable: adopt its record once a dosed call happened,
+                    # otherwise stay empty so the next call is tried again
+                    if own:
+                        self.audit = dict(own)
+                    return
             written = (h_new.float() - h.float())
             if isinstance(self.delta, torch.Tensor) and self.mode == "add" and self.delta.dim() == 1 \
                     and self.positions is not None and not self.every_token:
@@ -381,7 +395,7 @@ def entropy_gradient(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite,
         H = -(logp.exp() * logp).sum()
         H.backward()
     g = leaf["h"].grad[0, position].detach().float().clone()
-    return g, float(H)
+    return g, float(H.detach())
 
 
 # --------------------------------------------------------------------------------------
@@ -396,6 +410,12 @@ class ScheduledSteer:
     added at absolute position T0-1+k, i.e. "the dose at the step that produces token k".
     Prompt positions < T0-1 are untouched. Positions are tracked by counting the chunk
     lengths the hook sees (full prompt first, then one token per step).
+
+    Soll/Ist audit: on the first *dosed* call (some eps(k) != 0 in the chunk) `audit`
+    records, at the dosed positions and in fp32, intended = eps·RMS(h)·dir/RMS(dir) vs.
+    written = h_new − h: `intended_norm`, `written_norm`, `rel_err` (= ‖written −
+    intended‖/‖intended‖), `dtype` of h, `n_dosed`, absolute `positions` and their `eps`.
+    It stays empty while no dose has been written.
     """
 
     def __init__(self, direction: torch.Tensor, eps_schedule: Callable[[int], float], prompt_len: int):
@@ -404,10 +424,12 @@ class ScheduledSteer:
         self.prompt_len = prompt_len
         self.offset = 0
         self.eps_log: list[float] = []
+        self.audit: dict = {}
 
     def reset(self):
         self.offset = 0
         self.eps_log = []
+        self.audit = {}
 
     def __call__(self, h: torch.Tensor) -> torch.Tensor:
         B, n, d = h.shape
@@ -419,8 +441,24 @@ class ScheduledSteer:
         self.eps_log.extend([float(e) for e, kk in zip(eps.tolist(), k.tolist()) if kk >= 0])
         if float(eps.abs().max()) == 0.0:
             return h
-        scale = eps[None, :, None] * rms(h)[..., None]          # [B,n,1]
-        return (h.float() + scale * self.dir.to(h.device)[None, None, :]).to(h.dtype)
+        scale = eps[None, :, None] * rms(h)[..., None]          # [B,n,1] fp32
+        intended = scale * self.dir.to(h.device)[None, None, :]  # [B,n,d] fp32
+        h_new = (h.float() + intended).to(h.dtype)
+        if not self.audit:
+            self._do_audit(h, h_new, intended, eps, pos)
+        return h_new
+
+    def _do_audit(self, h, h_new, intended, eps, pos):
+        with torch.no_grad():
+            dosed = eps != 0
+            i = intended[:, dosed, :]
+            w = (h_new.float() - h.float())[:, dosed, :]
+            i_norm = i.norm()
+            self.audit = dict(intended_norm=float(i_norm), written_norm=float(w.norm()),
+                              rel_err=float((w - i).norm() / i_norm.clamp_min(1e-30)),
+                              dtype=str(h.dtype), n_dosed=int(dosed.sum()),
+                              positions=[int(p) for p in pos[dosed].tolist()],
+                              eps=[float(e) for e in eps[dosed].tolist()])
 
 
 def generate_steered(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite,
@@ -429,7 +467,11 @@ def generate_steered(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite,
                      seed: int = 0, top_p: float = 1.0) -> dict:
     """Sample `n_samples` continuations while steering every generated token according
     to `eps_schedule(k)`. Returns tokens [n_samples,n_new], per-token logprob (of the
-    sampled token under the raw model distribution) and entropy, and eps per step."""
+    sampled token under the raw model distribution) and entropy, eps per step, and
+    `audit`: the Soll/Ist record of the first dosed step (see ScheduledSteer) plus
+    `valid = rel_err <= AUDIT_REL_ERR_MAX` (pre-registration §4). A run that wrote no
+    dose (direction None or an all-zero schedule) has n_dosed = 0, rel_err NaN and
+    valid True, since no vector was written."""
     input_ids = input_ids.to(mb.device)
     if input_ids.shape[0] == 1 and n_samples > 1:
         input_ids = input_ids.expand(n_samples, -1).contiguous()
@@ -442,7 +484,7 @@ def generate_steered(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite,
               top_p=top_p, top_k=0, pad_token_id=mb.tokenizer.pad_token_id or 0,
               output_logits=True, return_dict_in_generate=True, use_cache=True,
               attention_mask=torch.ones_like(input_ids))
-    with torch.no_grad(), Injector(mb, site, steer):
+    with torch.no_grad(), Injector(mb, site, steer) as inj:
         out = mb.model.generate(input_ids, **kw)
     toks = out.sequences[:, T0:T0 + n_new]
     logits = torch.stack([l.float() for l in out.logits], 1)      # [B,n_new,V] raw
@@ -450,5 +492,9 @@ def generate_steered(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite,
     tok_logp = logp.gather(-1, toks[..., None]).squeeze(-1)
     ent = -(logp.exp() * logp).sum(-1)
     eps = torch.tensor(steer.eps_log[:n_new]) if steer.eps_log else torch.zeros(n_new)
+    audit = dict(inj.audit) if inj.audit else dict(
+        intended_norm=float("nan"), written_norm=float("nan"), rel_err=float("nan"),
+        dtype=str(mb.dtype), n_dosed=0, positions=[], eps=[])
+    audit["valid"] = bool(audit["rel_err"] <= AUDIT_REL_ERR_MAX) if audit["n_dosed"] else True
     return dict(tokens=toks.cpu(), logprobs=tok_logp.cpu(), entropies=ent.cpu(), eps=eps,
-                prompt_len=T0)
+                prompt_len=T0, audit=audit)

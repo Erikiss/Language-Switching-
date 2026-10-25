@@ -9,6 +9,13 @@ Semantics (as in ``sparsify.Sae``):
     pre   = (x - b_dec) @ W_enc.T + b_enc
     acts  = relu(pre);  keep the k largest per sample (TopK)
     x_hat = sum_j acts_j * W_dec[idx_j] + b_dec
+
+Only this plain TopK forward pass is implemented. sparsify configs that change it are
+rejected by :func:`check_sparsify_cfg` (called from :meth:`TopKSAE.from_state` and hence
+:meth:`TopKSAE.load_from_hub`): ``signed`` latents, a non-``"topk"`` ``activation``
+(``"groupmax"``), a linear ``skip_connection`` (``W_skip``), a transcoder (``transcode``)
+or a ``W_skip`` tensor in the state dict. ``multi_topk`` is a training loss only and does
+not alter inference, so it is accepted.
 """
 from __future__ import annotations
 
@@ -24,6 +31,32 @@ import torch.nn as nn
 from .config import SAE_REPOS
 
 _EPS = 1e-30
+
+
+def check_sparsify_cfg(cfg: Optional[dict], tensors: Optional[dict] = None) -> None:
+    """Raise ``ValueError`` when a sparsify ``cfg.json`` / state dict describes an SAE whose
+    forward pass differs from the plain TopK semantics of :class:`TopKSAE`.
+
+    Rejected: ``signed=True`` (TopK on ``|pre|`` with signed latents), ``activation`` other
+    than ``"topk"`` (e.g. ``"groupmax"``), ``skip_connection=True`` (``x @ W_skip.T`` is
+    added to the reconstruction), ``transcode=True`` (the input is not ``b_dec``-centred and
+    the target is another hookpoint) and a ``W_skip`` tensor present in ``tensors``.
+    Missing keys take sparsify's defaults (all off, ``activation="topk"``)."""
+    cfg = dict(cfg or {})
+    problems: list[str] = []
+    act = cfg.get("activation", "topk")
+    if str(act).lower() != "topk":
+        problems.append(f"activation={act!r} (only 'topk' is implemented)")
+    for key in ("signed", "skip_connection", "transcode"):
+        if bool(cfg.get(key, False)):
+            problems.append(f"{key}={cfg[key]!r}")
+    if tensors is not None and "W_skip" in tensors:
+        problems.append("W_skip tensor present in the state dict (skip connection)")
+    if problems:
+        raise ValueError("unsupported sparsify SAE config: " + "; ".join(problems)
+                         + ". TopKSAE implements only relu + TopK on (x - b_dec) @ W_enc.T + b_enc "
+                           "with x_hat = acts @ W_dec + b_dec (no signed latents, groupmax, skip "
+                           "connection or transcoding).")
 
 
 class TopKSAE(nn.Module):
@@ -82,7 +115,9 @@ class TopKSAE(nn.Module):
     @classmethod
     def from_state(cls, tensors: dict, cfg: dict, device="cpu", **extra) -> "TopKSAE":
         """Build from a sparsify state dict (keys ``encoder.weight``, ``encoder.bias``,
-        ``W_dec``, ``b_dec``) and its cfg dict."""
+        ``W_dec``, ``b_dec``) and its cfg dict. Raises ``ValueError`` for configs whose
+        forward pass is not the plain TopK one (:func:`check_sparsify_cfg`)."""
+        check_sparsify_cfg(cfg, tensors)
         W_enc = tensors["encoder.weight"]
         b_enc = tensors.get("encoder.bias", torch.zeros(W_enc.shape[0]))
         W_dec = tensors["W_dec"]
@@ -242,5 +277,5 @@ def sae_repo_for(model_name: str) -> Optional[tuple[str, str]]:
     return None
 
 
-__all__ = ["TopKSAE", "fvu", "sae_fvu", "feature_table", "language_selective_features",
-           "feature_direction", "sae_repo_for"]
+__all__ = ["TopKSAE", "check_sparsify_cfg", "fvu", "sae_fvu", "feature_table",
+           "language_selective_features", "feature_direction", "sae_repo_for"]

@@ -2,7 +2,8 @@
 
 Tables
 ------
-families        one row per family file (ids, title, target, token id, n_units, kind)
+families        one row per family file (ids, title, target, token id from the K=0
+                variant - or the K=0 rendering if no variant was kept -, n_units, kind)
 variants        one row per variant (family, formulation, K, C, mask, n_tokens, n_words,
                 F100, last_switch_pos, tail_start, n_tokens_D, ..., text)
 checks          every built variant with its problems (``excluded`` flag) + schema failures
@@ -25,12 +26,31 @@ from ..model import ModelBundle
 from . import common as C
 
 
-def families_table(fams, original) -> pd.DataFrame:
+def families_table(fams, original, variants=(), tokenizer=None) -> pd.DataFrame:
+    """One row per family; ``target_id`` of a standard family (``Family.target_id`` is
+    None) is taken from its K=0 variant in `variants` (the id is identical across the
+    variants of a family/formulation, `stimuli.check_variant`; any variant of the group
+    is used when no K=0 variant was kept).  For a family without a variant (e.g. cut by
+    ``cfg.limit_variants``) the id is computed from the K=0 rendering when a `tokenizer`
+    is given (`stimuli.target_token_id`; NaN if the target is not a single token), else
+    it is NaN."""
+    target_ids: dict[tuple[str, str], int] = {}
+    for v in variants:
+        key = (str(v.family_id), str(v.formulation))
+        if int(v.K) == 0 or key not in target_ids:
+            target_ids[key] = int(v.target_id)
     rows = []
     for f in list(fams) + ([original.family] if original is not None else []):
+        tid = f.target_id if f.target_id is not None else target_ids.get((f.family_id, f.formulation))
+        if tid is None and tokenizer is not None and f.kind == "standard":
+            try:
+                text = stimuli.render_text(f, stimuli.segment_masks(f.n_units, 0, "C1"))
+                tid = stimuli.target_token_id(tokenizer, text, f.target)
+            except ValueError:
+                tid = None
         rows.append(dict(tag=f.tag, family=f.family_id, formulation=f.formulation, kind=f.kind,
                          title=f.title, topic=f.topic, n_units=f.n_units, n_segments=f.n_segments,
-                         target=f.target, target_id=f.target_id, tail_E=f.tail_E,
+                         target=f.target, target_id=tid, tail_E=f.tail_E,
                          dev=f.family_id.startswith("DEV"), source=f.source or ""))
     return pd.DataFrame(rows, columns=["tag", "family", "formulation", "kind", "title", "topic", "n_units",
                                        "n_segments", "target", "target_id", "tail_E", "dev", "source"])
@@ -86,8 +106,13 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     allv = C.all_variants(variants, original)
     fams = C.select_families(cfg)
 
+    families = families_table(fams, original, variants, tokenizer=mb.tokenizer)
+    built = {(str(v.family_id), str(v.formulation)) for v in variants}
+    missing = [t for t, fid, form, tid in zip(families["tag"], families["family"], families["formulation"], families["target_id"])
+               if (fid, form) in built and pd.isna(tid)]
+    assert not missing, f"families table without target_id although variants were built: {missing}"
     tables = {
-        "families": families_table(fams, original),
+        "families": families,
         "variants": variants_table(allv),
         "checks": checks,
         "exclusions": checks[checks["excluded"]].reset_index(drop=True) if len(checks) else checks,

@@ -209,7 +209,8 @@ def _variant_ids(v) -> torch.Tensor:
 
 
 def collect_activations(mb: ModelBundle, variants: Sequence, site: HookSite,
-                        which: str = "segment_last") -> tuple[torch.Tensor, list[str], pd.DataFrame]:
+                        which: str = "segment_last", include_tail: bool = True
+                        ) -> tuple[torch.Tensor, list[str], pd.DataFrame]:
     """Residual activations at ``site`` for a list of stimulus variants.
 
     A variant is any object with ``.ids`` (token ids), ``.target_id`` and ``.annot`` (a dict
@@ -219,6 +220,12 @@ def collect_activations(mb: ModelBundle, variants: Sequence, site: HookSite,
     ``which="segment_last"``: one row per segment (maximal run of equal ``(unit, lang)``
     before ``tail_start``; the tail is one 'E' segment), taken at the segment's last token.
     ``which="all_tokens"``: one row per token (tail tokens labelled 'E').
+
+    ``include_tail=False`` drops the tail segment (positions ``>= tail_start``): the tail is
+    the shared English continuation that has no German counterpart, so with it the 'E'
+    class would contain unpaired material. The language axis of DESIGN section 3 is built
+    from the final tokens of *paired* segments only, hence :func:`language_axis` and the
+    direction bank collect with ``include_tail=False``.
 
     Sequences have different lengths, so each variant is run on its own.
     Returns ``(acts [N,d] float32 CPU, labels list[str], meta DataFrame)`` where meta has the
@@ -239,21 +246,25 @@ def collect_activations(mb: ModelBundle, variants: Sequence, site: HookSite,
         klass = list(annot.get("klass", []))
         if len(klass) < T:
             klass = klass + [None] * (T - len(klass))
+        tail_start = max(0, min(int(annot.get("tail_start", T)), T))
+        segs = _segments_of(annot, T)
+        if not include_tail:
+            segs = [sg for sg in segs if sg[0] < tail_start]
+        if not segs:
+            continue
         co = run_with_cache(mb, ids[None, :], [site])
         h = co.resid[site.key][0].detach().float().cpu()          # [T,d]
         base = dict(variant=vi, family=getattr(v, "family_id", None),
                     formulation=getattr(v, "formulation", None),
                     K=getattr(v, "K", None), C=getattr(v, "C", None), n_tokens=T)
-        segs = _segments_of(annot, T)
         if which == "segment_last":
             for (s, e, lang, u) in segs:
                 pos = e - 1
                 acts.append(h[pos])
                 labels.append(lang)
                 rows.append(dict(base, unit=u, position=pos, lang=lang, klass=klass[pos],
-                                 seg_start=s, seg_len=e - s, is_tail=(e == T and s == int(annot.get("tail_start", T)))))
+                                 seg_start=s, seg_len=e - s, is_tail=(e == T and s == tail_start)))
         else:
-            tail_start = int(annot.get("tail_start", T))
             for (s, e, lang, u) in segs:
                 for pos in range(s, e):
                     acts.append(h[pos])
@@ -407,19 +418,25 @@ def denoise_report(acts_D: torch.Tensor, acts_E: torch.Tensor, denoise_pcs: int 
 
 
 def language_axis(mb: ModelBundle, variants: Sequence, site: HookSite,
-                  pool: str = "segment_last", denoise_pcs: int = 1) -> Direction:
+                  pool: str = "segment_last", denoise_pcs: int = 1,
+                  include_tail: bool = False) -> Direction:
     """``lang_dom``: denoised difference of means D - E over the residuals of ``variants``
     at ``site`` (segment-final tokens by default).
+
+    By default (``include_tail=False``) only the *paired* unit segments enter the E/D
+    classes (DESIGN section 3: difference of means over the final tokens of paired
+    segments); the shared English tail, which has no German counterpart, is excluded.
+    ``include_tail=True`` adds the tail as one further 'E' segment per variant.
 
     meta: ``n_E``, ``n_D``, ``cos_denoised_plain`` (cosine between the denoised and the plain
     difference), ``separation_kept`` (gate quantity: fraction of the raw D-E mean separation
     kept along the denoised axis), ``cos_pcs_plain``, ``within_var_removed``,
     ``dprime_plain`` / ``dprime_denoised``, ``gate_ok`` / ``gate_cos`` (see
-    :func:`denoise_report`), ``denoise_pcs``, ``pool``, ``mean_norm_D/E``, ``diff_norm`` and
-    the plain direction itself under ``vec_plain``. A :class:`UserWarning` is emitted when
-    ``cos_denoised_plain < DENOISE_GATE_COS`` (0.7).
+    :func:`denoise_report`), ``denoise_pcs``, ``pool``, ``include_tail``, ``mean_norm_D/E``,
+    ``diff_norm`` and the plain direction itself under ``vec_plain``. A :class:`UserWarning`
+    is emitted when ``cos_denoised_plain < DENOISE_GATE_COS`` (0.7).
     """
-    acts, labels, _meta = collect_activations(mb, variants, site, which=pool)
+    acts, labels, _meta = collect_activations(mb, variants, site, which=pool, include_tail=bool(include_tail))
     lab = np.asarray(labels)
     D = acts[torch.as_tensor(lab == "D")]
     E = acts[torch.as_tensor(lab == "E")]
@@ -427,7 +444,7 @@ def language_axis(mb: ModelBundle, variants: Sequence, site: HookSite,
         raise ValueError(f"language_axis needs both languages (n_E={E.shape[0]}, n_D={D.shape[0]})")
     rep = denoise_report(D, E, denoise_pcs=int(denoise_pcs), warn=True)
     v_den = rep.pop("vec_denoised")
-    meta = dict(n_E=int(E.shape[0]), n_D=int(D.shape[0]), pool=pool,
+    meta = dict(n_E=int(E.shape[0]), n_D=int(D.shape[0]), pool=pool, include_tail=bool(include_tail),
                 diff_norm=float((D.mean(0) - E.mean(0)).norm()),
                 mean_norm_D=float(D.mean(0).norm()), mean_norm_E=float(E.mean(0).norm()))
     meta.update(rep)

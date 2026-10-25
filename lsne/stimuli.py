@@ -50,6 +50,10 @@ from .config import C_LEVELS, K_LEVELS, K_LEVELS_EXTREME, MASKS_UNIT_LEVEL
 
 SEGMENT_NAMES: tuple[str, ...] = ("subj", "pred", "adj")
 LANGS = ("E", "D")
+#: Token classes of :func:`annotate`.  ``ws`` = whitespace-only tokens that are not a
+#: word's leading space (a lone ``" "`` before a word the BPE could not merge it into is
+#: the word's first token: ``boundary`` / ``word_start``); under the GPT-NeoX BPE ordinary
+#: prose without line breaks therefore has no ``ws`` token.
 TOKEN_CLASSES = ("ws", "punct", "boundary", "word_start", "word_cont")
 MAX_TOKENS = 2000
 
@@ -558,19 +562,25 @@ def _token_offsets(tokenizer, text: str) -> tuple[list[int], list[tuple[int, int
     return ids, offsets
 
 
-def token_class(tok_str: str, is_first: bool, is_boundary: bool, after_ws: bool = False) -> str:
-    """Token class: 'ws' (whitespace only), 'punct' (no alphanumerics), 'boundary'
-    (first word token of a segment whose language differs from the previous one),
-    'word_start' (starts with whitespace, is the first token, or directly follows a
-    whitespace-only token such as the lone " " in " erscheint" -> [" ", "ers", "che", "int"]),
-    else 'word_cont'."""
-    if tok_str != "" and tok_str.strip() == "":
-        return "ws"
-    if not any(ch.isalnum() for ch in tok_str):
-        return "punct"
+def token_class(tok_str: str, is_first: bool, is_boundary: bool, after_ws: bool = False,
+                leading_space: bool = False) -> str:
+    """Token class: 'ws' (whitespace only: line breaks, runs of spaces), 'punct' (no
+    alphanumerics), 'boundary' (first word token of a segment whose language differs from
+    the previous one), 'word_start' (starts with whitespace, is the first token, or
+    directly follows a 'ws' token), else 'word_cont'.
+
+    ``leading_space`` marks the lone ``" "`` the BPE could not merge into the following
+    word (``" erscheint" -> [" ", "ers", "che", "int"]``): it is that word's leading
+    space, i.e. the word's first token ('boundary' or 'word_start', never 'ws'), and the
+    piece after it is a 'word_cont' - exactly as ``" The"`` carries its space."""
+    if not leading_space:
+        if tok_str != "" and tok_str.strip() == "":
+            return "ws"
+        if not any(ch.isalnum() for ch in tok_str):
+            return "punct"
     if is_boundary:
         return "boundary"
-    if is_first or after_ws or tok_str[:1].isspace():
+    if leading_space or is_first or after_ws or tok_str[:1].isspace():
         return "word_start"
     return "word_cont"
 
@@ -580,9 +590,16 @@ def annotate(tokenizer, text: str, segments_with_lang: Sequence) -> dict:
 
     `segments_with_lang` is the list of ``(segment_text, lang, unit_idx, segment_name)``
     returned by `render` (the tail must be the last entry, name "tail").  A token belongs
-    to the segment that contains its first non-space character (whitespace-only tokens
-    to the segment owning their first character; joiner characters belong to the
-    preceding segment).
+    to the segment that contains its first non-space character; joiner characters
+    belong to the preceding segment.  A whitespace-only token belongs to the segment
+    owning its first character, except for a word's *leading space*: the lone ``" "``
+    the BPE could not merge into the following word (``" erscheint"`` -> ``[" ", "ers",
+    "che", "int"]``) belongs to that word.  When the word starts a new segment the
+    space therefore takes the new segment (its language and unit), is the segment's
+    first word token (class ``boundary`` at a language switch, else ``word_start``) and
+    ``dist_to_last_switch`` counts from it; the piece after it is a ``word_cont``.  The
+    class ``ws`` is kept for whitespace-only tokens that are not a word's leading space
+    (line breaks, runs of spaces).
 
     Returns a dict with per-token lists ``tokens`` (decoded), ``lang``, ``unit``, ``seg``
     (segment index, tail = last), ``klass``, ``dist_to_last_switch`` (tokens since the
@@ -602,17 +619,24 @@ def annotate(tokenizer, text: str, segments_with_lang: Sequence) -> dict:
     tok_strs = [text[s:e] for s, e in offsets]
     tail_idx = len(segments) - 1 if segments[-1].name == "tail" else None
 
+    # a word's leading space: the lone " " directly followed by a word piece that starts
+    # with an alphanumeric character (" erscheint" -> [" ", "ers", "che", "int"])
+    leading_space = [
+        tok_strs[t] == " " and t + 1 < n and offsets[t + 1][0] == offsets[t][1]
+        and tok_strs[t + 1][:1].isalnum()
+        for t in range(n)
+    ]
     seg_of_tok: list[int] = []
-    for (s, e) in offsets:
+    for t, (s, e) in enumerate(offsets):
         c = s
         while c < e and text[c].isspace():
             c += 1
         if c >= e:                       # whitespace-only token
-            c = min(s, len(text) - 1)
+            c = offsets[t + 1][0] if leading_space[t] else min(s, len(text) - 1)
         seg_of_tok.append(owner[c] if 0 <= c < len(text) else len(segments) - 1)
 
-    # boundary tokens: first alphanumeric-bearing token of a segment whose language
-    # differs from the previous segment's language
+    # boundary tokens: first word token (alphanumeric-bearing, or a word's leading
+    # space) of a segment whose language differs from the previous segment's language
     boundary_seg = set()
     for i in range(1, len(segments)):
         if segments[i].lang != segments[i - 1].lang:
@@ -622,12 +646,12 @@ def annotate(tokenizer, text: str, segments_with_lang: Sequence) -> dict:
     boundary_positions: list[int] = []
     for t in range(n):
         sidx = seg_of_tok[t]
-        has_alnum = any(ch.isalnum() for ch in tok_strs[t])
-        is_boundary = has_alnum and sidx in boundary_seg and sidx not in seen_word_in_seg
-        if has_alnum:
+        starts_word = leading_space[t] or any(ch.isalnum() for ch in tok_strs[t])
+        is_boundary = starts_word and sidx in boundary_seg and sidx not in seen_word_in_seg
+        if starts_word:
             seen_word_in_seg.add(sidx)
         after_ws = t > 0 and klass[t - 1] == "ws"
-        k = token_class(tok_strs[t], t == 0, is_boundary, after_ws)
+        k = token_class(tok_strs[t], t == 0, is_boundary, after_ws, leading_space[t])
         if k == "boundary":
             boundary_positions.append(t)
         klass.append(k)

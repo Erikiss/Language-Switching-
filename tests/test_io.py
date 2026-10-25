@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 
 import numpy as np
@@ -74,6 +75,25 @@ def test_save_load_df_roundtrip(tmp_path):
         pd.testing.assert_frame_equal(pd.read_parquet(rd.file("grid2.parquet")), df, check_dtype=False)
     with pytest.raises(FileNotFoundError):
         IO.load_df(rd, "missing")
+
+
+def test_save_df_logs_missing_parquet_engine_once(tmp_path, monkeypatch, caplog):
+    """Without a parquet engine the CSV is the record and the skip is logged exactly once."""
+    monkeypatch.setattr(IO, "_parquet_skip_logged", False)
+
+    def no_engine(self, *args, **kwargs):
+        raise ImportError("Unable to find a usable engine; tried using: 'pyarrow', 'fastparquet'.")
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", no_engine)
+    df = pd.DataFrame(dict(a=[1, 2], b=["x", "y"]))
+    with caplog.at_level(logging.WARNING, logger="lsne.io"):
+        p1 = IO.save_df(df, tmp_path, "one")
+        p2 = IO.save_df(df, tmp_path, "two")
+    assert p1.exists() and p2.exists()
+    assert not (tmp_path / "one.parquet").exists() and not (tmp_path / "two.parquet").exists()
+    msgs = [r.getMessage() for r in caplog.records if r.name == "lsne.io"]
+    assert len(msgs) == 1 and "pyarrow" in msgs[0] and "one.csv" in msgs[0]
+    pd.testing.assert_frame_equal(IO.load_df(tmp_path, "one"), df, check_dtype=False)
 
 
 def test_drive_root_and_colab(monkeypatch, tmp_path):

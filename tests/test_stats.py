@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -40,7 +42,43 @@ def test_cluster_bootstrap_recovers_mean_and_covers_truth():
     df2.loc[0, "value"] = np.nan
     assert S.cluster_bootstrap(df2, "value", "family", n_boot=50)["n_rows"] == 199
     empty = S.cluster_bootstrap(df.iloc[:0], "value", "family", n_boot=50)
-    assert np.isnan(empty["mean"]) and empty["n_clusters"] == 0
+    assert np.isnan(empty["mean"]) and empty["n_clusters"] == 0 and empty["stat_level"] == "row"
+    assert res["stat_level"] == "row" and res["cluster_keys"] == sorted(df["family"].unique())
+    assert np.allclose(res["cluster_values"], df.groupby("family")["value"].mean().to_numpy())
+
+
+def test_cluster_bootstrap_stat_level_cluster():
+    """stat_level='cluster': the statistic is applied per cluster first (family means) and
+    then over the drawn clusters -- the pre-registered estimator of the confirmatory
+    contrasts.  'row' (the default) weighs rows, so the two differ on unbalanced data."""
+    df = _clustered(seed=4, n_clusters=15, per_cluster=6, mu=0.5)
+    fam_means = df.groupby("family")["value"].mean()
+    cl = S.cluster_bootstrap(df, "value", "family", n_boot=2000, seed=0, stat_level="cluster")
+    row = S.cluster_bootstrap(df, "value", "family", n_boot=2000, seed=0, stat_level="row")
+    assert cl["stat_level"] == "cluster" and cl["n_clusters"] == 15 and cl["n_rows"] == 90
+    assert cl["mean"] == pytest.approx(fam_means.mean()) == pytest.approx(row["mean"])   # balanced: same point
+    assert np.allclose(cl["cluster_values"], fam_means.to_numpy()) and cl["cluster_keys"] == fam_means.index.tolist()
+    assert cl["ci_low"] < 0.5 < cl["ci_high"] and 0 < cl["se"] < 0.5
+    assert np.allclose(cl["boot"], row["boot"])           # balanced clusters: identical resamples
+    # the generic statistic path agrees with the np.mean fast path at the cluster level
+    gen = S.cluster_bootstrap(df, "value", "family", n_boot=300, seed=1, stat=lambda v: float(np.mean(v)),
+                              stat_level="cluster")
+    fast = S.cluster_bootstrap(df, "value", "family", n_boot=300, seed=1, stat_level="cluster")
+    assert np.allclose(gen["boot"], fast["boot"]) and gen["mean"] == pytest.approx(fast["mean"])
+    # unbalanced clusters: 'row' weighs the big cluster, 'cluster' weighs every family the same
+    u = pd.DataFrame(dict(family=["A"] + ["B"] * 3, value=[0.0, 1.0, 1.0, 1.0]))
+    r_row = S.cluster_bootstrap(u, "value", "family", n_boot=500, seed=0)
+    r_cl = S.cluster_bootstrap(u, "value", "family", n_boot=500, seed=0, stat_level="cluster")
+    assert r_row["mean"] == pytest.approx(0.75) and r_cl["mean"] == pytest.approx(0.5)
+    assert set(np.unique(r_cl["boot"]).tolist()) <= {0.0, 0.5, 1.0}
+    assert np.allclose(r_cl["cluster_values"], [0.0, 1.0]) and r_cl["cluster_keys"] == ["A", "B"]
+    # a statistic other than the mean is applied at both levels (median within, median across)
+    med = S.cluster_bootstrap(df, "value", "family", n_boot=200, seed=0, stat=np.median, stat_level="cluster")
+    fam_medians = np.array([np.median(g["value"]) for _, g in df.groupby("family")])
+    assert np.allclose(med["cluster_values"], fam_medians) and med["mean"] == pytest.approx(np.median(fam_medians))
+    assert med["ci_low"] <= med["mean"] <= med["ci_high"]
+    with pytest.raises(ValueError):
+        S.cluster_bootstrap(df, "value", "family", n_boot=10, stat_level="family")
 
 
 def test_cluster_bootstrap_wider_than_naive_with_cluster_effects():
@@ -63,14 +101,24 @@ def test_paired_contrast():
     df = pd.DataFrame(rows)
     res = S.paired_contrast(df, "value", "cond", "mixed", "mono", ["family", "K"], "family",
                             n_boot=2000, seed=0)
-    assert res["n_pairs"] == 36 and res["n_clusters"] == 12
+    assert res["n_pairs"] == 36 and res["n_clusters"] == 12 and res["n_dropped_a"] == res["n_dropped_b"] == 0
+    assert res["stat_level"] == "cluster"                      # family mean of the paired difference
     assert res["mean"] == pytest.approx(1.0, abs=0.1)
     assert res["ci_low"] > 0.8 and res["ci_high"] < 1.2
     assert res["p_boot"] < 0.01 and res["d"] > 3
     assert res["mean_a"] - res["mean_b"] == pytest.approx(res["mean"])
+    assert len(res["cluster_values"]) == 12 and res["mean"] == pytest.approx(np.mean(res["cluster_values"]))
+    # 'row' level: every pair weighs the same (balanced design -> same point estimate)
+    res_row = S.paired_contrast(df, "value", "cond", "mixed", "mono", ["family", "K"], "family",
+                                n_boot=2000, seed=0, stat_level="row")
+    assert res_row["stat_level"] == "row" and res_row["mean"] == pytest.approx(res["mean"])
+    assert res_row["mean_a"] - res_row["mean_b"] == pytest.approx(res_row["mean"]) and res_row["d"] > 3
+    assert np.allclose(res_row["boot"], res["boot"])        # balanced: identical resamples
     # cluster column not part of the pair columns (taken from the a-side rows)
     df["item"] = df["family"].astype(str) + "-" + df["K"].astype(str)
-    res2 = S.paired_contrast(df, "value", "cond", "mixed", "mono", "item", "family", n_boot=200, seed=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", category=UserWarning)   # consistent clusters: no warning
+        res2 = S.paired_contrast(df, "value", "cond", "mixed", "mono", "item", "family", n_boot=200, seed=0)
     assert res2["n_pairs"] == 36 and res2["n_clusters"] == 12
     assert res2["mean"] == pytest.approx(res["mean"])
     # duplicate rows per (pair, condition) are averaged, not multiplied
@@ -83,6 +131,52 @@ def test_paired_contrast():
     res0 = S.paired_contrast(df0, "value", "cond", "mixed", "mono", ["family", "K"], "family",
                              n_boot=1000, seed=0)
     assert res0["ci_low"] < 0 < res0["ci_high"] and res0["p_boot"] > 0.05
+    with pytest.raises(ValueError):
+        S.paired_contrast(df, "value", "cond", "mixed", "mono", ["family", "K"], "family", n_boot=10, stat_level="x")
+
+
+def test_paired_contrast_dropped_pairs_and_cluster_warning():
+    """Finding: pairs without a partner were dropped silently by the inner join, and a pair
+    whose a and b rows sit in different clusters was resampled under the a cluster without
+    notice.  Now n_dropped_a / n_dropped_b are returned and differing clusters warn."""
+    rows = []
+    for fam in range(4):
+        for K in (2, 4):
+            rows.append(dict(family=fam, K=K, cond="a", value=1.0 + fam + 0.1 * K))
+            rows.append(dict(family=fam, K=K, cond="b", value=0.0 + fam))
+    rows.append(dict(family=9, K=2, cond="a", value=5.0))        # a without partner
+    rows.append(dict(family=0, K=8, cond="b", value=5.0))        # b without partner
+    rows.append(dict(family=1, K=8, cond="b", value=5.0))        # b without partner
+    df = pd.DataFrame(rows)
+    res = S.paired_contrast(df, "value", "cond", "a", "b", ["family", "K"], "family", n_boot=200, seed=0)
+    assert res["n_pairs"] == 8 and res["n_dropped_a"] == 1 and res["n_dropped_b"] == 2 and res["n_clusters"] == 4
+    assert res["mean"] == pytest.approx(1.3) and res["mean_a"] - res["mean_b"] == pytest.approx(res["mean"])
+    # unbalanced families: the family mean ('cluster') and the pair mean ('row') differ
+    df_u = df[~((df["family"] == 3) & (df["K"] == 4))].copy()          # family 3 keeps one pair
+    df_u.loc[(df_u["family"] == 3) & (df_u["cond"] == "a"), "value"] += 2.0
+    r_cl = S.paired_contrast(df_u, "value", "cond", "a", "b", ["family", "K"], "family", n_boot=200, seed=0)
+    r_row = S.paired_contrast(df_u, "value", "cond", "a", "b", ["family", "K"], "family", n_boot=200, seed=0,
+                              stat_level="row")
+    fam_diffs = np.array([1.3, 1.3, 1.3, 3.2])
+    assert r_cl["mean"] == pytest.approx(fam_diffs.mean()) and r_cl["n_pairs"] == r_row["n_pairs"] == 7
+    assert r_row["mean"] == pytest.approx((6 * 1.3 + 3.2) / 7)
+    assert r_cl["d"] == pytest.approx(fam_diffs.mean() / fam_diffs.std(ddof=1))
+    for r in (r_cl, r_row):
+        assert r["mean_a"] - r["mean_b"] == pytest.approx(r["mean"])
+    # pair column without the cluster: clusters that differ between the a and b side warn
+    df["item"] = df["family"].astype(str) + "-" + df["K"].astype(str)
+    df_m = df[df["family"] < 9].copy()
+    df_m.loc[(df_m["cond"] == "b") & (df_m["family"] == 0) & (df_m["K"] == 2), "family"] = 3
+    with pytest.warns(UserWarning, match="different 'family'"):
+        r_m = S.paired_contrast(df_m, "value", "cond", "a", "b", "item", "family", n_boot=100, seed=0)
+    assert r_m["n_pairs"] == 8 and r_m["n_clusters"] == 4                  # the a cluster is used
+    # rows of one side that disagree on the cluster within a pair warn as well
+    df_w = df[df["family"] < 9].copy()
+    extra = df_w[(df_w["cond"] == "a") & (df_w["family"] == 1)].copy()
+    extra["family"] = 2
+    with pytest.warns(UserWarning, match="span more than one"):
+        S.paired_contrast(pd.concat([df_w, extra], ignore_index=True), "value", "cond", "a", "b", "item", "family",
+                          n_boot=100, seed=0)
 
 
 def test_bh_correct_monotone_and_known_values():

@@ -6,6 +6,7 @@ import numpy as np
 import opt_einsum as oe
 import pytest
 import torch
+from transformers.models.gpt_neox import modeling_gpt_neox as mg
 
 from lsne.config import HookSite
 from lsne.model import run_with_cache
@@ -16,6 +17,56 @@ from lsne.tn_lattice import (LN_MODES, LatticeTN, attention_from_heads, build_fa
 
 HAS_TNCO = importlib.util.find_spec("tnco") is not None
 T_W = 8
+#: Stated tolerance (relative Frobenius norm) of the frozen-attention check: the r = d
+#: exact-LN lattice vs the detached-softmax JVP measured 3.8e-7 (one block) and 6.1e-7
+#: (two blocks) on pythia-14m, i.e. float32 round-off; 1e-5 leaves a 15x margin.
+FROZEN_TOL = 1e-5
+#: The full JVP must differ from the frozen-attention reference by at least this much
+#: (measured 0.099 for one block, 0.23 for two blocks: the ignored dA/dq, dA/dk term).
+FROZEN_GAP = 1e-2
+#: Both path backends must stay within one order of magnitude of opt_einsum 'dp'.
+COST_LOG10_TOL = 1.0
+
+
+def _rel(a, b) -> float:
+    """Relative Frobenius error ``|a - b| / |b|``."""
+    return float(np.linalg.norm(np.asarray(a) - np.asarray(b)) / np.linalg.norm(np.asarray(b)))
+
+
+def _detached_softmax_attention(module, query, key, value, attention_mask, scaling,
+                                dropout=0.0, **kwargs):
+    """GPT-NeoX eager attention with the softmax weights *detached*.
+
+    Forward values are unchanged; under forward-mode AD the tangent through q / k is
+    dropped, so a JVP run with this patch is the frozen-attention linear response.  It is
+    built here independently of ``lsne.tn_lattice.frozen_attention`` (which substitutes
+    cached patterns).  Only forward-mode AD sees the detach: finite differences would
+    recompute the perturbed softmax and return the full response."""
+    w = torch.matmul(query, key.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        w = w + attention_mask
+    w = torch.nn.functional.softmax(w, dim=-1, dtype=torch.float32).to(query.dtype).detach()
+    return torch.matmul(w, value).transpose(1, 2).contiguous(), w
+
+
+def _sequential_reference(tn: LatticeTN) -> np.ndarray:
+    """Independent contraction of the lattice: block by block with plain numpy loops in
+    float64 (no opt_einsum, no contraction path):
+    ``y_{l+1}[t', :] = sum_{b, t} G_l[b, t', t] * (K_l[b, t] @ y_l[t])``."""
+    arrays = dict(tn.tensors)
+    y = arrays[tn.tensors[0][0]].astype(np.float64)                 # source [T_w, r]
+    T_w = y.shape[0]
+    for l in tn.meta["layers"]:
+        G = arrays[(f"b{l}", f"t{l + 1}", f"t{l}")].astype(np.float64)
+        K = arrays[(f"b{l}", f"t{l}", f"i{l + 1}", f"i{l}")].astype(np.float64)
+        y_new = np.zeros_like(y)
+        for b in range(G.shape[0]):
+            for t in range(T_w):
+                u = K[b, t] @ y[t]
+                for tp in range(T_w):
+                    y_new[tp] += G[b, tp, t] * u
+        y = y_new
+    return y
 
 
 # --------------------------------------------------------------------------------------
@@ -56,6 +107,18 @@ def lattice_3(mb, setup):
     l0 = max(L - 3, 0)
     return build_factorized_lattice(mb, s["cache"], HookSite(l0, "block_input"), s["window"], P,
                                     range(l0, L), position=s["position"], direction=s["direction"])
+
+
+@pytest.fixture(scope="module")
+def sequential_ref(setup, lattice_3):
+    """Sequential plain-numpy contraction of ``lattice_3`` (the reference for both path
+    backends); non-trivial and causal."""
+    y = _sequential_reference(lattice_3)
+    assert y.shape == (T_W, lattice_3.meta["r"]) and np.isfinite(y).all()
+    assert np.linalg.norm(y) > 0
+    rel_pos = setup["position"] - setup["window"].start
+    assert np.abs(y[:rel_pos]).max() == 0 and np.linalg.norm(y[rel_pos]) > 0
+    return y
 
 
 # --------------------------------------------------------------------------------------
@@ -157,13 +220,30 @@ def jvp_last_frozen_attn(mb, sample_ids, setup):
     """Frozen-attention linear response at the output of the last block: the exact
     reference of the untruncated lattice (everything but the softmax derivative)."""
     s = setup
-    from transformers.models.gpt_neox import modeling_gpt_neox as mg
     orig = mg.eager_attention_forward
     out = linear_response_jvp(mb, sample_ids, s["site"], s["position"], s["direction"],
                               [s["L"]], s["window"], method="jvp", attention_patterns=s["cache"].attn)
     assert mg.eager_attention_forward is orig            # patch removed afterwards
     assert out.shape == (1, T_W, s["d"])
     return out[0]
+
+
+@pytest.fixture(scope="module")
+def jvp_detached_softmax(mb, sample_ids, setup):
+    """Independent frozen-attention reference: the JVP with transformers' GPT-NeoX eager
+    attention monkeypatched to detach the softmax weights.  Keyed by the injection block
+    ``l0``: the one-block chain (``L-1``) and the two-block chain (``L-2``), both read at
+    the output of the last block on the window."""
+    s = setup
+    orig = mg.eager_attention_forward
+    out = {}
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(mg, "eager_attention_forward", _detached_softmax_attention)
+        for l0 in (s["L"] - 1, s["L"] - 2):
+            out[l0] = linear_response_jvp(mb, sample_ids, HookSite(l0, "block_input"), s["position"],
+                                          s["direction"], [s["L"]], s["window"], method="jvp")[0]
+    assert mg.eager_attention_forward is orig
+    return out
 
 
 def test_factorized_last_layer_within_50pct(mb, setup, jvp_last, jvp_last_frozen_attn):
@@ -205,6 +285,28 @@ def test_factorized_last_layer_within_50pct(mb, setup, jvp_last, jvp_last_frozen
     # causality is preserved by the lattice as well
     rel_pos = s["position"] - s["window"].start
     assert np.abs(resp[:rel_pos]).max() < 1e-6
+
+
+def test_lattice_matches_detached_softmax_reference(mb, sample_ids, setup, jvp_last,
+                                                    jvp_last_frozen_attn, jvp_detached_softmax):
+    """Frozen-attention reference built independently of the module (eager attention
+    monkeypatched to detach the softmax weights): the r = d exact-LN lattice matches it
+    within ``FROZEN_TOL`` for one and for two blocks, while the full JVP differs by more
+    than ``FROZEN_GAP``.  The module's own ``frozen_attention`` reference coincides with
+    the independent one."""
+    s = setup
+    L, d = s["L"], s["d"]
+    P = torch.eye(d)
+    assert _rel(jvp_last_frozen_attn, jvp_detached_softmax[L - 1]) < 1e-6
+    for l0, ref in jvp_detached_softmax.items():
+        site = HookSite(l0, "block_input")
+        lat = factorized_response(mb, s["cache"], site, s["position"], s["direction"], s["window"], P,
+                                  range(l0, L), backend="opt_einsum")
+        full = jvp_last if l0 == L - 1 else linear_response_jvp(
+            mb, sample_ids, site, s["position"], s["direction"], [L], s["window"], method="jvp")[0]
+        assert np.isfinite(ref).all() and np.linalg.norm(ref) > 0
+        assert _rel(lat, ref) < FROZEN_TOL, (l0, _rel(lat, ref))
+        assert _rel(full, ref) > FROZEN_GAP, (l0, _rel(full, ref))
 
 
 def test_frozen_attention_context(mb, sample_ids, setup, jvp_last, jvp_last_frozen_attn):
@@ -297,7 +399,7 @@ def test_lattice_validation(mb, setup):
 # --------------------------------------------------------------------------------------
 # (d) + (e) contraction paths
 # --------------------------------------------------------------------------------------
-def test_opt_einsum_path_and_contract(lattice_3):
+def test_opt_einsum_path_and_contract(lattice_3, sequential_ref):
     tn = lattice_3
     info = optimize_path(tn, backend="opt_einsum")
     assert info["backend"] == "opt_einsum"
@@ -305,7 +407,8 @@ def test_opt_einsum_path_and_contract(lattice_3):
     assert isinstance(info["path"], list) and all(len(p) == 2 for p in info["path"])
     y = contract(tn, info["path"])
     assert y.shape == (T_W, tn.meta["r"]) and np.isfinite(y).all()
-    # explicit path == plain einsum result; dict input accepted
+    # explicit path == independent sequential contraction == plain einsum; dict input accepted
+    assert np.allclose(y, sequential_ref, rtol=1e-4, atol=1e-6)
     expr, _ = einsum_expression(tn)
     ref = oe.contract(expr, *tn.arrays, optimize="greedy")
     assert np.allclose(y, ref, rtol=1e-4, atol=1e-6)
@@ -314,10 +417,17 @@ def test_opt_einsum_path_and_contract(lattice_3):
     assert np.isfinite(ref_costs["greedy_cost_log10"]) and np.isfinite(ref_costs["dp_cost_log10"])
     assert ref_costs["dp_cost_log10"] <= ref_costs["greedy_cost_log10"] + 1e-9
     assert ref_costs["naive_cost_log10"] >= ref_costs["dp_cost_log10"]
+    # the opt_einsum backend (dp by default, greedy when forced) stays within one order of
+    # magnitude of the 'dp' reference and the forced-greedy path contracts to the same array
+    dp = ref_costs["dp_cost_log10"]
+    assert abs(info["cost_log10"] - dp) < COST_LOG10_TOL
+    g_info = optimize_path(tn, backend="opt_einsum", optimize="greedy")
+    assert g_info["optimizer"] == "greedy" and abs(g_info["cost_log10"] - dp) < COST_LOG10_TOL
+    assert np.allclose(contract(tn, g_info["path"]), sequential_ref, rtol=1e-4, atol=1e-6)
 
 
 @pytest.mark.skipif(not HAS_TNCO, reason="tnco not installed")
-def test_tnco_path_matches_opt_einsum(lattice_3):
+def test_tnco_path_matches_opt_einsum(lattice_3, sequential_ref):
     tn = lattice_3
     t_info = optimize_path(tn, backend="tnco", n_steps=300, n_runs=2, seed=0)
     assert t_info["backend"] == "tnco", t_info.get("fallback_reason")
@@ -331,12 +441,20 @@ def test_tnco_path_matches_opt_einsum(lattice_3):
     expr, _ = einsum_expression(tn)
     _, oe_info = oe.contract_path(expr, *tn.arrays, optimize=path)
     assert np.isfinite(float(oe_info.opt_cost))
-    # (d) both backends contract to the same array
+    # (d) both backends contract to the independent sequential reference (and to each other)
     y_t = contract(tn, path)
     y_o = contract(tn, o_info["path"])
+    assert np.allclose(y_t, sequential_ref, rtol=1e-4, atol=1e-6)
+    assert np.allclose(y_o, sequential_ref, rtol=1e-4, atol=1e-6)
     assert np.allclose(y_t, y_o, rtol=1e-4, atol=1e-6)
-    # tnco's own cost must not be far from the optimal opt_einsum cost (same path cost)
-    assert abs(t_info["cost_log10_opt_einsum"] - o_info["cost_log10"]) < 1.0
+    # both backends' log10 costs lie within one order of magnitude of opt_einsum 'dp':
+    # tnco's own cost model (multiply-adds), the tnco path under the opt_einsum FLOP count,
+    # and the opt_einsum backend's own cost
+    dp = cost_reference(tn)["dp_cost_log10"]
+    assert np.isfinite(dp)
+    assert abs(t_info["cost_log10"] - dp) < COST_LOG10_TOL, (t_info["cost_log10"], dp)
+    assert abs(t_info["cost_log10_opt_einsum"] - dp) < COST_LOG10_TOL, (t_info["cost_log10_opt_einsum"], dp)
+    assert abs(o_info["cost_log10"] - dp) < COST_LOG10_TOL, (o_info["cost_log10"], dp)
 
 
 def test_optimize_path_fallback_on_tnco_failure(lattice_3, monkeypatch):

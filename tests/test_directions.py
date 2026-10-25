@@ -141,6 +141,29 @@ def test_collect_activations_segments(mb, variants, site, collected):
         collect_activations(mb, variants[:1], site, which="bogus")
 
 
+def test_collect_activations_include_tail_false_drops_the_unpaired_tail(mb, variants, site, collected):
+    """Round 2, G4 item 4: with include_tail=False only the paired unit segments remain."""
+    acts, labels, meta = collected                                  # include_tail=True (default)
+    acts_p, labels_p, meta_p = collect_activations(mb, variants, site, which="segment_last", include_tail=False)
+    n_var = len(variants)
+    assert acts_p.shape == (2 * n_var, mb.d_model) and labels_p == ["E", "D"] * n_var
+    assert list(meta_p["unit"]) == [1, 2] * n_var and not meta_p["is_tail"].any()
+    assert (meta_p["position"] < meta_p["n_tokens"]).all()
+    for v, (_, r) in zip(variants, meta_p[meta_p["unit"] == 2].iterrows()):
+        assert int(r["position"]) == v.annot["tail_start"] - 1       # last token before the tail
+    # the kept rows are exactly the non-tail rows of the full collection (same activations)
+    keep = ~meta["is_tail"].to_numpy()
+    assert torch.allclose(acts_p, acts[torch.as_tensor(keep)])
+    assert meta_p[["variant", "unit", "position", "lang"]].reset_index(drop=True).equals(
+        meta.loc[keep, ["variant", "unit", "position", "lang"]].reset_index(drop=True))
+    # all_tokens: positions >= tail_start are dropped
+    acts_t, labels_t, meta_t = collect_activations(mb, variants[:2], site, which="all_tokens", include_tail=False)
+    n_pre = sum(v.annot["tail_start"] for v in variants[:2])
+    assert acts_t.shape == (n_pre, mb.d_model) and len(labels_t) == n_pre and not meta_t["is_tail"].any()
+    assert labels_t[:variants[0].annot["tail_start"]] == variants[0].annot["lang"][:variants[0].annot["tail_start"]]
+    assert int(meta_t["position"].max()) < max(v.annot["tail_start"] for v in variants[:2])
+
+
 def test_diff_of_means_unit_and_denoise(collected):
     acts, labels, _ = collected
     lab = np.asarray(labels)
@@ -261,16 +284,29 @@ def test_language_axis(mb, variants, site, collected):
         d = language_axis(mb, variants, site)
     assert d.name == "lang_dom" and d.site == site
     assert torch.isclose(d.vec.norm(), torch.tensor(1.0), atol=1e-6)
-    assert d.meta["n_D"] == len(variants) and d.meta["n_E"] == 2 * len(variants)
+    # DESIGN section 3 / round 2 G4 item 4: only the paired unit segments form the classes;
+    # the shared English tail (one more 'E' segment per variant) is excluded by default
+    assert d.meta["include_tail"] is False
+    assert d.meta["n_D"] == len(variants) and d.meta["n_E"] == len(variants)
     assert -1 <= d.meta["cos_denoised_plain"] <= 1
     assert torch.isclose(d.meta["vec_plain"].norm(), torch.tensor(1.0), atol=1e-6)
     assert abs(float(d.vec @ d.meta["vec_plain"]) - d.meta["cos_denoised_plain"]) < 1e-5
-    # the axis is the within-class denoised difference of the collected activations
-    acts, labels, _ = collected
+    # the axis is the within-class denoised difference of the tail-free collected activations
+    acts, labels, _ = collect_activations(mb, variants, site, which="segment_last", include_tail=False)
     lab = np.asarray(labels)
     D, E = acts[torch.as_tensor(lab == "D")], acts[torch.as_tensor(lab == "E")]
     assert torch.allclose(d.vec, diff_of_means(D, E, denoise_pcs=1), atol=1e-5)
     assert abs(float(d.vec @ within_class_pcs(D, E, 1)[0][:, 0])) < 1e-4
+    # include_tail=True reproduces the old construction on the full collection (tail in E)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dt = language_axis(mb, variants, site, include_tail=True)
+    acts_f, labels_f, _ = collected
+    labf = np.asarray(labels_f)
+    Df, Ef = acts_f[torch.as_tensor(labf == "D")], acts_f[torch.as_tensor(labf == "E")]
+    assert dt.meta["include_tail"] is True and dt.meta["n_E"] == 2 * len(variants) and dt.meta["n_D"] == len(variants)
+    assert torch.allclose(dt.vec, diff_of_means(Df, Ef, denoise_pcs=1), atol=1e-5)
+    assert not torch.allclose(dt.meta["vec_plain"], d.meta["vec_plain"], atol=1e-3)   # the tail did move the E mean
     # gate / provenance in meta, consistent with the warning that was (not) emitted
     m = d.meta
     for k in ("separation_kept", "cos_pcs_plain", "within_var_removed", "dprime_plain",

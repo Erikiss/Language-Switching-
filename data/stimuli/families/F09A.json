@@ -17,8 +17,8 @@
      "E": {"subj": "Nora", "pred": "writes a number", "adj": "on every sheet"},
      "D": {"subj": "Nora", "pred": "schreibt eine Nummer", "adj": "auf jedes Blatt"}},
     {"id": 5,
-     "E": {"subj": "The paper", "pred": "smells of dust and salt", "adj": "even today"},
-     "D": {"subj": "Das Papier", "pred": "riecht nach Staub und Salz", "adj": "noch heute"}},
+     "E": {"subj": "The paper", "pred": "smells of dust and salt", "adj": "like the sea"},
+     "D": {"subj": "Das Papier", "pred": "riecht nach Staub und Salz", "adj": "wie das Meer"}},
     {"id": 6,
      "E": {"subj": "The colours", "pred": "fade", "adj": "at the edges"},
      "D": {"subj": "Die Farben", "pred": "verblassen", "adj": "an den Rändern"}},
@@ -39,5 +39,5 @@
   "target": " glass",
   "target_note": "'glass' is the near-obligatory completion of 'picks up her magnifying' in a context of reading tiny place names on old maps; the word occurs nowhere in the units or the tail, and neither does its German equivalent (Glas / Lupe). ' glass' is a single Pythia token (id 5253); Pythia-160m ranks it first after the all-English context (p ~ 0.89).",
   "author": "LS-NEQ stimulus authoring (F09A, librarian Nora / old maps)",
-  "notes": "Formulation A. Ten meaning units: Nora catalogues old maps / the oldest map shows the harbour of Bremen / a colleague brings a box from the cellar / Nora numbers every sheet / the paper smells of dust and salt / the colours fade at the edges / a student asks for a river map / Nora notes the year in the catalogue / the shelves reach the ceiling / Nora locks the archive at six. Subjects alternate between the protagonist (Nora), other people (a colleague, a student) and objects (the oldest map, the paper, the colours, the shelves), singular and plural, so C3 switches cross real subject-verb agreement; units 6 and 9 have bare intransitive predicates (fade/verblassen, reach/reichen). No separable German verbs ('abschließen' avoided in favour of 'verschließt' in unit 10). 'Bremen' and 'Nora' are the only proper names and are identical in both languages. Present tense and positive polarity throughout; unit 9 reads naturally in German, units 1 and 10 in English."
+  "notes": "Formulation A. Ten meaning units: Nora catalogues old maps / the oldest map shows the harbour of Bremen / a colleague brings a box from the cellar / Nora numbers every sheet / the paper smells of dust and salt / the colours fade at the edges / a student asks for a river map / Nora notes the year in the catalogue / the shelves reach the ceiling / Nora locks the archive at six. Subjects alternate between the protagonist (Nora), other people (a colleague, a student) and objects (the oldest map, the paper, the colours, the shelves), singular and plural, so C3 switches cross real subject-verb agreement; units 6 and 9 have bare intransitive predicates (fade/verblassen, reach/reichen). Unit 5 ends in a comparative adjunct ('like the sea' / 'wie das Meer'): a 'wie'-phrase is natural in final position in German (post-field), unlike the earlier clause-final 'noch heute'. No separable German verbs ('abschließen' avoided in favour of 'verschließt' in unit 10). 'Bremen' and 'Nora' are the only proper names and are identical in both languages. Present tense and positive polarity throughout; unit 9 reads naturally in German, units 1 and 10 in English."
 }

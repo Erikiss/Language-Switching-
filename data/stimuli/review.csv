@@ -175,7 +175,7 @@ F05,B,3,1,1,1,
 F05,B,4,1,1,1,
 F05,B,5,1,1,1,'enthüllt' is literary for a monitor ('zeigt' plainer); 'Spalt' for a fissure in concrete acceptable ('Riss' more usual).
 F05,B,6,1,1,1,
-F05,B,7,1,1,1,
+F05,B,7,1,1,1,"CHANGED D pred: 'stauen sich' (= back up, a traffic jam) -> 'warten in einer Reihe' (= wait in a line), aligned with E 'line up'."
 F05,B,8,1,1,1,
 F05,B,9,1,1,1,
 F05,B,10,1,1,1,Tail -> traffic OK.
@@ -198,7 +198,7 @@ F06,B,6,1,1,1,
 F06,B,7,1,1,1,
 F06,B,8,1,1,1,
 F06,B,9,1,1,1,
-F06,B,10,1,1,1,"'schließt' intransitive for a day ending is literary but correct. Tail -> oven OK. File 'notes' mention wordings (überreicht, Dame von nebenan) not present in the units; units themselves are fine."
+F06,B,10,1,1,1,"'schließt' intransitive for a day ending is literary but correct. Tail -> oven OK. File 'notes' refreshed in round 2 to match the units (the earlier notes mentioned 'überreicht' / 'Dame von nebenan', which never occurred)."
 F07,A,1,1,1,1,
 F07,A,2,1,1,1,
 F07,A,3,1,1,1,
@@ -238,12 +238,12 @@ F08,B,6,1,1,1,
 F08,B,7,1,1,1,
 F08,B,8,1,1,1,
 F08,B,9,1,1,1,
-F08,B,10,1,1,1,Tail -> rope OK. File 'notes' describe unit 4/5/9 wordings that differ from the units (stale notes); units are fine.
+F08,B,10,1,1,1,"Tail -> rope OK. File 'notes' refreshed in round 2 to match the unit 4/5/9 wordings (the earlier notes described other wordings)."
 F09,A,1,1,1,1,
 F09,A,2,1,1,1,
 F09,A,3,1,1,1,
 F09,A,4,1,1,1,
-F09,A,5,1,1,1,
+F09,A,5,1,1,1,"CHANGED adj in both languages: clause-final 'even today' / 'noch heute' (marked after the PP object in German) -> 'like the sea' / 'wie das Meer' (comparative 'wie'-phrase, natural in final position in both languages). 10 English words (soft limit 9)."
 F09,A,6,1,1,1,
 F09,A,7,1,1,1,
 F09,A,8,1,1,1,
@@ -393,7 +393,7 @@ F16,B,1,1,1,1,
 F16,B,2,1,1,1,
 F16,B,3,1,1,1,'grüßt' (greets) matches E 'greets' (A has 'begrüßt' = welcomes).
 F16,B,4,1,1,1,
-F16,B,5,1,1,1,"'verleiht ihren Saal' is unusual for rooms ('überlässt'/'stellt zur Verfügung' more natural); grammatical, meaning clear. Not changed."
+F16,B,5,1,1,1,"CHANGED D pred: 'verleiht ihren Saal' (unusual for rooms) -> 'überlässt ihren Saal' (inseparable; 'stellt ... zur Verfügung' was not used because 'zur Verfügung' would close the verb bracket before the adjunct)."
 F16,B,6,1,1,1,"'bereiten das Abendessen' elevated register, correct."
 F16,B,7,1,1,1,
 F16,B,8,1,1,1,

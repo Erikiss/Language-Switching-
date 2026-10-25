@@ -8,11 +8,15 @@ with a small self-contained fallback labeller if that module is unavailable).
 
 Diagnostics
 -----------
-D3 hysteresis      :func:`hysteresis`      dose ramp 0 -> eps_max -> 0, f_D up vs. down, area
+D3 hysteresis      :func:`hysteresis`      dose ramp 0 -> eps_max -> 0 (zero-dose plateaus at
+                                           both ends), f_D up vs. down, NaN-aware area
 D4 relaxation      :func:`relaxation`      dose quench 0 -> eps at token t_on, f_D(t), tau
-                                           (identifiable only: window-calibrated F-test of
-                                           the mean series AND between-sample bootstrap of
-                                           the amplitude, :func:`fit_relaxation_samples`)
+                                           fitted on the unwindowed per-token D indicator
+                                           (the running-window series is for plots only:
+                                           it floors tau at ~window/2); identifiable only
+                                           (F-test of the mean series AND between-sample
+                                           bootstrap of the amplitude,
+                                           :func:`fit_relaxation_samples`)
 D5 switch statistics :func:`switch_interval_stats`  inter-switch intervals vs. geometric
 D6 susceptibility  :func:`susceptibility`  chi(eps) = d f_D / d eps and Var(f_D)
 D7 fluctuation-response :func:`fdt_ratio`  T_eff = Var_0(m) / chi
@@ -42,51 +46,62 @@ LABELS = ("E", "D", "N")
 # dose schedules
 # ======================================================================================
 def ramp_levels(eps_max: float, n_steps: int) -> np.ndarray:
-    """Dose levels visited by :func:`schedule_ramp`: ``eps_max * (1..n_steps) / n_steps``."""
+    """Dose levels visited by :func:`schedule_ramp`: ``eps_max * (0..n_steps) / n_steps``,
+    i.e. ``n_steps + 1`` levels; level 0 is the zero-dose plateau at either end of the
+    cycle (DESIGN D3: ramp 0 -> eps_max -> 0 in ``n_steps`` steps)."""
     n_steps = int(n_steps)
-    return float(eps_max) * np.arange(1, n_steps + 1, dtype=np.float64) / n_steps
+    return float(eps_max) * np.arange(0, n_steps + 1, dtype=np.float64) / n_steps
 
 
 def ramp_step_slices(n_steps: int, tokens_per_step: int) -> list[tuple[str, int, int, slice]]:
     """``(branch, step, level, slice)`` for every plateau of the ramp.
 
-    ``branch`` is ``"up"`` for steps ``0..n_steps-1`` and ``"down"`` for steps
-    ``n_steps..2*n_steps-1``; ``level`` indexes :func:`ramp_levels` (the descending branch
-    mirrors the ascending one); ``slice`` selects the generated token indices ``k``."""
+    With ``n_lev = n_steps + 1`` levels, ``branch`` is ``"up"`` for steps ``0..n_lev-1``
+    (levels ``0..n_steps``) and ``"down"`` for steps ``n_lev..2*n_lev-1`` (levels
+    ``n_steps..0``); ``level`` indexes :func:`ramp_levels` (the descending branch mirrors
+    the ascending one); ``slice`` selects the generated token indices ``k``."""
     n_steps, tokens_per_step = int(n_steps), int(tokens_per_step)
+    n_lev = n_steps + 1
     out = []
-    for s in range(2 * n_steps):
-        branch = "up" if s < n_steps else "down"
-        level = s if s < n_steps else 2 * n_steps - 1 - s
+    for s in range(2 * n_lev):
+        branch = "up" if s < n_lev else "down"
+        level = s if s < n_lev else 2 * n_lev - 1 - s
         out.append((branch, s, level, slice(s * tokens_per_step, (s + 1) * tokens_per_step)))
     return out
 
 
 def schedule_ramp(eps_max: float, n_steps: int = 8, tokens_per_step: int = 8) -> Callable[[int], float]:
-    """Piecewise-constant dose ramp 0 -> eps_max -> 0 (D3).
+    """Piecewise-constant dose ramp 0 -> eps_max -> 0 in ``n_steps`` steps (DESIGN D3).
 
-    Generated tokens are grouped into plateaus of ``tokens_per_step`` tokens.  Plateaus
-    ``0..n_steps-1`` ramp linearly up from ``eps_max/n_steps`` to ``eps_max``; plateaus
-    ``n_steps..2*n_steps-1`` ramp back down symmetrically (``eps_max`` ... ``eps_max/n_steps``),
-    so every level is visited exactly once on each branch.  Outside the ramp
-    (``k < 0`` or ``k >= 2*n_steps*tokens_per_step``) the dose is 0 -- these are the "0"
-    end points of the cycle.  The returned callable carries the attributes ``n_steps``,
+    Generated tokens are grouped into plateaus of ``tokens_per_step`` tokens.  The cycle
+    visits the ``n_steps + 1`` levels ``0, eps_max/n_steps, ..., eps_max`` on the ascending
+    branch (plateaus ``0..n_steps``) and ``eps_max, ..., eps_max/n_steps, 0`` on the
+    descending branch (plateaus ``n_steps+1..2*n_steps+1``), so every level -- the
+    zero-dose plateaus included -- is visited exactly once on each branch.  The ramp is
+    ``2 * (n_steps + 1) * tokens_per_step`` tokens long (144 for the production
+    ``n_steps = tokens_per_step = 8``); outside it (``k < 0`` or ``k >= n_new``) the dose
+    is 0 as well.  The zero-dose plateaus are part of the cycle: ``up[0]`` is the German
+    fraction before any dose, ``down[0]`` the one after the dose has been removed, so the
+    hysteresis area includes the residual memory at ``eps = 0``.  The returned callable
+    carries the attributes ``n_steps``, ``n_levels`` (= ``n_steps + 1``),
     ``tokens_per_step``, ``n_new`` (= total ramp length) and ``levels``."""
     n_steps, tokens_per_step = int(n_steps), int(tokens_per_step)
     if n_steps < 1 or tokens_per_step < 1:
         raise ValueError("n_steps and tokens_per_step must be >= 1")
     eps_max = float(eps_max)
-    total = 2 * n_steps * tokens_per_step
+    n_lev = n_steps + 1
+    total = 2 * n_lev * tokens_per_step
 
     def eps(k: int) -> float:
         k = int(k)
         if k < 0 or k >= total:
             return 0.0
         s = k // tokens_per_step
-        level = s if s < n_steps else 2 * n_steps - 1 - s
-        return eps_max * (level + 1) / n_steps
+        level = s if s < n_lev else 2 * n_lev - 1 - s
+        return eps_max * level / n_steps
 
     eps.n_steps = n_steps                      # type: ignore[attr-defined]
+    eps.n_levels = n_lev                       # type: ignore[attr-defined]
     eps.tokens_per_step = tokens_per_step      # type: ignore[attr-defined]
     eps.n_new = total                          # type: ignore[attr-defined]
     eps.levels = ramp_levels(eps_max, n_steps)  # type: ignore[attr-defined]
@@ -276,15 +291,29 @@ def language_trajectory(tokenizer, tokens, window: int = WINDOW, labeller: str =
                 window=int(window), labeller=name)
 
 
-def block_fraction(labels: np.ndarray, lang: str = "D") -> tuple[float, int]:
+def block_fraction(labels: np.ndarray, lang: str = "D", empty: float = 0.0) -> tuple[float, int]:
     """Pooled fraction of ``lang`` among the E/D labels of a label block (any shape).
-    Returns ``(fraction, n_ED)``; the fraction is 0.0 when the block has no E/D label
-    (the :func:`lsne.lang_id.language_fraction` convention)."""
+    Returns ``(fraction, n_ED)``; the fraction is ``empty`` when the block has no E/D
+    label (default 0.0, the :func:`lsne.lang_id.language_fraction` convention;
+    :func:`hysteresis` passes ``np.nan`` so that an unlabelled plateau is missing data,
+    not a German fraction of 0)."""
     lab = np.asarray(labels, dtype="<U1")
     n_ed = int(((lab == "E") | (lab == "D")).sum())
     if n_ed == 0:
-        return 0.0, 0
+        return float(empty), 0
     return float((lab == lang).sum() / n_ed), n_ed
+
+
+def token_indicator(labels, lang: str = "D") -> np.ndarray:
+    """Per-token indicator of ``lang`` among the E/D labels (same shape as ``labels``):
+    1.0 where the label is ``lang``, 0.0 where it is the other language, NaN for 'N'.
+    Its NaN-aware mean over samples at a fixed position is the unwindowed German
+    fraction ``f_D(t)`` that :func:`relaxation` fits."""
+    lab = np.asarray(labels, dtype="<U1")
+    ed = (lab == "E") | (lab == "D")
+    out = np.full(lab.shape, np.nan, dtype=np.float64)
+    out[ed] = (lab[ed] == lang).astype(np.float64)
+    return out
 
 
 def _as_vector(direction, mb: Optional[ModelBundle] = None) -> torch.Tensor:
@@ -299,11 +328,16 @@ def _as_vector(direction, mb: Optional[ModelBundle] = None) -> torch.Tensor:
 
 
 def trapezoid(y, x) -> float:
-    """Trapezoidal integral of ``y`` over ``x`` (0.0 for fewer than two points)."""
-    y = np.asarray(y, dtype=np.float64)
-    x = np.asarray(x, dtype=np.float64)
+    """NaN-aware trapezoidal integral of ``y`` over ``x``: points with a non-finite
+    ``y`` are dropped and the remaining points are integrated on their own ``x`` grid
+    (linear interpolation across the gaps).  NaN for fewer than two finite points (the
+    integral is undefined, not 0)."""
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    ok = np.isfinite(y)
+    y, x = y[ok], x[ok]
     if y.shape[0] < 2:
-        return 0.0
+        return float("nan")
     return float(np.sum(0.5 * (y[1:] + y[:-1]) * np.diff(x)))
 
 
@@ -312,8 +346,16 @@ def trapezoid(y, x) -> float:
 # ======================================================================================
 def hysteresis_area(up, down, eps_levels) -> float:
     """Signed area between the descending and ascending branch,
-    ``sum_levels (down - up) * d eps`` (trapezoid rule over the dose levels)."""
+    ``sum_levels (down - up) * d eps`` (NaN-aware trapezoid rule over the dose levels:
+    levels where either branch has no E/D-labelled token are skipped; NaN if fewer than
+    two levels carry data on both branches)."""
     return trapezoid(np.asarray(down, dtype=np.float64) - np.asarray(up, dtype=np.float64), eps_levels)
+
+
+def levels_with_data(up, down) -> int:
+    """Number of dose levels at which both branches carry a finite German fraction
+    (the levels that enter :func:`hysteresis_area`)."""
+    return int(np.sum(np.isfinite(np.asarray(up, dtype=np.float64)) & np.isfinite(np.asarray(down, dtype=np.float64))))
 
 
 NULL_SEED_STRIDE = 10_000
@@ -332,38 +374,47 @@ def hysteresis(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, directi
                temperature: float = 1.0, window: int = WINDOW, n_null: int = 4) -> dict:
     """D3: German fraction under a dose ramp 0 -> eps_max -> 0 (ascending vs. descending).
 
-    One steered generation of ``2*n_steps*tokens_per_step`` tokens follows
-    :func:`schedule_ramp`.  ``up[s]`` is the pooled fraction of 'D' among the E/D-labelled
-    tokens generated on plateau ``s`` of the ascending branch (all samples pooled), and
-    ``down[s]`` the same on the descending branch at the same dose level
-    ``eps_levels[s]``.  ``area = sum_s (down - up) d eps`` (trapezoid).
+    One steered generation of ``2 * (n_steps + 1) * tokens_per_step`` tokens follows
+    :func:`schedule_ramp`: the ``n_levels = n_steps + 1`` dose levels ``eps_levels =
+    0, eps_max/n_steps, ..., eps_max`` are visited once on each branch, the zero-dose
+    plateaus at both ends of the cycle included (DESIGN D3).  ``up[l]`` is the pooled
+    fraction of 'D' among the E/D-labelled tokens generated on the ascending plateau at
+    level ``l`` (all samples pooled), ``down[l]`` the same on the descending branch at
+    the same dose ``eps_levels[l]``; ``up[0]`` is the fraction before any dose and
+    ``down[0]`` the fraction after the dose has been removed.  A plateau without any
+    E/D-labelled token is missing data: it contributes NaN (not 0) and is skipped by the
+    NaN-aware trapezoid ``area = sum_l (down - up) d eps`` (:func:`hysteresis_area`;
+    NaN if fewer than two levels carry data on both branches).  ``n_levels_with_data``
+    counts the levels that enter the area.
 
     Null model (independent restarts, no memory): ``n_null`` (>= 2) replicates, each a
     generation of ``tokens_per_step`` tokens from the prompt at constant dose
-    (:func:`schedule_const`) for every level.  Every (replicate, level) uses its own seed
-    :func:`restart_seed` (``seed + 10_000 * (replicate + 1) + level``), disjoint from the
-    ramp seed and from each other, so restarts are independent of the ramp and do not
-    share common random numbers across levels (both would make ``restart[0] == up[0]``
-    and correlate the null terms across levels).  ``restarts[r, l]`` holds the pooled
-    fractions; ``null_areas`` the signed areas ``hysteresis_area(restarts[a],
+    (:func:`schedule_const`) for every level (an unsteered generation at level 0).
+    Every (replicate, level) uses its own seed :func:`restart_seed` (``seed + 10_000 *
+    (replicate + 1) + level``), disjoint from the ramp seed and from each other, so
+    restarts are independent of the ramp and do not share common random numbers across
+    levels (both would make ``restart[0] == up[0]`` and correlate the null terms across
+    levels).  ``restarts[r, l]`` holds the pooled fractions (NaN for an unlabelled
+    restart); ``null_areas`` the signed areas ``hysteresis_area(restarts[a],
     restarts[b])`` of every pair ``a < b`` (``n_null * (n_null - 1) / 2`` draws from the
     no-memory null of the area statistic, which is symmetric around 0); ``null_area`` is
-    their mean (kept for the pre-registered contrast ``area - null_area``; it is ~0 by
-    construction), ``null_area_sd`` the root-mean-square of the null draws (the standard
-    deviation of the sign-symmetric null; defined already for one pair) and
-    ``area_z = area / null_area_sd`` (NaN if the null scale is 0).  ``restart`` /
-    ``restart_b`` alias replicates 0 and 1.
+    their NaN-aware mean (kept for the pre-registered contrast ``area - null_area``; it
+    is ~0 by construction), ``null_area_sd`` the root-mean-square of the finite null
+    draws (the standard deviation of the sign-symmetric null; defined already for one
+    pair) and ``area_z = area / null_area_sd`` (NaN if the null scale is 0 or no null
+    draw is finite).  ``restart`` / ``restart_b`` alias replicates 0 and 1.
 
     Returns
     -------
-    dict(up, down, eps_levels, area, null_area, null_areas, null_area_sd, area_z, n_null,
-    restarts, restart_seeds, restart, restart_b, curves, tokens, labels, fD_window,
-    entropies, eps, n_steps, tokens_per_step, eps_max, site, n_samples, seed).
-    ``curves`` is a long DataFrame with one row per (branch, step): columns
-    ``branch`` ('up', 'down', 'restart_a', 'restart_b', 'restart_c', ...), ``replicate``
-    (-1 for the ramp branches), ``seed``, ``step``, ``level``, ``eps``, ``k_start``,
-    ``k_end``, ``fD`` (pooled fraction), ``fD_window`` (mean running fraction),
-    ``entropy`` (mean next-token entropy), ``n_ED`` (E/D tokens pooled).
+    dict(up, down, eps_levels, n_levels, n_levels_with_data, area, null_area, null_areas,
+    null_area_sd, area_z, n_null, restarts, restart_seeds, restart, restart_b, curves,
+    tokens, labels, fD_window, entropies, eps, n_steps, tokens_per_step, eps_max, site,
+    n_samples, seed).  ``curves`` is a long DataFrame with one row per (branch, step):
+    columns ``branch`` ('up', 'down', 'restart_a', 'restart_b', 'restart_c', ...),
+    ``replicate`` (-1 for the ramp branches), ``seed``, ``step``, ``level``, ``eps``,
+    ``k_start``, ``k_end``, ``fD`` (pooled fraction, NaN without E/D tokens),
+    ``fD_window`` (mean running fraction), ``entropy`` (mean next-token entropy),
+    ``n_ED`` (E/D tokens pooled).
     """
     vec = _as_vector(direction, mb)
     n_steps, tokens_per_step = int(n_steps), int(tokens_per_step)
@@ -378,12 +429,13 @@ def hysteresis(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, directi
     labels, fDw = traj["labels"], traj["fD_window"]
     ent = res["entropies"].numpy()
     levels = ramp_levels(eps_max, n_steps)
+    n_levels = int(levels.shape[0])
 
-    up = np.full(n_steps, np.nan)
-    down = np.full(n_steps, np.nan)
+    up = np.full(n_levels, np.nan)
+    down = np.full(n_levels, np.nan)
     rows: list[dict] = []
     for branch, step, level, sl in ramp_step_slices(n_steps, tokens_per_step):
-        f, n_ed = block_fraction(labels[:, sl])
+        f, n_ed = block_fraction(labels[:, sl], empty=np.nan)
         (up if branch == "up" else down)[level] = f
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
@@ -393,8 +445,8 @@ def hysteresis(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, directi
                          entropy=float(ent[:, sl].mean()), n_ED=n_ed))
 
     # null model: n_null independent restarts at every level, each with its own seed
-    restarts = np.full((n_null, n_steps), np.nan)
-    seeds = np.zeros((n_null, n_steps), dtype=np.int64)
+    restarts = np.full((n_null, n_levels), np.nan)
+    seeds = np.zeros((n_null, n_levels), dtype=np.int64)
     for rep in range(n_null):
         tag = f"restart_{chr(ord('a') + rep)}" if rep < 26 else f"restart_{rep}"
         for level, eps in enumerate(levels):
@@ -403,7 +455,7 @@ def hysteresis(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, directi
             r = generate_steered(mb, input_ids, site, vec, schedule_const(float(eps)), n_new=tokens_per_step,
                                  n_samples=n_samples, temperature=temperature, seed=s)
             t = language_trajectory(mb.tokenizer, r["tokens"], window=window)
-            f, n_ed = block_fraction(t["labels"])
+            f, n_ed = block_fraction(t["labels"], empty=np.nan)
             restarts[rep, level] = f
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=RuntimeWarning)
@@ -415,12 +467,14 @@ def hysteresis(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, directi
     area = hysteresis_area(up, down, levels)
     null_areas = np.array([hysteresis_area(restarts[a], restarts[b], levels)
                            for a in range(n_null) for b in range(a + 1, n_null)], dtype=np.float64)
-    null_area = float(np.mean(null_areas))
-    null_area_sd = float(np.sqrt(np.mean(null_areas ** 2)))      # RMS: sd of the sign-symmetric null
-    area_z = float(area / null_area_sd) if null_area_sd > 0 else float("nan")
+    null_fin = null_areas[np.isfinite(null_areas)]
+    null_area = float(np.mean(null_fin)) if null_fin.size else float("nan")
+    null_area_sd = float(np.sqrt(np.mean(null_fin ** 2))) if null_fin.size else float("nan")  # RMS: sd of the sign-symmetric null
+    area_z = float(area / null_area_sd) if np.isfinite(null_area_sd) and null_area_sd > 0 else float("nan")
     curves = pd.DataFrame(rows, columns=["branch", "replicate", "seed", "step", "level", "eps", "k_start",
                                          "k_end", "fD", "fD_window", "entropy", "n_ED"])
-    return dict(up=up, down=down, eps_levels=levels, area=area, null_area=null_area, null_areas=null_areas,
+    return dict(up=up, down=down, eps_levels=levels, n_levels=n_levels, n_levels_with_data=levels_with_data(up, down),
+                area=area, null_area=null_area, null_areas=null_areas,
                 null_area_sd=null_area_sd, area_z=area_z, n_null=n_null, restarts=restarts,
                 restart_seeds=seeds, restart=restarts[0], restart_b=restarts[1], curves=curves,
                 tokens=res["tokens"].numpy(), labels=labels, fD_window=fDw, entropies=ent,
@@ -584,6 +638,16 @@ def fit_relaxation(fD_t: np.ndarray, t_on: int, t: Optional[np.ndarray] = None, 
       of a running-window fraction is not ``window`` times fewer observations, and a
       shrunk F-test with three residual degrees of freedom rejects real, strong responses.
 
+    Resolution floor.  A trailing box window of width ``w`` turns a step at ``t_on`` into
+    a linear rise over ``w`` tokens, so the ``tau`` fitted to a running-window series
+    cannot fall below about ``w / 2`` tokens (measured: 4.2 tokens for ``w = 8`` on an
+    instantaneous step) and is biased upward by about ``(w - 1) / 2`` for slower
+    responses.  ``tau`` is therefore fitted on the unwindowed per-token indicator
+    (``window = 1``, :func:`token_indicator`; :func:`relaxation` does this), whose floor
+    is the token resolution itself: ``TAU_BOUNDS[0] = 0.5`` tokens, and a response
+    completed within one token is flagged ``tau_censored`` at that bound.  Running-window
+    series are for plots; ``window > 1`` only calibrates the test for such a series.
+
     ``tau_censored`` flags a fit at either bound of ``TAU_BOUNDS`` (upper bound: no
     relaxation within the window, lower bound: a step within one token); such a ``tau``
     is kept but should be masked in phase diagrams.  ``b_se`` is the standard error of
@@ -656,19 +720,23 @@ def fit_relaxation(fD_t: np.ndarray, t_on: int, t: Optional[np.ndarray] = None, 
 
 
 def fit_relaxation_samples(fD_window: np.ndarray, t_on: int, t: Optional[np.ndarray] = None,
-                           window: int = WINDOW, n_boot: int = N_BOOT_RELAX, seed: int = 0,
+                           window: int = 1, n_boot: int = N_BOOT_RELAX, seed: int = 0,
                            b_min: float = B_MIN, alpha: float = FIT_ALPHA) -> dict:
-    """The identifiability gate of :func:`relaxation` on per-sample running fractions
-    ``fD_window [B, n]`` (no model needed): the series fit of the NaN-aware mean over
-    samples (:func:`fit_relaxation` with the label ``window``) AND the between-sample
-    bootstrap of the raw amplitude ``b`` over ``n_boot`` resamples of the ``B`` samples
-    (seeded).  ``tau`` is NaN unless both pass; the bootstrap is skipped
-    (``criterion="series"``) when it is uninformative (``B < 2`` or fewer than two finite
-    resample amplitudes).  ``tau_ci`` is the (2.5, 97.5) percentile interval of the
-    resample taus that pass the series gate (``n_tau_boot`` of them; NaN pair below two).
+    """The identifiability gate of :func:`relaxation` on per-sample series ``[B, n]``
+    (no model needed): the series fit of the NaN-aware mean over samples
+    (:func:`fit_relaxation`) AND the between-sample bootstrap of the raw amplitude ``b``
+    over ``n_boot`` resamples of the ``B`` samples (seeded).  The first argument is the
+    per-token indicator of :func:`token_indicator` with ``window=1`` (what
+    :func:`relaxation` fits; the name is historical) or a running-window fraction with
+    the matching ``window`` (plots only -- see the resolution floor in
+    :func:`fit_relaxation`).  ``tau`` is NaN unless both gates pass; the bootstrap is
+    skipped (``criterion="series"``) when it is uninformative (``B < 2`` or fewer than
+    two finite resample amplitudes).  ``tau_ci`` is the (2.5, 97.5) percentile interval
+    of the resample taus that pass the series gate (``n_tau_boot`` of them; NaN pair
+    below two).
 
     Returns dict(fD_t, fit, tau, tau_ci, tau_boot, n_tau_boot, b_boot, b_ci,
-    b_ci_excludes_zero, criterion)."""
+    b_ci_excludes_zero, criterion, window)."""
     fDw = np.asarray(fD_window, dtype=np.float64)
     if fDw.ndim == 1:
         fDw = fDw[None, :]
@@ -703,7 +771,7 @@ def fit_relaxation_samples(fD_window: np.ndarray, t_on: int, t: Optional[np.ndar
     fit = dict(fit, identifiable=identifiable, tau=(fit["tau_raw"] if identifiable else np.nan),
                reason="; ".join(reasons), criterion=("series+bootstrap" if boot_informative else "series"))
     return dict(fD_t=fD_t, fit=fit, tau=fit["tau"], tau_ci=tau_ci, tau_boot=taus, n_tau_boot=int(finite.size),
-                b_boot=bs, b_ci=b_ci, b_ci_excludes_zero=b_excl, criterion=fit["criterion"])
+                b_boot=bs, b_ci=b_ci, b_ci_excludes_zero=b_excl, criterion=fit["criterion"], window=max(1, int(window)))
 
 
 def relaxation(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, direction, eps: float,
@@ -713,14 +781,23 @@ def relaxation(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, directi
     """D4: response of the German fraction to a dose quench 0 -> eps at generated token
     ``t_on`` (:func:`schedule_quench`).
 
-    ``fD_t[t]`` is the mean over samples of the running German fraction (trailing
-    window) at generated position ``t`` (NaN-aware); ``entropy_t`` the mean next-token
-    entropy.  ``tau`` is the time constant of an exponential fit of ``fD_t[t_on:]`` to
-    ``a + b (1 - exp(-(t - t_on)/tau))`` by :func:`fit_relaxation` (with the label
-    ``window`` as autocorrelation length).  It is NaN unless the response is
-    *identifiable* (:func:`fit_relaxation_samples`), which requires all of
+    Two series of the German fraction are returned.  ``fD_token_t[t]`` is the NaN-aware
+    mean over samples of the per-token D indicator (:func:`token_indicator`: 1 for a
+    'D' token, 0 for 'E', NaN for 'N') at generated position ``t`` -- the unwindowed
+    series on which ``tau`` is fitted.  ``fD_t[t]`` is the mean over samples of the
+    running German fraction in the trailing ``window`` -- a smoothed series for plots
+    only: the window turns a step into a rise over ``window`` tokens and floors a fitted
+    ``tau`` at about ``window / 2`` (see :func:`fit_relaxation`), so no time constant is
+    derived from it.  ``entropy_t`` is the mean next-token entropy.
 
-    * ``|b_window| >= b_min`` and the window-calibrated series F-test ``f_pvalue <= alpha``
+    ``tau`` is the time constant of an exponential fit of ``fD_token_t[t_on:]`` to
+    ``a + b (1 - exp(-(t - t_on)/tau))`` by :func:`fit_relaxation` with ``window=1``
+    (``fit_window``; plain iid F-test, no Monte-Carlo null).  Its floor is the token
+    resolution (``TAU_BOUNDS[0]``; a response completed within one token is
+    ``tau_censored`` there).  It is NaN unless the response is *identifiable*
+    (:func:`fit_relaxation_samples`), which requires all of
+
+    * ``|b_window| >= b_min`` and the series F-test ``f_pvalue <= alpha``
       (:func:`fit_relaxation`), and
     * the between-sample bootstrap: ``b_ci``, the (2.5, 97.5) percentile interval of the
       raw amplitude over ``n_boot`` resamples of the ``n_samples`` independent
@@ -737,9 +814,10 @@ def relaxation(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, directi
     interval of the resample taus that pass the series gate (NaN pair if fewer than two
     do; ``n_tau_boot`` counts them), ``tau_boot`` / ``b_boot`` the per-resample values.
 
-    Returns dict(fD_t, entropy_t, tau, tau_ci, tau_boot, n_tau_boot, b_boot, b_ci,
-    b_ci_excludes_zero, criterion, fit, t, t_on, eps, tokens, labels, fD_window, entropies,
-    eps_t, site, n_samples, seed).
+    Returns dict(fD_t, fD_token_t, entropy_t, tau, tau_ci, tau_boot, n_tau_boot, b_boot,
+    b_ci, b_ci_excludes_zero, criterion, fit, fit_window, t, t_on, eps, tokens, labels,
+    fD_window, fD_token, entropies, eps_t, site, n_samples, seed); ``fD_window`` /
+    ``fD_token`` are the per-sample ``[B, n_new]`` series behind ``fD_t`` / ``fD_token_t``.
     """
     vec = _as_vector(direction, mb)
     n_new, t_on = int(n_new), int(t_on)
@@ -747,16 +825,20 @@ def relaxation(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, directi
     res = generate_steered(mb, input_ids, site, vec, sched, n_new=n_new, n_samples=n_samples,
                            temperature=temperature, seed=seed)
     traj = language_trajectory(mb.tokenizer, res["tokens"], window=window)
-    fDw = traj["fD_window"]                            # [B, n_new]
+    fDw = traj["fD_window"]                            # [B, n_new] running fraction (plots only)
+    ind = token_indicator(traj["labels"])              # [B, n_new] per-token D indicator (fitted)
     ent = res["entropies"].numpy()
     entropy_t = ent.mean(axis=0)
     t = np.arange(n_new)
-    g = fit_relaxation_samples(fDw, t_on, t, window=window, n_boot=n_boot, seed=seed, b_min=b_min, alpha=alpha)
-    return dict(fD_t=g["fD_t"], entropy_t=entropy_t, tau=g["tau"], tau_ci=g["tau_ci"], tau_boot=g["tau_boot"],
-                n_tau_boot=g["n_tau_boot"], b_boot=g["b_boot"], b_ci=g["b_ci"],
-                b_ci_excludes_zero=g["b_ci_excludes_zero"], criterion=g["criterion"], fit=g["fit"],
+    g = fit_relaxation_samples(ind, t_on, t, window=1, n_boot=n_boot, seed=seed, b_min=b_min, alpha=alpha)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        fD_t = np.nanmean(fDw, axis=0) if fDw.shape[0] else np.full(n_new, np.nan)
+    return dict(fD_t=fD_t, fD_token_t=g["fD_t"], entropy_t=entropy_t, tau=g["tau"], tau_ci=g["tau_ci"],
+                tau_boot=g["tau_boot"], n_tau_boot=g["n_tau_boot"], b_boot=g["b_boot"], b_ci=g["b_ci"],
+                b_ci_excludes_zero=g["b_ci_excludes_zero"], criterion=g["criterion"], fit=g["fit"], fit_window=1,
                 t=t, t_on=t_on, eps=float(eps), tokens=res["tokens"].numpy(), labels=traj["labels"],
-                fD_window=fDw, entropies=ent, eps_t=res["eps"].numpy(), site=site.key,
+                fD_window=fDw, fD_token=ind, entropies=ent, eps_t=res["eps"].numpy(), site=site.key,
                 n_samples=int(n_samples), seed=int(seed))
 
 

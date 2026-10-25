@@ -406,10 +406,86 @@ def test_annotate_direct(tok):
         S.annotate(tok, text, [("nonexistent", "E", 1, "subj")])
 
 
+def test_annotate_leading_space_of_byte_split_word_at_c1_boundary(tok, variants):
+    """The GPT-NeoX BPE cannot merge the leading space into some German words
+    (" entscheidende" -> [" ", "ents", "che", "id", "ende"]).  That lone space is the
+    word's first token: at a C1 boundary it belongs to the new (German) unit, is the
+    boundary token and dist_to_last_switch counts from it; inside a segment it is a
+    word_start; the piece after it is a word_cont.  No token of such prose is 'ws'."""
+    text = "Kraft reads the report in the morning. entscheidende Stimmen fehlen am Morgen. The end"
+    segs = [("Kraft", "E", 1, "subj"), ("reads the report", "E", 1, "pred"), ("in the morning", "E", 1, "adj"),
+            ("entscheidende Stimmen", "D", 2, "subj"), ("fehlen", "D", 2, "pred"), ("am Morgen", "D", 2, "adj"),
+            ("The end", "E", 3, "tail")]
+    a = S.annotate(tok, text, segs)
+    toks = a["tokens"]
+    sp = toks.index(" ")
+    assert toks[sp - 1] == "." and toks[sp + 1] == "ents" and toks[sp + 2] == "che"
+    # the space belongs to the following word: segment 3 = subj of unit 2, German
+    assert (a["seg"][sp], a["unit"][sp], a["lang"][sp]) == (3, 2, "D")
+    assert (a["seg"][sp - 1], a["lang"][sp - 1]) == (2, "E")          # the period stays with unit 1
+    assert a["klass"][sp] == "boundary" and a["klass"][sp + 1] == "word_cont" and a["klass"][sp + 2] == "word_cont"
+    assert a["boundary_positions"] == [sp, toks.index(" The")] and a["n_switches"] == 2
+    assert a["dist_to_last_switch"][sp - 1] == -1 and a["dist_to_last_switch"][sp:sp + 3] == [0, 1, 2]
+    assert "ws" not in a["klass"]
+    assert a["n_words_D"] == 5 and a["n_words_E"] == 9
+    # the tokens of the German subject spell the segment, leading space included
+    assert "".join(toks[t] for t in range(a["n_tokens"]) if a["seg"][t] == 3) == " entscheidende Stimmen"
+    # inside a segment the lone space is a word_start and the next piece a word_cont
+    text2 = "Kraft reads the report. Er entscheidet am Morgen. The end"
+    segs2 = [("Kraft", "E", 1, "subj"), ("reads the report", "E", 1, "pred"),
+             ("Er", "D", 2, "subj"), ("entscheidet am Morgen", "D", 2, "pred"), ("The end", "E", 3, "tail")]
+    a2 = S.annotate(tok, text2, segs2)
+    sp2 = a2["tokens"].index(" ")
+    assert a2["tokens"][sp2 + 1] == "ents" and a2["tokens"][a2["boundary_positions"][0]] == " Er"
+    assert (a2["seg"][sp2], a2["lang"][sp2]) == (3, "D") and a2["klass"][sp2] == "word_start"
+    assert a2["klass"][sp2 + 1] == "word_cont" and "ws" not in a2["klass"]
+    # the bank: DEV01A's pred_5 "erscheint im Traum" starts with a lone space; at the
+    # C3 switch inside unit 5 (K=8) it is the boundary token, under C1 a word_start
+    by = {(v.K, v.C): v for v in variants["DEV01A"]}
+    for (K, C), want in (((8, "C3"), "boundary"), ((28, "seg"), "boundary"), ((2, "C1"), "word_start")):
+        a3 = by[(K, C)].annot
+        pos = [t for t, s in enumerate(a3["tokens"]) if s == " " and a3["tokens"][t + 1] == "ers"]
+        assert len(pos) == 1, (K, C)
+        t = pos[0]
+        assert a3["unit"][t] == 5 and a3["lang"][t] == "D" and a3["klass"][t] == want
+        assert a3["klass"][t + 1] == "word_cont" and a3["lang"][t + 1] == "D"
+        if want == "boundary":
+            assert a3["lang"][t - 1] == "E" and a3["dist_to_last_switch"][t:t + 2] == [0, 1]
+    for vs in variants.values():
+        for v in vs:
+            assert "ws" not in v.annot["klass"], v.tag
+
+
 def test_variant_summary(variants):
     df = S.variant_summary(variants["DEV01B"])
     assert len(df) == 12 and {"K", "C", "F100", "n_tokens", "n_words", "tail_start"} <= set(df.columns)
     assert df["target_id"].nunique() == 1
+
+
+def test_stage_a_families_table_fills_target_id(families, variants, tok):
+    """Stage A's families table takes the target id of a standard family from its K=0
+    variant (the Family itself carries none); a family without a kept variant gets the
+    id of its K=0 rendering when a tokenizer is given and NaN otherwise."""
+    from lsne.experiments.stage_a_stimuli import families_table
+
+    fams = [f for f in families if f.family_id == "DEV01"]
+    vs = [v for f in fams for v in variants[f.tag]]
+    df = families_table(fams, None, vs)
+    assert df["tag"].tolist() == [f.tag for f in fams] and df["target_id"].notna().all()
+    for f in fams:
+        ref = S.reference_variant(variants[f.tag])
+        assert int(df.set_index("tag").loc[f.tag, "target_id"]) == ref.target_id == 21939
+    # K=0 is the source; without it the (identical) id of any variant of the group is used
+    one = [v for v in vs if v.K != 0 and v.formulation == "A"][:1]
+    assert families_table(fams, None, one).set_index("tag")["target_id"].notna().tolist() == [True] + [False] * (len(fams) - 1)
+    assert families_table(fams, None)["target_id"].isna().all()
+    # the smoke run keeps the core triple of DEV01A only: DEV01B (and the further
+    # formulations C, D of the family) are filled from their renderings
+    df3 = families_table(fams, None, one, tokenizer=tok)
+    assert df3["target_id"].tolist() == [21939] * len(fams)
+    bad = copy.deepcopy(fams[1])
+    bad.target = " Fewkoombey"                              # not a single token: NaN, no error
+    assert families_table([fams[0], bad], None, one, tokenizer=tok)["target_id"].isna().tolist() == [False, True]
 
 
 # ======================================================================================
