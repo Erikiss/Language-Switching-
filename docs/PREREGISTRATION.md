@@ -71,6 +71,20 @@ Mindesteffektgrenze nicht ausschließt, gilt als „offen“, nicht als Nullbefu
 14. Head-Arm: B bei Steering am schlechtesten Head (Auswahl auf Entwicklungsfamilien
     eingefroren) vs. am Residualstrom bei gleicher relativer Dosis; zweiseitig.
 
+15. RDX-Anteil (Stufe J): Bruchteil von ‖Δ‖² der Differenz Kultur/Politik ↔
+    Proteinfehlfaltung, der durch die Domänenachsen erklärt wird, gegen 32 Zufallsbasen
+    gleicher Größe; Mindesteffekt z ≥ 2 in mindestens der Hälfte der Layer.
+16. Empirische Schwierigkeitsrangfolge: mittlere Token-NLL pro Pile-Teilgebiet aus
+    N ≥ 2000 gezogenen Sequenzen; Bericht des Rangs von `protein_misfolding`. Liegt es
+    nicht im schwersten Drittel, wird der Gegenpol durch das tatsächlich schwerste
+    Teilgebiet ersetzt und das in der Auswertung vermerkt.
+17. Test-Time-Training (Stufe K): (i) Memorisationsgeschwindigkeit der injizierten
+    Textstücke gegen angepasste Kontrolltexte (Schritte bis zur NLL-Schwelle,
+    zweiseitig); (ii) Δ Sharing-Index und Δ Netzwerkaktivität nach TTT gegenüber den
+    drei Kontrollarmen; (iii) Δ T(K=8) und Δ B(x) nach TTT. Alle drei nur auf
+    Entwicklungsfamilien explorativ, Bestätigung auf Testfamilien mit eingefrorener
+    Schrittzahl und Lernrate.
+
 ## 4. Ausschlussregeln (vor Sichtung der Modellwerte)
 
 - Variante ausgeschlossen, wenn Ziel-ID oder Tail-Token-IDs vom K=0-Fall abweichen

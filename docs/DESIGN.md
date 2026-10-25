@@ -364,6 +364,79 @@ Richtung × Domäne der Familie (ist Steuern in der Schwachdomäne treffsicherer
 Alles explorativ, bis die Bestätigung auf Testfamilien läuft; der Atlas bleibt die
 Instanz für die Richtungswahl, wenn Befunde mehrdeutig sind.
 
+### 4.8 RDX: Differenz statt Einzeldomäne, Gegenpol Proteinfehlfaltung, Sharing-Index, Test-Time-Training
+
+Präzisierung des Auftraggebers (25.10.2026, fünfte Rückmeldung): Nach dem Prinzip der
+**Representational Difference Explanation (RDX)** ist eine *Differenz* aussagekräftiger
+als eine einzelne Domäne. Kultur/Politik allein genügt also nicht; es braucht einen
+Gegenpol. Vorschlag: Pile enthält PubMed, PubMed enthält Proteinliteratur, und dort sind
+**fehlgefaltete Proteine** (Prionen, Amyloid, β-Faltblätter) vermutlich das am schlechtesten
+vorhersagbare Teilgebiet — strukturell analog zur Schwachstelle des Kultur-Benchmarks, aber
+aus entgegengesetzter Richtung. Dritter Baustein: der **Sharing**-Parameter aus Metas
+*Meaningful Social Interactions*, der die Netzwerkaktivität steigern sollte; da Pythia
+keinen solchen Parameter hat, soll Test-Time-Training auf Ethereum-Daten (DAO-Fork 2016,
+also eine Spaltung) als strukturelle Injektion dienen, unter Ausnutzung der Phasen, in
+denen Textstücke sehr schnell memorisiert werden (wie State 60482 zeigte).
+
+Umsetzung in drei Teilen, jeder mit einer eigenen Prüfung statt einer Annahme
+(Module `lsne.rdx`, `lsne.pile_domains`, `lsne.sharing`, `lsne.ttt`):
+
+**(a) RDX-Prinzip.** Nicht absolute Repräsentationen werden erklärt, sondern
+Differenzvektoren zwischen kontrollierten Bedingungen. Kontrastpaare:
+Kultur/Politik ↔ Proteinfehlfaltung (die beiden mutmaßlichen Schwachpole),
+Jura ↔ Kultur/Politik (Dossier-Achse aus §4.7), Englisch ↔ Deutsch (Sprachachse),
+K=0 ↔ K=8 (Sprachwechsel). Für jede Differenz Δ = mean(A) − mean(B) an jedem
+(Layer, Readout) wird der **RDX-Anteil** berechnet: Welcher Bruchteil von ‖Δ‖² lässt sich
+durch eine Kandidatenbasis erklären (Domänenachsen, SAE-Decoderzeilen, Head-Beiträge,
+Hauptkomponenten)? Gegen Zufallsbasen gleicher Größe z-standardisiert. Eine Basis erklärt
+eine Differenz nur dann, wenn sie sie besser erklärt als eine Zufallsbasis **und** die
+Erklärung über Familien hinweg stabil ist.
+
+**(b) Gegenpol Proteinfehlfaltung — gemessen, nicht angenommen.** Neue Lexikondomänen
+`biomed_protein` und `protein_misfolding`. Die Prämisse „Fehlfaltung ist das am
+schlechtesten vorhergesagte Teilgebiet“ wird empirisch geprüft: Mit dem vorhandenen
+Range-Request-Sampler werden N Trainingssequenzen aus dem Pile gezogen, per Schlüsselwort-
+profil einer Domäne zugeordnet (inklusive PubMed-Marker) und ihre Token-NLL unter
+Pythia-160M gemessen. Ergebnis ist eine **empirische Schwierigkeitsrangfolge der
+Pile-Teilgebiete**; sie entscheidet, ob Fehlfaltung tatsächlich der passende Gegenpol ist
+oder ob ein anderes Teilgebiet (z. B. Formeln, Code, seltene Nomenklatur) die Rolle besser
+erfüllt. Dazu Stimulusfamilien F19–F20 (Prion/Amyloid-Kontext, Laborerzählung) für den
+Sprachwechseltest in dieser Domäne.
+
+**(c) Sharing und Netzwerkaktivität — operationalisiert.** „Sharing“ ist bei Meta eine
+Produktkennzahl, kein Modellparameter; eine direkte Übertragung wird hier nicht behauptet.
+Das modellinterne Analogon ist **repräsentationales Teilen**: Wie stark nutzen
+verschiedene Domänen dieselben Einheiten? Messgrößen pro (Layer, Site):
+Sharing-Index S = Jaccard-Überlappung der aktiven TopK-SAE-Features zwischen
+Domänenbedingungen (paarweise und global), Kosinus der Head-Beitragsprofile,
+Anteil gemeinsam genutzter Features an der Gesamtaktivierung;
+Netzwerkaktivität A = Anteil der Features bzw. Heads über Schwelle, mittlere
+Aktivierungsmasse, Participation Ratio der Feature-Aktivierungen. S und A sind vor und
+nach dem Eingriff messbar und bilden den „dritten Parameter“ des Vorschlags.
+
+**(d) Test-Time-Training als strukturelle Injektion.** Fortgesetztes Training eines
+eingefrorenen Checkpoints auf einem kleinen Kontrastkorpus (Ethereum/DAO-Fork 2016,
+vom Auftraggeber bereitzustellen unter `data/ttt/`; der Code liefert einen Loader und einen
+kleinen gemeinfreien Platzhalter, damit Tests ohne das Korpus laufen). Gemessen wird:
+1. **Memorisationsgeschwindigkeit** pro Textstück: NLL-Verlauf über Updateschritte, mit
+   den Kontrollen des Dossiers (Batchnachbarn, angepasste Kontrolltexte, Platzhalter);
+   „schnelle Phase“ = Schritte bis zum Unterschreiten einer vorab definierten NLL-Schwelle.
+   Geprüft über mehrere Checkpoints (4k, 98k, 143k), da das Dossier Phasenabhängigkeit
+   nahelegt.
+2. **Wirkung auf alles Übrige:** Sprachwechselkontraste T und B, lokale Geometrie (§4.4),
+   Sharing-Index und Netzwerkaktivität (c), schlechtester Head (§4.7) — jeweils vor/nach
+   TTT auf demselben Stimulusraster.
+3. **Kontrollarme:** gleiches Trainingsbudget auf (i) einem thematisch neutralen Korpus
+   gleicher Größe, (ii) einem Korpus ohne Spaltungs-/Fork-Struktur, (iii) permutiertem
+   Text des DAO-Korpus. Nur ein Effekt, der über diesen Kontrollen liegt, stützt die
+   „strukturelle Injektion“.
+
+**Was hier nicht behauptet wird.** Dass eine Produktkennzahl eines sozialen Netzwerks einem
+Modellparameter entspricht; dass ein Fork-Text im Modell eine Spaltung erzeugt; dass
+Fehlfaltung ohne Messung der schwierigste Pile-Teil ist. TTT verändert Gewichte, daher
+gelten alle Befunde am eingefrorenen Modell danach nicht automatisch weiter — jede Größe
+wird nach dem Training neu gemessen.
+
 ### 4.3 Dossier-Kernkontraste (Frage 2 und Replikation)
 
 T(K, C), B(x) pro Richtung, I(K, C). Wechselwirkung K × C, Transfer `ent` von
@@ -441,6 +514,8 @@ Shard schreibt eigene Ergebnisdateien, `lsne.cli merge` fügt zusammen.
 | G Geometrie + Trajektorie | G0–G3 (lokale Geometrie unter Sprachwechsel), T1–T5 (Trajektorie) | `06_geometry_trajectory` | G0 muss bestehen, sonst keine Interpretation; T3 entscheidet über die Steering-Lesart |
 | H λ-Dynamik | Alg. 1 im Aktivierungsraum, λ-Sweep, SAE-Features und Pfadgeometrie vs. λ, B(x)(λ) | `07_lambda_dynamics` | Korrelationen mit λ auf Entwicklungsfamilien gefunden, auf Testfamilien bestätigt |
 | I Kompass + Heads | Domänenprofile (Atlas-Proxy/-Import), Domänenachsen mit Gegensteuern, Head-Attribution, Steering am schlechtesten Head | `08_compass_heads` | Domänenprofil von `ent` dokumentiert; Richtung × Domäne-Interaktion auf Entwicklungsfamilien |
+| J RDX + Sharing | Differenzerklärung gegen Zufallsbasen, empirische Schwierigkeitsrangfolge der Pile-Teilgebiete, Sharing-Index und Netzwerkaktivität | `09_rdx_sharing` | Gegenpol wird durch die NLL-Rangfolge bestimmt, nicht gesetzt |
+| K Test-Time-Training | Kontrastkorpus-Training, Memorisationsgeschwindigkeit über Checkpoints, Vorher/Nachher auf allen Kenngrößen, drei Kontrollarme | `10_ttt_injection` | Effekt nur gültig, wenn er über allen drei Kontrollarmen liegt |
 | E Tensornetz | lineare Antwort, TNCO vs. opt_einsum, Nichtlinearität | `04_tn_linear_response` | Berichtet Kosten/Laufzeit/Fehler; kein Hypothesentest |
 | F Skala & Verlauf | 410M/1B/1.4B, Checkpoint-Sweep; BF16-Vergleich | `05_scale_and_checkpoints` | Shards, Drive-Export |
 
