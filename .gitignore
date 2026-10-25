@@ -17,3 +17,9 @@ cache/
 data/state2143/sequence_tokens.json
 data/state2143/*.bin
 .env
+# user-supplied corpora and extractions (never committed)
+data/ttt/dao_fork/
+data/ttt/neutral/
+data/ttt/nofork/
+data/atlas/
+data/s4/
