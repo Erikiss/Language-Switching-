@@ -14,8 +14,10 @@
 #     `--f-stages B,D` runs only the baseline + non-equilibrium stages per checkpoint
 #     (stage D with the reduced `limited` settings of lsne.experiments.common.Limits).
 #   * Family subsets: F01-F12 (test) + DEV01-DEV04 (development) are all included unless
-#     `--families` is given.  The scale arm (shard 6) limits the variants per formulation
-#     to the core triple + C1 levels with `--limit-variants` (counted over all families).
+#     `--families` is given.  The scale arm (shard 6) restricts the condition grid to the
+#     C1 structure level (`--c-levels C1`: K=0, K=2/4/8 C1, K=16/28 seg = 6 variants per
+#     formulation); `--limit-variants N` would instead keep whole formulations (core
+#     triple first) and is meant for smoke / debugging runs.
 #   * The anchor (cache/state2143) and the unigram counts (cache/unigram) are fetched by
 #     range request on first use; set `LSNE_CACHE` to a Drive folder to share them.
 #   * The SAE arm (shard 3) needs `--use-sae`; the published SAE for pythia-160m is
@@ -103,18 +105,19 @@ shards:
   - id: 6
     account: colab-B
     gpu: A100-6
-    purpose: scale arm, pythia-1b and pythia-1.4b step143000, stages B/C/D (limited), core + C1 variants
+    purpose: scale arm, pythia-1b and pythia-1.4b step143000, stages B/C/D (limited), C1 variants only
     models: [EleutherAI/pythia-1b, EleutherAI/pythia-1.4b]
     revision: step143000
     stages: [F]
     f_stages: [B, C, D]
+    c_levels: [C1]
     shard_index: 0
     shard_count: 1
     command: >-
       python -m lsne.cli run --stage F --model EleutherAI/pythia-1b --revision step143000
       --dtype float32 --device auto --out /content/drive/MyDrive/LSNE/runs --seed 0
       --pairs EleutherAI/pythia-1b@step143000,EleutherAI/pythia-1.4b@step143000
-      --f-stages B,C,D --limit-variants 192 --shard-index 0 --shard-count 1
+      --f-stages B,C,D --c-levels C1 --shard-index 0 --shard-count 1
 
 # Smoke test of the whole pipeline on a CPU (same command the test suite runs; < 3 min):
 smoke:

@@ -133,6 +133,7 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
 
     bank = C.direction_bank(cfg, mb, variants, site, original=original, limits=limits, sae=kw.get("sae"),
                             axis_npz=kw.get("axis_npz"))
+    bank.meta["source"] = "built"
     sig = C.bank_signature(variants, site, cfg, limits, original)
     if ctx is not None:
         ctx["bank"], ctx["bank_signature"] = bank, sig

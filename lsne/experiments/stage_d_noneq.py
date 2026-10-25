@@ -313,6 +313,7 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
               "lens": lens, "lens_summary": lens_summary, "update_norms": upd, "ca": ca, "ca_layers": ca_layers}
     tables.update(gen)
     return C.finish_stage(run_dir, "D", cfg, mb, tables, limits=limits, t0=t0, site=site, depth_site=C.depth_site(mb),
+                          bank_source=bank.meta.get("source", ""),
                           lattice_directions=lattice_dirs, generation_directions=gen_dirs, doses=list(doses),
                           marker_lexicon=lexicon, n_variants=len(variants), n_core=len(core),
                           gen=dict(n_new=cfg.gen_n_new, n_samples=cfg.gen_n_samples, n_steps=limits.gen_n_steps,

@@ -267,5 +267,6 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
         "grad_x_act": gxa, "grad_x_act_by_class": gxa_cls,
     }
     return C.finish_stage(run_dir, "C", cfg, mb, tables, limits=limits, t0=t0, site=site, directions=dir_names,
+                          bank_source=bank.meta.get("source", ""),
                           doses=list(cfg.doses), layer_grid=[int(l) for l in layer_grid(mb.n_layers)],
                           n_variants=len(variants), n_pairs=len(attribution_pairs(allv)))

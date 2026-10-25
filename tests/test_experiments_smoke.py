@@ -272,6 +272,26 @@ def test_direction_bank_with_synthetic_sae_and_roundtrip(mb, tok, tmp_path):
     assert C.load_bank(tmp_path / "nowhere") is None
 
 
+def test_stage_error_is_recorded_and_run_continues(mb, tmp_path, monkeypatch):
+    """A failing stage writes error.txt + a manifest with status='error'; later stages still run."""
+    from lsne import cli
+
+    class Boom:
+        @staticmethod
+        def run(cfg, mb, run_dir, **kw):
+            raise RuntimeError("boom")
+
+    monkeypatch.setitem(cli.STAGES, "A", Boom)
+    monkeypatch.setenv("LSNE_OFFLINE", "1")
+    cfg = C.smoke_config(RunConfig(model=mb.spec, families=["DEV01"], out_root=str(tmp_path)))
+    report = cli.run_stages(cfg, C.Limits.smoke(progress=False), ["A", "B"], mb=mb)
+    assert report["A"]["status"] == "error" and "boom" in report["A"]["error"]
+    a_dir = tmp_path / "A" / "pythia-14m@step98000"
+    assert (a_dir / "error.txt").exists() and "RuntimeError: boom" in (a_dir / "error.txt").read_text()
+    assert json.loads((a_dir / "manifest.json").read_text())["status"] == "error"
+    assert report["B"]["status"] == "ok" and (tmp_path / "B" / "pythia-14m@step98000" / "baseline.csv").exists()
+
+
 def test_marker_lexicon_and_sites(mb, tok):
     lex = C.marker_lexicon(tok)
     assert len(lex["E"]) == 6 and len(lex["D"]) == 6 and not set(lex["E"]) & set(lex["D"])

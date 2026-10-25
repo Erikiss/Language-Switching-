@@ -56,8 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--families", default=None, help="comma-separated family ids (F01) or tags (F01A); default: all")
     r.add_argument("--families-dir", default=RunConfig().families_dir)
     r.add_argument("--out", default=None, help="output root (default: lsne.io.drive_root(), i.e. Drive on Colab or ./runs)")
-    r.add_argument("--limit-variants", type=int, default=None)
-    r.add_argument("--limit-families", type=int, default=None)
+    r.add_argument("--limit-variants", type=int, default=None,
+                   help="keep at most N variants (formulation by formulation, core triple first)")
+    r.add_argument("--limit-families", type=int, default=None, help="keep at most N family ids")
+    r.add_argument("--k-levels", default=None, help="comma-separated K levels of the unit-level grid (default 0,2,4,8)")
+    r.add_argument("--c-levels", default=None, help="comma-separated C levels (default C1,C2,C3)")
+    r.add_argument("--k-extreme", default=None, help="comma-separated segment-level K levels (default 16,28; '' = none)")
     r.add_argument("--n-random-dirs", type=int, default=None)
     r.add_argument("--seed", type=int, default=0)
     r.add_argument("--smoke", action="store_true", help="tiny CPU run (pythia-14m, < 3 min)")
@@ -105,6 +109,12 @@ def make_config(args: argparse.Namespace) -> tuple[RunConfig, C.Limits]:
                     limit_families=args.limit_families)
     if args.n_random_dirs is not None:
         cfg.n_random_dirs = int(args.n_random_dirs)
+    if args.k_levels is not None:
+        cfg.k_levels = tuple(int(k) for k in args.k_levels.split(",") if k.strip())
+    if args.c_levels is not None:
+        cfg.c_levels = tuple(c.strip() for c in args.c_levels.split(",") if c.strip())
+    if args.k_extreme is not None:
+        cfg.k_extreme = tuple(int(k) for k in args.k_extreme.split(",") if k.strip())
     for name in ("gen_n_new", "gen_n_samples", "tn_rank", "tn_window"):
         val = getattr(args, name, None)
         if val is not None:

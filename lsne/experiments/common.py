@@ -697,10 +697,13 @@ def get_bank(cfg: RunConfig, mb: ModelBundle, variants: Sequence, site: HookSite
         rd = RunDir(cfg.out_root, "B", cfg.model, mkdir=False)
         if rd.manifest_path.exists() and read_manifest(rd).get("bank_signature") == sig:
             bank = load_bank(rd)
+            if bank is not None:
+                bank.meta["source"] = f"disk:{rd.path}"
     except Exception:  # noqa: BLE001 - any unreadable previous run: rebuild
         bank = None
     if bank is None:
         bank = direction_bank(cfg, mb, variants, site, original=original, limits=limits, sae=sae)
+        bank.meta["source"] = "built"
     if ctx is not None:
         ctx["bank"], ctx["bank_signature"] = bank, sig
     return bank

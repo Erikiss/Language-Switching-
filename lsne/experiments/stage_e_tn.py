@@ -25,7 +25,6 @@ tn_basis     explained variance of the PCA basis per rank
 """
 from __future__ import annotations
 
-import math
 import time
 
 import numpy as np
@@ -175,5 +174,6 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
         "tn_basis": basis_df,
     }
     return C.finish_stage(run_dir, "E", cfg, mb, tables, limits=limits, t0=t0, site_from=site_from, layers=list(layers),
+                          bank_source=bank.meta.get("source", ""),
                           rank=int(P.shape[1]), window=int(cfg.tn_window), directions=dir_names, n_subset=len(subset),
                           subset=[v.tag for v in subset])

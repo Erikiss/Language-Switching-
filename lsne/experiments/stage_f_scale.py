@@ -63,6 +63,16 @@ def parse_pairs(spec: Optional[str], cfg: RunConfig) -> list[tuple[str, str]]:
     return out
 
 
+def family_filter(requested: Optional[Sequence[str]], family_ids: Sequence[str]) -> list[str]:
+    """``cfg.families`` entries (ids or formulation tags) restricted to ``family_ids``;
+    bare ids when nothing was requested."""
+    ids = set(family_ids)
+    if not requested:
+        return sorted(ids)
+    out = [x for x in requested if x in ids or x.rstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ") in ids]
+    return out or sorted(ids)
+
+
 def plan_triples(pairs: Sequence[tuple[str, str]], families: Sequence[str], shard_index: int = 0,
                  shard_count: int = 1) -> pd.DataFrame:
     """Sorted ``(model, revision, family)`` triples with a deterministic shard assignment."""
@@ -97,7 +107,7 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     for (model, revision) in C.progress(done_pairs, "F pairs", enabled=limits.progress):
         fams = sorted(mine[(mine["model"] == model) & (mine["revision"] == revision)]["family"].tolist())
         spec = replace(cfg.model, name=model, revision=revision)
-        sub_cfg = replace(cfg, model=spec, families=fams)
+        sub_cfg = replace(cfg, model=spec, families=family_filter(cfg.families, fams))
         t_load = time.perf_counter()
         try:
             mb2 = load_model(spec)
