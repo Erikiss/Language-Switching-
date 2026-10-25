@@ -119,9 +119,39 @@ def test_smoke_stage_contents(smoke_run):
     # pre-registered grid = last block of each quarter of the depth ({2,5,8,11} for 160m,
     # {1,2,4,5} for the 6 blocks of pythia-14m); block 0 (token embedding) is never patched
     assert {"K0_vs_K8C1", "K0_vs_K28seg"} <= set(att["pair"]) and set(att["layer"]) == {1, 2, 4, 5}
-    assert set(att["class"]) == set(C.PATCH_CLASSES)
+    assert set(att["class"]) == set(C.PATCH_CLASSES) >= {"delim", "post_punct", "ws", "punct", "boundary"}
+    # the pre-registered union class R_ws+punct+boundary (`delim`, contrast 3) is measurable with a
+    # defined stratified control on every pair and layer; `ws` alone is empty by construction
+    # (BPE attaches the space to the word) and flagged, never silently NaN
+    delim = att[att["class"] == C.PREREG_PATCH_CLASS]
+    assert len(delim) == att["pair"].nunique() * 4
+    assert delim["measurable"].all() and delim["control_defined"].all() and (delim["n_positions"] >= 2).all()
+    assert np.isfinite(delim[["recovery", "recovery_random_mean", "recovery_random_sd"]].to_numpy()).all()
+    assert (delim["n_positions"] >= att[att["class"] == "punct"].set_index(["pair", "layer"]).loc[
+        list(zip(delim["pair"], delim["layer"])), "n_positions"].to_numpy()).all()
+    ws = att[(att["class"] == "ws") & (att["kind"] == "standard")]
+    assert len(ws) and (~ws["measurable"]).all() and ws["recovery"].isna().all() and (ws["n_positions"] == 0).all()
+    assert (att["measurable"] == (att["n_positions"] > 0)).all()
+    # contrast 3 per layer: per-formulation excess rows and the family cluster bootstrap next to T / I
+    acon = pd.read_csv(_stage_dir(out, "C") / "attribution_contrasts.csv")
+    assert set(acon["class"]) <= set(C.PATCH_CLASSES) and not {"tail", "all"} & set(acon["class"])
+    ad = acon[acon["class"] == C.PREREG_PATCH_CLASS]
+    assert len(ad) == len(delim) and ad["preregistered"].all() and (~acon[acon["class"] != "delim"]["preregistered"]).all()
+    assert np.allclose(ad["R_excess"], ad["recovery"] - ad["recovery_random_mean"])
+    assert set(ad["layer"]) == {1, 2, 4, 5} and set(zip(ad["K"], ad["C"])) >= {(8, "C1"), (28, "seg")}
+    boot = pd.read_csv(_stage_dir(out, "C") / "contrasts_boot.csv")
+    assert {"T", "I", "R_excess"} <= set(boot["quantity"]) and {"layer", "class"} <= set(boot.columns)
+    assert (boot[boot["quantity"] != "R_excess"]["layer"] == -1).all()
+    r3 = boot[(boot["quantity"] == "R_excess") & (boot["class"] == C.PREREG_PATCH_CLASS)]
+    assert sorted(zip(r3["K"], r3["C"], r3["layer"])) == sorted((K, Cc, l) for (K, Cc) in [(8, "C1"), (28, "seg")]
+                                                                 for l in (1, 2, 4, 5))
+    assert np.isfinite(r3[["mean", "ci_low", "ci_high"]].to_numpy()).all() and (r3["n_clusters"] == 1).all()
+    std_ad = ad[ad["kind"] == "standard"].set_index(["K", "C", "layer"])
+    for _, r in r3.iterrows():
+        assert r["mean"] == pytest.approx(std_ad.loc[(r["K"], r["C"], r["layer"]), "R_excess"])
     cman = json.loads((_stage_dir(out, "C") / "manifest.json").read_text(encoding="utf-8"))
-    assert cman["layer_grid"] == [1, 2, 4, 5]
+    assert cman["layer_grid"] == [1, 2, 4, 5] and cman["prereg_patch_class"] == "delim"
+    assert cman["patch_classes"] == list(C.PATCH_CLASSES)
     gxa = pd.read_csv(_stage_dir(out, "C") / "grad_x_act_by_class.csv")
     assert gxa["abs_share"].between(0, 1 + 1e-9).all() and set(gxa["layer"]) == {1, 2, 4, 5}
     # D: damage spreading and generation diagnostics
@@ -170,6 +200,12 @@ def test_smoke_stage_contents(smoke_run):
     assert (rx["eps"] == 0.5).all() and (rx["n_new"] == 8).all()
     assert {"tau_raw", "tau_censored", "identifiable", "reason", "b_se", "r2", "f_pvalue", "b_lo", "b_hi"} <= set(rx.columns)
     assert (rx["tau"].notna() <= rx["identifiable"].astype(bool)).all()
+    # the gate no longer shrinks the residual df by the label window: for fitted rows
+    # n_eff = n / vif >= n / window (unfitted rows - constant or too short - keep n_eff = 0)
+    fitted = rx["tau_raw"].notna()
+    assert (rx.loc[fitted, "n_eff"] >= rx.loc[fitted, "n_fit"] / 8.0 - 1e-9).all() and (rx.loc[fitted, "n_eff"] > 0).all()
+    assert (rx.loc[~fitted, "n_eff"] == 0).all()
+    assert (rx["identifiable"].astype(bool) == (rx["reason"].fillna("") == "")).all()
     su = pd.read_csv(_stage_dir(out, "D") / "susceptibility.csv")
     assert set(su["order_parameter"]) == {"fD", "proj_lang_dom"} and set(su["eps"]) == {0.0, 0.5}
     fdt = pd.read_csv(_stage_dir(out, "D") / "fdt.csv")

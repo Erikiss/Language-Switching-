@@ -437,8 +437,9 @@ FIT_ALPHA = 0.05
 N_NULL_F = 199
 #: Default number of between-sample bootstrap resamples of :func:`relaxation`.
 N_BOOT_RELAX = 200
-_FIT_KEYS = ("a", "b", "tau", "tau_raw", "b_se", "b_se_hac", "r2", "rss", "rss_const", "f_stat", "f_pvalue",
-             "f_pvalue_iid", "n", "n_eff", "vif", "n_null", "tau_censored", "identifiable", "criterion", "reason")
+_FIT_KEYS = ("a", "b", "b_window", "tau", "tau_raw", "b_se", "b_se_hac", "r2", "rss", "rss_const", "f_stat",
+             "f_pvalue", "f_pvalue_iid", "n", "n_eff", "vif", "n_null", "tau_censored", "identifiable", "criterion",
+             "reason")
 _F_NULL_CACHE: dict = {}
 _F_NULL_CACHE_MAX = 64
 
@@ -448,9 +449,9 @@ def _relax_model(t, a, b, tau, t_on):
 
 
 def _fit_result(**kw) -> dict:
-    out = dict(a=np.nan, b=np.nan, tau=np.nan, tau_raw=np.nan, b_se=np.nan, b_se_hac=np.nan, r2=np.nan, rss=np.nan,
-               rss_const=np.nan, f_stat=np.nan, f_pvalue=np.nan, f_pvalue_iid=np.nan, n=0, n_eff=0.0, vif=np.nan,
-               n_null=0, tau_censored=False, identifiable=False, criterion="series", reason="")
+    out = dict(a=np.nan, b=np.nan, b_window=np.nan, tau=np.nan, tau_raw=np.nan, b_se=np.nan, b_se_hac=np.nan,
+               r2=np.nan, rss=np.nan, rss_const=np.nan, f_stat=np.nan, f_pvalue=np.nan, f_pvalue_iid=np.nan, n=0,
+               n_eff=0.0, vif=np.nan, n_null=0, tau_censored=False, identifiable=False, criterion="series", reason="")
     out.update(kw)
     return out
 
@@ -564,7 +565,11 @@ def fit_relaxation(fD_t: np.ndarray, t_on: int, t: Optional[np.ndarray] = None, 
     series always returns some finite, often bound-saturated time constant, which would
     fake "critical slowing down" in a tau(eps) phase diagram).  Identifiable means
 
-    * the amplitude is not negligible: ``|b| >= b_min`` (default :data:`B_MIN`), and
+    * the amplitude realised inside the fitted window is not negligible:
+      ``|b_window| >= b_min`` (default :data:`B_MIN`) with ``b_window = b * (1 -
+      exp(-(t_last - t_on)/tau))``, the rise of the fitted curve between ``t_on`` and the
+      last point (equal to ``b`` for a resolved ``tau``; a bound-saturated fit of a
+      nearly flat series can carry a large asymptotic ``b`` with a rise of 0.01), and
     * the fit improves on the constant model ``y = mean(y)``: F-test of the two extra
       parameters with ``f_pvalue <= alpha`` (default :data:`FIT_ALPHA`).  The F statistic
       keeps its plain degrees of freedom ``(2, n - 3)``; for ``window > 1`` (the label
@@ -633,17 +638,69 @@ def fit_relaxation(fD_t: np.ndarray, t_on: int, t: Optional[np.ndarray] = None, 
     n_eff = float(n) / vif
     lo_t, hi_t = TAU_BOUNDS
     censored = bool(tau <= lo_t * (1.0 + 1e-6) or tau >= hi_t * (1.0 - 1e-6))
+    b_window = float(b * (1.0 - np.exp(-(tt[-1] - float(t_on)) / tau)))
     reasons = []
-    if abs(b) < float(b_min):
-        reasons.append(f"|b|={abs(b):.3g} < b_min={float(b_min):.3g}")
+    if abs(b_window) < float(b_min):
+        reasons.append(f"|b_window|={abs(b_window):.3g} < b_min={float(b_min):.3g}")
     if not (np.isfinite(f_p) and f_p <= float(alpha)):
         reasons.append(f"F-test p={f_p:.3g} > alpha={float(alpha):.3g}" if np.isfinite(f_p)
                        else "F-test undefined (too few points)")
     identifiable = not reasons
-    return _fit_result(a=a, b=b, tau=(tau if identifiable else np.nan), tau_raw=tau, b_se=b_se, b_se_hac=b_se_hac,
-                       r2=r2, rss=rss, rss_const=rss_const, f_stat=f_stat, f_pvalue=f_p, f_pvalue_iid=f_p_iid, n=n,
-                       n_eff=n_eff, vif=vif, n_null=n_null, tau_censored=censored, identifiable=identifiable,
-                       criterion="series", reason="; ".join(reasons))
+    return _fit_result(a=a, b=b, b_window=b_window, tau=(tau if identifiable else np.nan), tau_raw=tau, b_se=b_se,
+                       b_se_hac=b_se_hac, r2=r2, rss=rss, rss_const=rss_const, f_stat=f_stat, f_pvalue=f_p,
+                       f_pvalue_iid=f_p_iid, n=n, n_eff=n_eff, vif=vif, n_null=n_null, tau_censored=censored,
+                       identifiable=identifiable, criterion="series", reason="; ".join(reasons))
+
+
+def fit_relaxation_samples(fD_window: np.ndarray, t_on: int, t: Optional[np.ndarray] = None,
+                           window: int = WINDOW, n_boot: int = N_BOOT_RELAX, seed: int = 0,
+                           b_min: float = B_MIN, alpha: float = FIT_ALPHA) -> dict:
+    """The identifiability gate of :func:`relaxation` on per-sample running fractions
+    ``fD_window [B, n]`` (no model needed): the series fit of the NaN-aware mean over
+    samples (:func:`fit_relaxation` with the label ``window``) AND the between-sample
+    bootstrap of the raw amplitude ``b`` over ``n_boot`` resamples of the ``B`` samples
+    (seeded).  ``tau`` is NaN unless both pass; the bootstrap is skipped
+    (``criterion="series"``) when it is uninformative (``B < 2`` or fewer than two finite
+    resample amplitudes).  ``tau_ci`` is the (2.5, 97.5) percentile interval of the
+    resample taus that pass the series gate (``n_tau_boot`` of them; NaN pair below two).
+
+    Returns dict(fD_t, fit, tau, tau_ci, tau_boot, n_tau_boot, b_boot, b_ci,
+    b_ci_excludes_zero, criterion)."""
+    fDw = np.asarray(fD_window, dtype=np.float64)
+    if fDw.ndim == 1:
+        fDw = fDw[None, :]
+    B, n = fDw.shape
+    t = np.arange(n) if t is None else np.asarray(t)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        fD_t = np.nanmean(fDw, axis=0) if B else np.full(n, np.nan)
+    fit = fit_relaxation(fD_t, t_on, t, b_min=b_min, alpha=alpha, window=window)
+    rng = np.random.default_rng(int(seed))
+    taus = np.full(int(n_boot), np.nan)
+    bs = np.full(int(n_boot), np.nan)
+    for i in range(int(n_boot) if B >= 2 else 0):          # one sample: every resample is the series itself
+        idx = rng.integers(0, B, size=B)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            fb = np.nanmean(fDw[idx], axis=0)
+        fb_fit = fit_relaxation(fb, t_on, t, b_min=b_min, alpha=alpha, window=window)
+        taus[i], bs[i] = fb_fit["tau"], fb_fit["b"]
+    finite = taus[np.isfinite(taus)]
+    tau_ci = (float(np.percentile(finite, 2.5)), float(np.percentile(finite, 97.5))) if finite.size >= 2 \
+        else (np.nan, np.nan)
+    b_fin = bs[np.isfinite(bs)]
+    b_ci = (float(np.percentile(b_fin, 2.5)), float(np.percentile(b_fin, 97.5))) if b_fin.size >= 2 \
+        else (np.nan, np.nan)
+    b_excl = bool(np.isfinite(b_ci).all() and (b_ci[0] > 0 or b_ci[1] < 0))
+    boot_informative = bool(B >= 2 and b_fin.size >= 2)
+    reasons = [fit["reason"]] if fit["reason"] else []
+    if boot_informative and not b_excl:
+        reasons.append(f"bootstrap CI of b over samples includes 0 [{b_ci[0]:.3g}, {b_ci[1]:.3g}]")
+    identifiable = not reasons
+    fit = dict(fit, identifiable=identifiable, tau=(fit["tau_raw"] if identifiable else np.nan),
+               reason="; ".join(reasons), criterion=("series+bootstrap" if boot_informative else "series"))
+    return dict(fD_t=fD_t, fit=fit, tau=fit["tau"], tau_ci=tau_ci, tau_boot=taus, n_tau_boot=int(finite.size),
+                b_boot=bs, b_ci=b_ci, b_ci_excludes_zero=b_excl, criterion=fit["criterion"])
 
 
 def relaxation(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, direction, eps: float,
@@ -658,9 +715,9 @@ def relaxation(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, directi
     entropy.  ``tau`` is the time constant of an exponential fit of ``fD_t[t_on:]`` to
     ``a + b (1 - exp(-(t - t_on)/tau))`` by :func:`fit_relaxation` (with the label
     ``window`` as autocorrelation length).  It is NaN unless the response is
-    *identifiable*, which requires all of
+    *identifiable* (:func:`fit_relaxation_samples`), which requires all of
 
-    * ``|b| >= b_min`` and the window-calibrated series F-test ``f_pvalue <= alpha``
+    * ``|b_window| >= b_min`` and the window-calibrated series F-test ``f_pvalue <= alpha``
       (:func:`fit_relaxation`), and
     * the between-sample bootstrap: ``b_ci``, the (2.5, 97.5) percentile interval of the
       raw amplitude over ``n_boot`` resamples of the ``n_samples`` independent
@@ -689,41 +746,12 @@ def relaxation(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, directi
     traj = language_trajectory(mb.tokenizer, res["tokens"], window=window)
     fDw = traj["fD_window"]                            # [B, n_new]
     ent = res["entropies"].numpy()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        fD_t = np.nanmean(fDw, axis=0)
     entropy_t = ent.mean(axis=0)
     t = np.arange(n_new)
-    fit = fit_relaxation(fD_t, t_on, t, b_min=b_min, alpha=alpha, window=window)
-    rng = np.random.default_rng(int(seed))
-    B = fDw.shape[0]
-    taus = np.full(int(n_boot), np.nan)
-    bs = np.full(int(n_boot), np.nan)
-    for i in range(int(n_boot)):
-        idx = rng.integers(0, B, size=B)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=RuntimeWarning)
-            fb = np.nanmean(fDw[idx], axis=0)
-        fb_fit = fit_relaxation(fb, t_on, t, b_min=b_min, alpha=alpha, window=window)
-        taus[i], bs[i] = fb_fit["tau"], fb_fit["b"]
-    finite = taus[np.isfinite(taus)]
-    tau_ci = (float(np.percentile(finite, 2.5)), float(np.percentile(finite, 97.5))) if finite.size >= 2 \
-        else (np.nan, np.nan)
-    b_fin = bs[np.isfinite(bs)]
-    b_ci = (float(np.percentile(b_fin, 2.5)), float(np.percentile(b_fin, 97.5))) if b_fin.size >= 2 \
-        else (np.nan, np.nan)
-    b_excl = bool(np.isfinite(b_ci).all() and (b_ci[0] > 0 or b_ci[1] < 0))
-    boot_informative = bool(B >= 2 and b_fin.size >= 2)
-    # combined gate: series test AND between-sample bootstrap (when informative)
-    reasons = [fit["reason"]] if fit["reason"] else []
-    if boot_informative and not b_excl:
-        reasons.append(f"bootstrap CI of b over samples includes 0 [{b_ci[0]:.3g}, {b_ci[1]:.3g}]")
-    identifiable = not reasons
-    fit = dict(fit, identifiable=identifiable, tau=(fit["tau_raw"] if identifiable else np.nan),
-               reason="; ".join(reasons), criterion=("series+bootstrap" if boot_informative else "series"))
-    return dict(fD_t=fD_t, entropy_t=entropy_t, tau=fit["tau"], tau_ci=tau_ci, tau_boot=taus,
-                n_tau_boot=int(finite.size), b_boot=bs, b_ci=b_ci, b_ci_excludes_zero=b_excl,
-                criterion=fit["criterion"], fit=fit,
+    g = fit_relaxation_samples(fDw, t_on, t, window=window, n_boot=n_boot, seed=seed, b_min=b_min, alpha=alpha)
+    return dict(fD_t=g["fD_t"], entropy_t=entropy_t, tau=g["tau"], tau_ci=g["tau_ci"], tau_boot=g["tau_boot"],
+                n_tau_boot=g["n_tau_boot"], b_boot=g["b_boot"], b_ci=g["b_ci"],
+                b_ci_excludes_zero=g["b_ci_excludes_zero"], criterion=g["criterion"], fit=g["fit"],
                 t=t, t_on=t_on, eps=float(eps), tokens=res["tokens"].numpy(), labels=traj["labels"],
                 fD_window=fDw, entropies=ent, eps_t=res["eps"].numpy(), site=site.key,
                 n_samples=int(n_samples), seed=int(seed))

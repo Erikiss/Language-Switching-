@@ -188,7 +188,7 @@ def test_relaxation_small(mb, sample_ids):
     site = HookSite(mb.n_layers // 2, "block_input")
     n_new, t_on, n_samples = 10, 3, 2
     r = G.relaxation(mb, sample_ids, site, _direction(mb), eps=0.5, t_on=t_on, n_new=n_new,
-                     n_samples=n_samples, seed=0)
+                     n_samples=n_samples, seed=0, n_boot=20)
     assert r["fD_t"].shape == (n_new,) and r["entropy_t"].shape == (n_new,)
     assert np.isfinite(r["entropy_t"]).all() and (r["entropy_t"] > 0).all()
     assert np.isfinite(r["tau"]) or np.isnan(r["tau"])
@@ -197,8 +197,18 @@ def test_relaxation_small(mb, sample_ids):
     assert set(r["fit"]) == set(G._FIT_KEYS)
     assert (np.isnan(r["tau"]) and np.isnan(r["fit"]["tau"])) or r["tau"] == r["fit"]["tau"]
     assert np.isnan(r["tau"]) or r["fit"]["identifiable"]
+    # the combined gate: series test AND between-sample bootstrap (two samples -> informative)
+    assert r["criterion"] == r["fit"]["criterion"] == "series+bootstrap"
+    assert r["n_tau_boot"] == int(np.isfinite(r["tau_boot"]).sum())
+    assert r["fit"]["identifiable"] == (r["fit"]["reason"] == "")
+    if not r["b_ci_excludes_zero"]:
+        assert "bootstrap" in r["fit"]["reason"] and np.isnan(r["tau"])
     assert np.allclose(r["eps_t"], [0.0] * t_on + [0.5] * (n_new - t_on))
     assert r["tokens"].shape == (n_samples, n_new) and r["labels"].shape == (n_samples, n_new)
+    # the gate is a pure function of the per-sample fractions (reproducible without a model)
+    g = G.fit_relaxation_samples(r["fD_window"], t_on, r["t"], window=G.WINDOW, n_boot=20, seed=0)
+    assert np.allclose(g["fD_t"], r["fD_t"], equal_nan=True) and g["criterion"] == r["criterion"]
+    assert np.allclose(g["b_boot"], r["b_boot"], equal_nan=True) and g["fit"]["reason"] == r["fit"]["reason"]
 
 
 def test_fit_relaxation_recovers_tau():
@@ -208,16 +218,37 @@ def test_fit_relaxation_recovers_tau():
     fit = G.fit_relaxation(y, t_on, t)
     assert fit["tau"] == pytest.approx(tau_true, rel=1e-3)
     assert fit["a"] == pytest.approx(0.1, abs=1e-4) and fit["b"] == pytest.approx(0.6, abs=1e-4)
+    assert fit["b_window"] == pytest.approx(0.6 * (1 - np.exp(-47 / tau_true)), abs=1e-4)
     assert fit["identifiable"] and not fit["tau_censored"] and fit["reason"] == ""
     assert fit["r2"] == pytest.approx(1.0, abs=1e-6) and fit["f_pvalue"] < 1e-6 and fit["n"] == 48
     assert fit["tau_raw"] == fit["tau"] and np.isfinite(fit["b_se"]) and fit["b_se"] < 1e-3
     assert set(fit) == set(G._FIT_KEYS)
+    # window=1: plain iid F-test, no variance inflation, no Monte-Carlo null
+    assert fit["f_pvalue"] == fit["f_pvalue_iid"] and fit["vif"] == pytest.approx(1.0) and fit["n_null"] == 0
+    assert fit["n_eff"] == pytest.approx(48.0) and fit["criterion"] == "series"
     const = G.fit_relaxation(np.full(20, 0.3), 5)
     assert np.isnan(const["tau"]) and const["reason"] == "constant series" and not const["identifiable"]
     few = G.fit_relaxation(np.array([0.1, 0.2, np.nan]), 0)
     assert np.isnan(few["tau"]) and "four" in few["reason"]
-    # the same clean response read through the label window: n_eff = n / window still identifies it
-    assert G.fit_relaxation(y, t_on, t, window=8)["identifiable"]
+    # the same clean response read through the label window is identified; the F statistic
+    # keeps its plain degrees of freedom and its p-value is calibrated against the MA(window)
+    # Monte-Carlo null (resolution 1 / (N_NULL_F + 1)); the response directions carry a
+    # variance inflation of up to `window` -> n_eff = n / vif is reported, not used as df
+    f8 = G.fit_relaxation(y, t_on, t, window=8)
+    assert f8["identifiable"] and f8["f_stat"] == fit["f_stat"] and f8["f_pvalue_iid"] == fit["f_pvalue_iid"]
+    assert f8["f_pvalue"] == pytest.approx(1.0 / (G.N_NULL_F + 1)) and f8["n_null"] == G.N_NULL_F
+    assert 1.0 < f8["vif"] <= 8.0 and f8["n_eff"] == pytest.approx(48.0 / f8["vif"])
+    assert f8["b_se_hac"] >= f8["b_se"] > 0
+    # the MA(window) correlation and the cached null are deterministic
+    R = G.ma_correlation(np.arange(5), 3)
+    assert np.allclose(R, [[1, 2 / 3, 1 / 3, 0, 0], [2 / 3, 1, 2 / 3, 1 / 3, 0], [1 / 3, 2 / 3, 1, 2 / 3, 1 / 3],
+                           [0, 1 / 3, 2 / 3, 1, 2 / 3], [0, 0, 1 / 3, 2 / 3, 1]])
+    assert np.array_equal(G.ma_correlation(np.arange(4), 1), np.eye(4))
+    tt = np.arange(t_on, 64, dtype=float)
+    null = G.f_null_distribution(tt, t_on, 8)
+    assert null.shape == (G.N_NULL_F,) and np.all(np.diff(null) >= 0) and np.isfinite(null).all()
+    assert G.f_null_distribution(tt, t_on, 8) is null                       # cached
+    assert np.array_equal(G.f_null_distribution(tt + 5, t_on + 5, 8), null)  # depends on the relative grid only
 
 
 def _window_mean_noise(rng, p, n_samples=8, window=8, n=64):
@@ -230,8 +261,8 @@ def _window_mean_noise(rng, p, n_samples=8, window=8, n=64):
 
 def test_fit_relaxation_rejects_non_responses():
     """Finding: a 3-parameter fit of any noisy flat series returned a finite, often
-    bound-saturated tau.  Now tau is NaN unless |b| >= B_MIN and the fit beats the constant
-    model (F-test with the autocorrelation-corrected sample size); the raw value is kept."""
+    bound-saturated tau.  Now tau is NaN unless |b_window| >= B_MIN and the fit beats the
+    constant model (F-test calibrated for the window autocorrelation); the raw value is kept."""
     rng = np.random.default_rng(0)
     t = np.arange(64)
     t_on = 16
@@ -241,16 +272,23 @@ def test_fit_relaxation_rejects_non_responses():
     assert np.mean([np.isfinite(f["tau"]) for f in fits]) <= 0.06              # ~alpha false positives
     assert all(f["reason"] for f in fits if np.isnan(f["tau"]))
     # window-smoothed label noise (what relaxation() produces at eps=0): the iid test is
-    # anti-conservative, the window-corrected one keeps the false positives near zero
+    # anti-conservative, the window-calibrated one rejects at (about) the nominal alpha
+    # (200 seeded series: 0.05 +/- 2 binomial sd = 0.08)
     series = [_window_mean_noise(rng, 0.3) for _ in range(200)]
     rate_iid = np.mean([np.isfinite(G.fit_relaxation(s, t_on, t, window=1)["tau"]) for s in series])
     rate_win = np.mean([np.isfinite(G.fit_relaxation(s, t_on, t, window=8)["tau"]) for s in series])
-    assert rate_win <= 0.05 < rate_iid
+    assert rate_win <= 0.08 and rate_iid > 0.3, (rate_win, rate_iid)
     # a single bump of 0.01 on a flat series is not a response
     bump = np.full(64, 0.3)
     bump[20] = 0.31
     fb = G.fit_relaxation(bump, t_on, t)
     assert np.isnan(fb["tau"]) and np.isfinite(fb["tau_raw"]) and "b_min" in fb["reason"]
+    # a near-linear fit (tau close to the upper bound) with a large asymptotic b but a rise of
+    # 0.02 inside the window is gated on the realised amplitude b_window, not on b
+    ramp_small = np.where(t >= t_on, 0.3 + 0.0004 * (t - t_on), 0.3)
+    fr0 = G.fit_relaxation(ramp_small, t_on, t)
+    assert fr0["tau_raw"] > 500 and abs(fr0["b"]) > G.B_MIN > abs(fr0["b_window"]) and "b_window" in fr0["reason"]
+    assert np.isnan(fr0["tau"]) and fr0["f_pvalue"] < 1e-6         # the shape is real, the amplitude is not
     # a real response of the same noise level is still found (seeded)
     sig = np.where(t >= t_on, 0.1 + 0.5 * (1 - np.exp(-(t - t_on) / 6.0)), 0.1) + rng.normal(0, 0.05, 64)
     fs = G.fit_relaxation(sig, t_on, t)
@@ -263,6 +301,63 @@ def test_fit_relaxation_rejects_non_responses():
     fstep = G.fit_relaxation(step, t_on, t)
     assert fstep["tau_censored"] and fstep["tau_raw"] == pytest.approx(G.TAU_BOUNDS[0], rel=1e-3)
     assert not G.fit_relaxation(np.where(t >= t_on, 0.1 + 0.6 * (1 - np.exp(-(t - t_on) / 6.0)), 0.1), t_on, t)["tau_censored"]
+
+
+def test_fit_relaxation_power_at_production_window():
+    """Finding (fix round 2): the gate shrank the residual df by the label window
+    (n=48, window=8 -> 3 df), so real, strong responses were rejected (b=0.3, sd=0.05:
+    0 of 200 identified).  The F statistic now keeps its df and only its null is
+    window-calibrated: such responses must be identified at the production settings
+    (n_new=64, t_on=16, window=8)."""
+    rng = np.random.default_rng(1)
+    t = np.arange(64)
+    t_on = 16
+    n_ok = 0
+    for _ in range(50):
+        y = np.where(t >= t_on, 0.1 + 0.3 * (1 - np.exp(-(t - t_on) / 8.0)), 0.1) + rng.normal(0, 0.05, 64)
+        f = G.fit_relaxation(y, t_on, t, window=8)
+        n_ok += bool(f["identifiable"])
+    assert n_ok >= 45, n_ok
+    # one explicit case: identifiable, tau recovered, not censored
+    y = np.where(t >= t_on, 0.1 + 0.3 * (1 - np.exp(-(t - t_on) / 8.0)), 0.1) + rng.normal(0, 0.05, 64)
+    f = G.fit_relaxation(y, t_on, t, window=8)
+    assert f["identifiable"] and 3.0 < f["tau"] < 20.0 and not f["tau_censored"] and f["reason"] == ""
+    assert f["f_pvalue"] <= G.FIT_ALPHA and f["f_pvalue_iid"] <= f["f_pvalue"]
+
+
+def _label_fractions(rng, p_t, n_samples=8, window=8):
+    """Per-sample trailing-window fractions of Bernoulli(p_t) labels (relaxation() structure)."""
+    n = p_t.shape[0]
+    lab = rng.random((n_samples, n)) < p_t[None, :]
+    return np.stack([G.window_fraction(np.where(lab[b], "D", "E"), window) for b in range(n_samples)])
+
+
+def test_fit_relaxation_samples_gate():
+    """The relaxation() gate on synthetic per-sample labels: a real response through the
+    label window is identified (series test AND between-sample bootstrap), a flat one is
+    not, and the bootstrap is skipped for a single sample."""
+    rng = np.random.default_rng(2)
+    t = np.arange(64)
+    t_on = 16
+    p_resp = np.where(t >= t_on, 0.1 + 0.5 * (1 - np.exp(-(t - t_on) / 8.0)), 0.1)
+    g = G.fit_relaxation_samples(_label_fractions(rng, p_resp), t_on, t, window=8, n_boot=100, seed=0)
+    assert g["criterion"] == "series+bootstrap" and g["fit"]["identifiable"] and np.isfinite(g["tau"])
+    assert g["b_ci_excludes_zero"] and g["b_ci"][0] > 0 and 2.0 < g["tau"] < 30.0
+    assert g["n_tau_boot"] >= 50 and np.isfinite(g["tau_ci"]).all() and g["tau_ci"][0] <= g["tau"] <= g["tau_ci"][1]
+    assert g["tau_boot"].shape == (100,) and g["b_boot"].shape == (100,)
+    # flat labels: mostly not identifiable (nominal 5 % for the series test alone, fewer combined)
+    n_fp = 0
+    for i in range(40):
+        g0 = G.fit_relaxation_samples(_label_fractions(rng, np.full(64, 0.3)), t_on, t, window=8, n_boot=50, seed=i)
+        n_fp += np.isfinite(g0["tau"])
+        assert np.isfinite(g0["tau"]) == g0["fit"]["identifiable"]
+        assert g0["fit"]["identifiable"] or g0["fit"]["reason"]
+    assert n_fp <= 4, n_fp
+    # a single sample: the bootstrap is degenerate and skipped, the series test decides
+    g1 = G.fit_relaxation_samples(_label_fractions(rng, p_resp, n_samples=1), t_on, t, window=8, n_boot=20, seed=0)
+    assert g1["criterion"] == "series" and g1["fit"]["criterion"] == "series"
+    assert g1["fit"]["identifiable"] == (g1["fit"]["reason"] == "") and not g1["b_ci_excludes_zero"]
+    assert np.isnan(g1["b_ci"]).all()
 
 
 # --------------------------------------------------------------------------------------
