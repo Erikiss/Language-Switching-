@@ -116,10 +116,14 @@ def test_smoke_stage_contents(smoke_run):
     assert len(k8) and np.allclose(k8["T"], k8["T"].iloc[0])
     assert np.allclose(k8["I"], k8["B_mixed"] - k8["B_mono"])
     att = pd.read_csv(_stage_dir(out, "C") / "attribution.csv")
-    assert {"K0_vs_K8C1", "K0_vs_K28seg"} <= set(att["pair"]) and set(att["layer"]) == {0, 2, 3, 5}
+    # pre-registered grid = last block of each quarter of the depth ({2,5,8,11} for 160m,
+    # {1,2,4,5} for the 6 blocks of pythia-14m); block 0 (token embedding) is never patched
+    assert {"K0_vs_K8C1", "K0_vs_K28seg"} <= set(att["pair"]) and set(att["layer"]) == {1, 2, 4, 5}
     assert set(att["class"]) == set(C.PATCH_CLASSES)
+    cman = json.loads((_stage_dir(out, "C") / "manifest.json").read_text(encoding="utf-8"))
+    assert cman["layer_grid"] == [1, 2, 4, 5]
     gxa = pd.read_csv(_stage_dir(out, "C") / "grad_x_act_by_class.csv")
-    assert gxa["abs_share"].between(0, 1 + 1e-9).all()
+    assert gxa["abs_share"].between(0, 1 + 1e-9).all() and set(gxa["layer"]) == {1, 2, 4, 5}
     # D: damage spreading and generation diagnostics
     dmg = pd.read_csv(_stage_dir(out, "D") / "damage.csv")
     assert set(dmg["inject"]) == {"dossier", "depth"} and set(dmg["dir_family"]) == {"ent", "lang_dom", "rand"}
@@ -151,13 +155,43 @@ def test_smoke_stage_contents(smoke_run):
     tn = pd.read_csv(_stage_dir(out, "E") / "tn_summary.csv")
     assert sorted(set(tn["tag"])) == ["DEV01A:K0:C1", "DEV01A:K8:C1"]
     assert set(tn["direction"]) == {"ent", "lang_dom"} and set(tn["eps"]) == {0.01, 0.1}
-    assert np.isfinite(tn[["nonlinearity_last", "factorization_error_last", "linear_norm_last"]].to_numpy()).all()
+    assert np.isfinite(tn[["nonlinearity_last", "factorization_error_last", "linear_norm_last",
+                           "nonlinearity_odd_wmean", "nonlinearity_even_wmean", "factorization_error_inspan_wmean",
+                           "factorization_error_full_wmean", "truncation_error_wmean", "linear_captured_wmean",
+                           "linear_captured_frob", "noise_floor_f32_wmean", "snr_f32_last"]].to_numpy()).all()
     assert (tn["linear_norm_last"] > 0).all() and tn["source_captured"].between(0, 1 + 1e-6).all()
+    # the measurement runs in float64 with a float64 softmax; the float32 floor is recorded
+    assert (tn["measured_dtype"] == "float64").all() and tn["softmax_float64"].all()
+    assert (tn["noise_floor_f32_wmean"] > 0).all() and (tn["n_below_floor_f32"] >= 0).all()
+    # response-fitted basis: the source lies in the span and the output response is largely captured
+    assert (tn["source_captured"] > 0.9).all()
+    assert tn["linear_captured_wmean"].between(0.5, 1 + 1e-6).all() and tn["linear_captured_frob"].between(0.5, 1 + 1e-6).all()
+    # the factorisation error is no longer the truncation floor (~1.0 with the state PCA)
+    assert (tn["factorization_error_wmean"] < 0.95).all() and (tn["full_rank_reference"] == "computed").all()
+    assert tn["factorization_error_inspan_wmean"].between(0, 1.5).all()
+    # D8: linear regime at eps = 0.01: nonlinearity ~ eps, second order ~ eps, odd part ~ 0
+    small = tn[tn["eps"] == 0.01]
+    assert (small["nonlinearity_odd_wmean"] < 0.01).all() and (small["nonlinearity_wmean"] < 0.05).all()
+    for (tag, dr), g in tn.groupby(["tag", "direction"]):
+        g = g.set_index("eps")
+        for col in ("nonlinearity_wmean", "nonlinearity_even_wmean", "nonlinearity_last"):
+            ratio = g.loc[0.1, col] / g.loc[0.01, col]
+            assert 5.0 < ratio < 20.0, (tag, dr, col, ratio)
+    cmp_ = pd.read_csv(_stage_dir(out, "E") / "tn_compare.csv")
+    assert {"nonlinearity_odd", "nonlinearity_even", "linear_captured", "factorization_error_inspan",
+            "factorization_error_full", "truncation_error", "noise_floor_f32", "snr_f32", "above_floor_f32",
+            "measured_norm_minus"} <= set(cmp_.columns)
+    assert cmp_["above_floor_f32"].dtype == bool and (cmp_["snr_f32"] > 0).all()
     paths = pd.read_csv(_stage_dir(out, "E") / "tn_paths.csv")
     assert {"tnco", "opt_einsum", "reference_greedy", "reference_dp"} == set(paths["backend"])
+    assert set(paths["basis"]) == {"response_svd", "identity"} and set(paths["r"]) == {16, 128}
     assert (paths["n_tensors"] == 9).all() and np.isfinite(paths["cost_log10_opt_einsum"]).all()
     basis = pd.read_csv(_stage_dir(out, "E") / "tn_basis.csv")
     assert len(basis) == 16 and basis["explained_variance_cum"].is_monotonic_increasing
+    assert (basis["source"] == "linear_response_svd").all() and (basis["n_rows"] == 2 * 2 * 5 * 16).all()
+    assert basis["explained_variance_cum"].iloc[-1] > 0.8 and basis["explained_variance_states_cum"].is_monotonic_increasing
+    eman = json.loads((_stage_dir(out, "E") / "manifest.json").read_text(encoding="utf-8"))
+    assert eman["measured_dtype"] == "float64" and eman["softmax_float64"] and eman["full_rank_reference"] == "computed"
 
 
 def test_merge_concatenates_runs(smoke_run, tmp_path):
@@ -297,3 +331,90 @@ def test_marker_lexicon_and_sites(mb, tok):
     assert len(lex["E"]) == 6 and len(lex["D"]) == 6 and not set(lex["E"]) & set(lex["D"])
     assert C.dossier_site(mb) == HookSite(mb.n_layers - 1, "block_input")
     assert C.depth_site(mb) == HookSite(mb.n_layers // 3, "block_input")
+
+
+# --------------------------------------------------------------------------------------
+# stage C: pre-registered layer grid
+# --------------------------------------------------------------------------------------
+def test_attribution_layer_grid():
+    from lsne.config import LAYER_GRID_160M
+    from lsne.experiments.stage_c_grid import attribution_layer_grid
+
+    assert attribution_layer_grid(12) == tuple(LAYER_GRID_160M) == (2, 5, 8, 11)
+    assert attribution_layer_grid(6) == (1, 2, 4, 5)        # pythia-14m / 70m
+    assert attribution_layer_grid(16) == (3, 7, 11, 15)     # pythia-1b
+    assert attribution_layer_grid(24) == (5, 11, 17, 23)    # pythia-410m / 1.4b
+    assert attribution_layer_grid(4) == (0, 1, 2, 3) and attribution_layer_grid(0) == ()
+    for n in range(5, 40):
+        g = attribution_layer_grid(n)
+        assert len(g) == 4 and 0 not in g and g[-1] == n - 1 and list(g) == sorted(set(g))
+
+
+# --------------------------------------------------------------------------------------
+# stage E: response basis, float64 measurement
+# --------------------------------------------------------------------------------------
+def test_response_basis_recovers_subspace():
+    from lsne.experiments.stage_e_tn import response_basis
+
+    g = torch.Generator().manual_seed(0)
+    d, k, N = 16, 3, 50
+    B = torch.randn(k, d, generator=g, dtype=torch.float64)
+    rows = (torch.randn(N, k, generator=g, dtype=torch.float64) @ B).numpy()
+    P, ev = response_basis(rows, 8)
+    assert P.shape == (d, 8) and P.dtype == torch.float32 and ev.shape == (8,)
+    assert np.allclose((P.T @ P).numpy(), np.eye(8), atol=1e-5)          # orthonormal incl. completion
+    assert ev[k - 1] == pytest.approx(1.0, abs=1e-9) and np.all(np.diff(ev) >= -1e-12)
+    proj = (rows @ P[:, :k].numpy().astype(np.float64)) @ P[:, :k].numpy().astype(np.float64).T
+    assert np.allclose(proj, rows, atol=1e-5)                               # rows lie in the span
+    # uncentred: the mean response stays in the span (a centred PCA would drop it)
+    mean = rows.mean(0, keepdims=True)
+    assert np.allclose((mean @ P[:, :k].numpy()) @ P[:, :k].numpy().T, mean, atol=1e-5)
+    # deterministic, and N < r completes the basis
+    P2, _ = response_basis(rows, 8)
+    assert torch.equal(P, P2)
+    P3, ev3 = response_basis(rows[:2], 5)
+    assert P3.shape == (d, 5) and np.allclose((P3.T @ P3).numpy(), np.eye(5), atol=1e-5) and ev3[-1] == pytest.approx(1.0)
+
+
+def test_float64_bundle_and_attention_floor(mb, sample_ids):
+    """The float64 copy reproduces the model; GPT-NeoX's float32 softmax leaves a round-off
+    floor in the even part of a +/- perturbation that the float64-softmax patch removes."""
+    from lsne.model import make_dose_delta, run_with_cache
+    from lsne.experiments.stage_e_tn import float64_attention, float64_bundle, measured_response
+    from transformers.models.gpt_neox import modeling_gpt_neox as mg
+
+    L = mb.n_layers
+    site_from, out_site = HookSite(L // 3, "block_input"), HookSite(L - 1, "block_output")
+    ids = sample_ids
+    T = int(ids.shape[1])
+    window, position = slice(T - 6, T), T - 4
+    mb64 = float64_bundle(mb)
+    assert mb64 is not None and mb64.dtype == torch.float64 and mb64.spec.dtype == "float64" and mb.dtype == torch.float32
+    c32 = run_with_cache(mb, ids, [site_from, out_site])
+    c64 = run_with_cache(mb64, ids, [out_site])
+    assert c64.resid[out_site.key].dtype == torch.float64
+    assert float((c32.logits - c64.logits).abs().max()) < 5e-2
+    h_ref = c32.resid[site_from.key][0, position]
+    g = torch.Generator().manual_seed(0)
+    u = torch.randn(mb.d_model, generator=g)
+    delta = make_dose_delta(h_ref, u / u.norm(), 1e-4)
+    orig = mg.eager_attention_forward
+
+    def even_part(bundle, ref):
+        mp = measured_response(bundle, ref, ids, site_from, position, delta, out_site, window)
+        mm = measured_response(bundle, ref, ids, site_from, position, -delta, out_site, window)
+        assert mp.shape == (6, mb.d_model) and mp.dtype == np.float64
+        return float(np.linalg.norm(mp + mm) / 2.0)
+
+    ref64 = c64.resid[out_site.key][0]
+    floor_unpatched = even_part(mb64, ref64)
+    with float64_attention() as ok:
+        assert ok and mg.eager_attention_forward is not orig
+        c64p = run_with_cache(mb64, ids, [out_site])
+        even_patched = even_part(mb64, c64p.resid[out_site.key][0])
+        # float32 models are bitwise unaffected by the patch
+        c32p = run_with_cache(mb, ids, [out_site])
+        assert torch.equal(c32p.resid[out_site.key], c32.resid[out_site.key])
+    assert mg.eager_attention_forward is orig
+    # true second order at eps = 1e-4 is ~1e-8; the float32 softmax floor is ~1e-4
+    assert even_patched < 1e-6 and floor_unpatched > 1e-5 and floor_unpatched > 100 * even_patched

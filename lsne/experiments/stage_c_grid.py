@@ -16,22 +16,24 @@ contrasts            per formulation and mixed variant: T = logp_0(mixed) - logp
 contrasts_boot       family cluster bootstrap of T per (K, C) and of I per
                      (K, C, dir_family, sign, eps)
 attribution          counterfactual position patching K=0 -> K=8/C1 and K=0 -> K=28/seg
-                     (original family: K=0 -> largest K) on the block inputs of
-                     ``config.layer_grid(n_layers)``, per token class with a random-position
-                     null (:func:`lsne.patching.counterfactual_attribution`)
+                     (original family: K=0 -> largest K) on the block inputs of the
+                     pre-registered layer grid :func:`attribution_layer_grid` ({2, 5, 8, 11}
+                     for pythia-160m, DESIGN section 4.1), per token class with a
+                     random-position null (:func:`lsne.patching.counterfactual_attribution`)
 attribution_summary  mean recovery per (pair, site, class) over formulations
 grad_x_act           gradient x activation of log p(target) per variant, site and position
 grad_x_act_by_class  share of |grad x act| per token class
 """
 from __future__ import annotations
 
+import math
 import time
 
 import numpy as np
 import pandas as pd
 import torch
 
-from ..config import RunConfig, layer_grid, HookSite
+from ..config import LAYER_GRID_160M, RunConfig, HookSite
 from ..model import Injector, ModelBundle, forward_logits, make_dose_delta, next_token_stats, run_with_cache
 from ..patching import counterfactual_attribution, grad_x_act
 from ..stats import cluster_bootstrap
@@ -142,6 +144,26 @@ def bootstrap_contrasts(contrasts: pd.DataFrame, n_boot: int, seed: int) -> pd.D
 # --------------------------------------------------------------------------------------
 # counterfactual attribution and gradient x activation
 # --------------------------------------------------------------------------------------
+def attribution_layer_grid(n_layers: int) -> tuple[int, ...]:
+    """Pre-registered layer grid of the patching / grad x act analyses (DESIGN section 4.1).
+
+    The last block of each quarter of the depth, ``ceil((i + 1) * n_layers / 4) - 1`` for
+    ``i = 0..3``: ``(2, 5, 8, 11)`` for the 12 blocks of pythia-160m
+    (= :data:`lsne.config.LAYER_GRID_160M`), ``(1, 2, 4, 5)`` for pythia-14m / 70m,
+    ``(5, 11, 17, 23)`` for 24 blocks.  Block 0 is never part of the grid for
+    ``n_layers >= 5``: its input is the token embedding, which is identical in both
+    variants of a pair on the shared tail, so a patch there recovers nothing by
+    construction.  (``lsne.config.layer_grid`` rounds ``i * (L - 1) / 3`` instead and
+    yields ``(0, 4, 7, 11)`` for 12 blocks, which is not the pre-registered grid.)"""
+    n_layers = int(n_layers)
+    if n_layers <= 0:
+        return ()
+    grid = tuple(sorted({max(0, math.ceil((i + 1) * n_layers / 4) - 1) for i in range(4)}))
+    if n_layers == 12:
+        assert grid == tuple(LAYER_GRID_160M), (grid, LAYER_GRID_160M)
+    return grid
+
+
 def attribution_pairs(variants) -> list[tuple[str, object, object]]:
     """``(pair_name, v_mono, v_mixed)`` per formulation: K=0 vs K=8/C1 and K=0 vs K=28/seg
     (original family: K=0 vs the largest K)."""
@@ -256,7 +278,8 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     contrasts = contrast_rows(summary)
     boot = bootstrap_contrasts(contrasts, n_boot=limits.n_boot, seed=cfg.seed)
 
-    sites = [HookSite(int(l), "block_input") for l in layer_grid(mb.n_layers)]
+    grid = attribution_layer_grid(mb.n_layers)
+    sites = [HookSite(int(l), "block_input") for l in grid]
     att = attribution_table(mb, allv, sites, n_random=limits.n_random_patch, seed=cfg.seed, enabled=limits.progress)
     gxa_variants = C.core_subset(allv) if limits.limited else allv
     gxa, gxa_cls = grad_x_act_tables(mb, gxa_variants, sites, enabled=limits.progress)
@@ -268,5 +291,5 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     }
     return C.finish_stage(run_dir, "C", cfg, mb, tables, limits=limits, t0=t0, site=site, directions=dir_names,
                           bank_source=bank.meta.get("source", ""),
-                          doses=list(cfg.doses), layer_grid=[int(l) for l in layer_grid(mb.n_layers)],
+                          doses=list(cfg.doses), layer_grid=[int(l) for l in grid],
                           n_variants=len(variants), n_pairs=len(attribution_pairs(allv)))
