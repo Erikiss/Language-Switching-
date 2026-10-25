@@ -38,7 +38,7 @@
   ],
   "tail_E": "The owner refuses to accept the ruling and lodges an",
   "target": " appeal",
-  "target_note": "Same target as formulation A: 'appeal' is the natural continuation of 'the owner refuses to accept the ruling and lodges an' after a hearing that ends in a ruling for the tenant; the word and its German equivalents (Berufung / Einspruch / Revision) occur nowhere in the units or the tail. ' appeal' is a single Pythia token (id 4549).",
+  "target_note": "Same target as formulation A: 'appeal' is the natural continuation of 'the owner refuses to accept the ruling and lodges an' after a hearing that ends in a ruling for the tenant; the word and its German equivalents (Berufung / Einspruch / Revision) occur nowhere in the units or the tail. ' appeal' is a single Pythia token (id 4549); Pythia-160m ranks it first after the all-English context (p ~ 0.57, next candidates 'injunction' / 'order' ~ 0.05).",
   "author": "LS-NEQ stimulus authoring (F17B, tenant versus landlord, Henrik, paraphrase)",
   "notes": "Formulation B, domain law: independent re-phrasing of the ten meaning units of F17A in both languages (same events, same order, same name Henrik). The contract is 'the agreement' / 'die Vereinbarung', the landlord 'the owner' / 'der Eigentümer', the lawyer 'an attorney' / 'ein Rechtsanwalt', the hearing 'die Verhandlung'; unit 8 uses the reflexive 'sich berufen auf' (non-separable), unit 4 'in writing' / 'schriftlich' as a one-word manner adjunct. No separable verbs ('zurückweisen', 'vorlegen', 'ansetzen' avoided). Subjects vary between the protagonist, other people (owner, attorney, judge), the court and the agreement itself. Unit 9 reads naturally in German, units 1 and 10 in English."
 }

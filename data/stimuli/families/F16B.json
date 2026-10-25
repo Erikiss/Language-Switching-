@@ -36,9 +36,9 @@
      "E": {"subj": "The celebration", "pred": "closes with music", "adj": "after midnight"},
      "D": {"subj": "Die Feier", "pred": "schließt mit Musik", "adj": "nach Mitternacht"}}
   ],
-  "tail_E": "Before dinner, Yusuf and the priest speak a short",
+  "tail_E": "Before dinner, Yusuf and the priest say a brief",
   "target": " prayer",
-  "target_note": "Same target as formulation A: 'prayer' is the natural continuation of 'Yusuf and the priest speak a short' at a joint festival of a mosque and a parish; the word and its German equivalents (Gebet / beten) occur nowhere in the units or the tail, and no form of 'pray' is used. ' prayer' is a single Pythia token (id 15851).",
+  "target_note": "Same target as formulation A: 'prayer' is the natural continuation of 'Yusuf and the priest say a brief' at a joint festival of a mosque and a parish; the word and its German equivalents (Gebet / beten) occur nowhere in the units or the tail, and no form of 'pray' is used. ' prayer' is a single Pythia token (id 15851); Pythia-160m ranks it first after the all-English context (p ~ 0.71, next candidate 'sermon' ~ 0.04).",
   "author": "LS-NEQ stimulus authoring (F16B, parish and mosque, Yusuf, paraphrase)",
   "notes": "Formulation B, domain religion: independent re-phrasing of the ten meaning units of F16A in both languages (same events, same order, same name Yusuf). The priest is 'the parish priest' / 'der Gemeindepfarrer', the parish 'the church community' / 'die Kirchengemeinde', the songs 'hymns' / 'Choräle', the speech 'a brief address' / 'eine kurze Ansprache'; unit 9 uses the reflexive 'sich bedanken bei' (non-separable). Unit 6 uses non-separable 'bereiten' (not 'zubereiten'). No separable verbs. Subjects vary between the protagonist, other people, institutions and the celebration itself. Unit 9 reads naturally in German, units 1 and 10 in English."
 }

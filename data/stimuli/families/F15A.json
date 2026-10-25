@@ -36,9 +36,9 @@
      "E": {"subj": "The couple", "pred": "celebrates the wedding", "adj": "on a warm Saturday"},
      "D": {"subj": "Das Paar", "pred": "feiert die Hochzeit", "adj": "an einem warmen Samstag"}}
   ],
-  "tail_E": "For the ceremony, Leyla wears a long white",
+  "tail_E": "For the ceremony, Leyla wears a simple white wedding",
   "target": " dress",
-  "target_note": "'dress' is the natural continuation of 'Leyla wears a long white' in a wedding context; the word occurs nowhere in the units or the tail (no 'dress', 'dressed', 'address'), and neither does its German equivalent (Kleid / Brautkleid). ' dress' is a single Pythia token (id 7619).",
+  "target_note": "'dress' is the natural continuation of 'Leyla wears a simple white wedding'; the word occurs nowhere in the units or the tail (no 'dress', 'dressed', 'address'), and neither does its German equivalent (Kleid / Brautkleid). 'wedding' itself occurs in the units, which is allowed (only the target must be absent). ' dress' is a single Pythia token (id 7619); Pythia-160m ranks it first after the all-English context (p ~ 0.60, next candidate 'gown' ~ 0.13).",
   "author": "LS-NEQ stimulus authoring (F15A, wedding and gender roles, Leyla)",
   "notes": "Formulation A, domain culture_values (ChronoCulture: values, generations, gender roles). Ten meaning units: Leyla plans her wedding / her grandmother expects a traditional ceremony / Leyla keeps her surname / her father criticises this / her fiancé Emre cooks the feast with his brothers / the aunts argue about old customs / grandfather defends the old roles / her younger sister supports Leyla / her grandmother accepts Leyla's choice / the couple celebrates on Saturday. Subjects alternate between the protagonist (Leyla), relatives of three generations (grandmother, father, fiancé, aunts, grandfather, sister) and 'the couple', singular and plural, so C3 switches cross real agreement. Unit 7 uses bare 'Grandfather' / 'Großvater' as a name-like subject (family register). No separable German verbs ('vorbereiten', 'zustimmen', 'stattfinden' avoided). Proper names: Leyla and Emre, identical in both languages (genitive 'Leylas' in unit 9). Present tense, positive polarity; unit 9 reads naturally in German, units 1 and 10 in English."
 }

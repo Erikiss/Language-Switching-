@@ -38,7 +38,7 @@
   ],
   "tail_E": "If the boss says no again, the workers will go on",
   "target": " strike",
-  "target_note": "Same target as formulation A: 'strike' is the natural continuation of 'the workers will go on' after flat pay, rising rent, a union gathering, a denied raise and a decision on a protest; the word and its German equivalents (Streik / streiken) occur nowhere in the units or the tail. ' strike' is a single Pythia token (id 9974).",
+  "target_note": "Same target as formulation A: 'strike' is the natural continuation of 'the workers will go on' after flat pay, rising rent, a union gathering, a denied raise and a decision on a protest; the word and its German equivalents (Streik / streiken) occur nowhere in the units or the tail. ' strike' is a single Pythia token (id 9974); Pythia-160m ranks it first after the all-English context (p ~ 0.86, next candidate 'the' ~ 0.03).",
   "author": "LS-NEQ stimulus authoring (F14B, wages and rents, Samir, paraphrase)",
   "notes": "Formulation B, domain economy: independent re-phrasing of the ten meaning units of F14A in both languages (same events, same order, same name Samir). The raise by a fifth is 'twenty percent more rent' demanded 'from January', the meeting a 'gathering' / 'Treffen', the factory owner 'the boss' / 'der Chef'. Unit 9 uses the reflexive 'sich entscheiden für' (non-separable); no separable verbs. Subjects vary between the protagonist, other people (landlord, workmates, boss), institutions (union, workforce, town) and abstract objects (his pay, the rent). Unit 9 reads naturally in German, units 1 and 10 in English."
 }

@@ -9353,20 +9353,25 @@
   "zoo"
  ],
  "N": [
+  "agnes",
   "anton",
   "berlin",
   "brecht",
   "clara",
   "elias",
+  "emre",
   "felix",
+  "greta",
   "hamburg",
   "hanna",
+  "henrik",
   "ida",
   "jonas",
   "josefine",
   "kafka",
   "kraft",
   "lena",
+  "leyla",
   "london",
   "mara",
   "mia",
@@ -9376,9 +9381,11 @@
   "paris",
   "paul",
   "rosa",
+  "samir",
   "schubert",
   "tomas",
-  "wien"
+  "wien",
+  "yusuf"
  ],
  "ambiguous": [
   "also",

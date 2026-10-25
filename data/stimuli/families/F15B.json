@@ -36,9 +36,9 @@
      "E": {"subj": "Bride and groom", "pred": "celebrate", "adj": "on a sunny Saturday"},
      "D": {"subj": "Braut und Bräutigam", "pred": "feiern", "adj": "an einem sonnigen Samstag"}}
   ],
-  "tail_E": "At the ceremony, Leyla wears a long white",
+  "tail_E": "At the ceremony, Leyla wears a simple white wedding",
   "target": " dress",
-  "target_note": "Same target as formulation A: 'dress' is the natural continuation of 'Leyla wears a long white' in a wedding context; the word and its German equivalents (Kleid / Brautkleid) occur nowhere in the units or the tail. ' dress' is a single Pythia token (id 7619).",
+  "target_note": "Same target as formulation A: 'dress' is the natural continuation of 'Leyla wears a simple white wedding'; the word and its German equivalents (Kleid / Brautkleid) occur nowhere in the units or the tail ('wedding' itself occurs in the units, which is allowed). ' dress' is a single Pythia token (id 7619); Pythia-160m ranks it first after the all-English context (p ~ 0.66, next candidate 'gown' ~ 0.15).",
   "author": "LS-NEQ stimulus authoring (F15B, wedding and gender roles, Leyla, paraphrase)",
   "notes": "Formulation B, domain culture_values: independent re-phrasing of the ten meaning units of F15A in both languages (same events, same order, same names Leyla and Emre). 'Surname' becomes 'family name' / 'Familienname', the father 'objects' ('widerspricht', inseparable 'wider-'), the aunts 'quarrel' ('zanken sich'), the grandfather 'justifies' the old roles 'at great length', the grandmother 'respects' Leyla's wish 'after all' / 'schließlich doch'. Unit 10 has the coordinated subject 'Bride and groom' / 'Braut und Bräutigam' (plural agreement) with a bare intransitive predicate. No separable verbs ('zubereiten', 'zustimmen', 'beistehen' avoided). Unit 9 reads naturally in German, units 1 and 10 in English."
 }

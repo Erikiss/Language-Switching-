@@ -38,7 +38,7 @@
   ],
   "tail_E": "The council therefore names Greta the",
   "target": " winner",
-  "target_note": "Same target as formulation A: 'winner' is the natural continuation of 'the council therefore names Greta the' after a tie, a second count and a three-vote lead; the word and its German equivalents (Siegerin / Gewinnerin / Sieg) occur nowhere in the units or the tail, and no form of 'win' is used. ' winner' is a single Pythia token (id 13688).",
+  "target_note": "Same target as formulation A: 'winner' is the natural continuation of 'the council therefore names Greta the' after a tie, a second count and a three-vote lead; the word and its German equivalents (Siegerin / Gewinnerin / Sieg) occur nowhere in the units or the tail, and no form of 'win' is used. ' winner' is a single Pythia token (id 13688); Pythia-160m ranks it first after the all-English context (p ~ 0.33, next candidate 'next' ~ 0.05).",
   "author": "LS-NEQ stimulus authoring (F13B, village election, Greta, paraphrase)",
   "notes": "Formulation B, domain politics: independent re-phrasing of the ten meaning units of F13A in both languages (same events, same order, same name Greta). The rival is 'her opponent' / 'ihr Konkurrent', the sealed box becomes a locked chest ('Truhe'), the recount a 'second count' / 'zweite Zählung'. Unit 1 uses the reflexive 'sich bewerben um' (non-separable), unit 9 'bestehen auf' with dative. No separable verbs. Subjects vary between the protagonist, other people (opponent, rivals, residents, teacher, council members) and an event (the first tally). Unit 9 reads naturally in German, units 1 and 10 in English."
 }
