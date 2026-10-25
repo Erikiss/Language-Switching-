@@ -885,9 +885,10 @@ def nb_03() -> list[tuple[str, str]]:
                     ax.plot([pos], [dm.inject_layer], marker="^", color="white", ms=8)
                     ax.set_xlim(max(-0.5, pos - 24.5), v.n_tokens - 0.5)      # sites before t0 are unperturbed (causality)
                     ax.set_title(f"K={K} {Cc} ({v.tag})\\nInjektion @ t={pos}, λ={lam:+.3f}", fontsize=9)
-                    ax.set_xlabel("Position t (gestrichelt: Beginn des englischen Schlussabschnitts)")
+                    ax.set_xlabel("Position t")
                 axes[0, 0].set_ylabel("Snapshot ℓ (Block-Eingänge; oberster = Ausgang)")
-                fig.suptitle(f"Störungsausbreitung D(ℓ, t): Richtung {DIR_MAP}, ε={EPS_MAP:g}, Injektion {C.depth_site(mb).key}", fontsize=10)
+                fig.suptitle(f"Störungsausbreitung D(ℓ, t): Richtung {DIR_MAP}, ε={EPS_MAP:g}, Injektion {C.depth_site(mb).key} "
+                             "(gestrichelt: Beginn des englischen Schlussabschnitts)", fontsize=10, y=1.04)
                 if im is not None:
                     fig.colorbar(im, ax=axes[0].tolist(), label="log10 D(ℓ, t)", shrink=0.9)
                 savefig("damage_maps")

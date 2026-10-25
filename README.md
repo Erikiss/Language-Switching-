@@ -48,7 +48,7 @@ RMS-Dosis als Nullmodell (`docs/PREREGISTRATION.md` §2).
 | SHA256 (2049 Tokens, uint16 LE) | `bdd4bbdd2b8138437e052b2f0e3aeb212a563c25fe447c920b0e9c6ee76f55d4` |
 | SHA256 (208 Kontext-Tokens) | `84c8f1b6a7a933f53f3b21e353c0c3af219d3ccfbcb7092584a9c6ad1035a750` (Dossier-Präfix `84c8f1b6a7a933f5`) |
 | Eingriffsstelle | Eingang Block 11 (nullbasiert), Position 207; δ = ε · RMS(h) · g/RMS(g), ε = 0,01 |
-| Checkpoints | step98000, step99000 (Eingriff); step143000 (SAE); 27 Dossier-Checkpoints 1k…143k (Verlauf) |
+| Checkpoints | step98000, step99000 (Eingriff); step143000 (SAE); 27 Dossier-Checkpoints (`lsne.config.CHECKPOINT_TRACE`, Verlauf) |
 
 **Wie der Anker geholt wird.** Die Sequenz wird *nicht* aus lokalen Dateien gelesen und
 *nicht* ins Repository geschrieben, sondern zur Laufzeit per HTTP-Range-Request direkt
