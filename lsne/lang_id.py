@@ -3,29 +3,45 @@
 
 Evidence per word, in order of precedence:
 
-1. digits, punctuation-only strings -> 'N';
-2. function-word / frequent-word lexicons (`data/lexicon/function_words.json`): a word
-   found in exactly one lexicon is decided by it;
-3. character cues: umlauts and sharp s, ``sch``, ``tz``, ``pf``, German suffixes
-   (-ung, -keit, -heit, -lich, -isch, -chen, -schaft, -ieren/-iert, ...), German verb
-   endings (-ibt, -eht, -ingt, -icht, ...) versus English cues (``th``, ``wh``, ``sh``,
-   ``ght``, ``oo``, ``ea``, ``ay``, ``ow``, bare ``c``, -ing, -tion, -ly, -ness, -ment,
-   -ous, -ity, -ful, -ed, -'s, ...); a net score of magnitude >= `DECISIVE` decides;
-4. everything else (words in both lexicons, weak cues, capitalised nouns) is resolved
-   from the decided labels of the two neighbouring words on each side (weights 1.0 and
-   0.5, halved across a sentence boundary) added to the word's own cue score.  A
-   capitalised mid-sentence word without decisive evidence is a German noun in a German
-   context and a proper name ('N') in an English context or without context; a
-   sentence-initial capitalised unknown word without any cue is a name ('N').
+1. digits, punctuation-only strings -> 'N'; English clitics (``'s``, ``n't``, ``'ll``,
+   ...) -> 'E'; proper names of the stimulus schema (``data/lexicon/function_words.json``
+   key ``"N"``: Lena, Tomas, Kraft, ..., also with a genitive ``-s``) -> 'N';
+2. the lexicons (keys ``"D"`` / ``"E"`` of the same file: function words, auxiliaries
+   and the common verbs / nouns / adjectives of everyday narratives with their inflected
+   forms): a lowercase or sentence-initial word found in exactly one lexicon is decided
+   by it; a *capitalised mid-sentence* word found only in the English lexicon is not
+   (German nouns are capitalised: ``im letzten Moment``) and goes to step 4;
+3. character cues: umlauts and ``ß`` are decisive for German.  Everything else is weak
+   evidence - ``sch``, ``tz``, ``pf``, ``ei``/``eu``, German suffixes (-ung, -keit, -heit,
+   -lich, -isch, -chen, -schaft, -ieren/-iert, ...) and verb endings (-eht, -ibt, -mmt,
+   -llt, ...) versus English cues (``th``, ``wh``, ``sh``, ``gh``, ``oo``, ``ea``, ``ay``,
+   ``ow``, ``tch``, ``dge``, bare ``c``, -ing, -tion, -ly, -ness, -ed, -ous, -ful, ...).
+   Only a lowercase or sentence-initial word whose net cue score reaches ``DECISIVE`` is
+   decided by cues alone;
+4. everything else (words in both lexicons, unknown words with weak cues, capitalised
+   mid-sentence words) is resolved from the labels of its neighbouring words *within the
+   same sentence* (sentence boundaries at ``. ! ?``): the nearest word on each side with
+   weight 1.0, the second with weight 0.5 (undecided words count 0, names and digits are
+   transparent), plus half of the word's own cue score.  A net vote of magnitude >=
+   ``MARGIN`` decides; a conflict between the two sides (a language boundary) needs a
+   clear majority and a one-sided context contradicted by the word's own cues is left
+   open, i.e. the word is 'N' rather than guessed.  A capitalised unknown word is a
+   German noun in a German context and a proper name ('N') in an English context.  Two
+   positional rules: ``am`` is English only after ``I``; English ``an`` precedes a vowel.
+   Words whose decided context was weak get a second pass in which the resolved labels
+   of their neighbours count with half weight.
 
 `label_tokens(tokenizer, ids)` labels every token with the label of the word it
 belongs to (a word is a maximal run of tokens starting at a word-start token; whitespace
 and punctuation tokens are 'N').  `label_text(text)` labels whitespace-delimited words.
+`evaluate_on_families(families_dir, tokenizer)` reports the accuracy against the segment
+languages of the stimulus bank per (family, formulation, language).
 """
 from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional, Sequence
@@ -34,54 +50,81 @@ LEXICON_PATH = Path(__file__).resolve().parent.parent / "data" / "lexicon" / "fu
 
 LABELS = ("E", "D", "N")
 DECISIVE = 2.0            # |cue score| needed for a cue-only decision
-CONTEXT_WEIGHTS = (1.0, 0.5)   # nearest and second-nearest word on each side
-SENTENCE_DISCOUNT = 0.5   # context weight factor across a sentence boundary
-_SENTENCE_PUNCT = ".!?:;"
+UMLAUT_SCORE = 3.0        # cue score of an umlaut or sharp s (decisive for every word)
+CONTEXT_WEIGHTS = (1.0, 0.5)   # nearest and second-nearest word on each side (undecided words count 0)
+MARGIN = 0.75             # |vote| needed to resolve an undecided word
+CONFLICT_MARGIN = 1.5     # |left + right| needed when the two sides vote for different languages
+CUE_WEIGHT = 0.5          # weight of the word's own cue score in the context resolution
+CAP_CUE_WEIGHT = 0.25     # ... for capitalised mid-sentence words (German nouns carry English-looking suffixes)
+CAP_PRIOR = 0.5           # German prior of a capitalised mid-sentence word (English capitalises only names)
+RESOLVED_WEIGHT = 0.5     # weight of a context-resolved (not decided) neighbour in the second pass
+_SENTENCE_PUNCT = ".!?"
+_VOWELS = "aeiouäöü"
 _CLOSING = "\"'’”)]»"
-_OPENING = "\"'‘“(„«»‚["
+_OPENING = "\"'‘“(„«»‚[_"
 
 # ---- character cues ------------------------------------------------------------------
 # (pattern, weight); positive = German, negative = English.  Applied to the lowercase
 # word core (letters, inner apostrophes and hyphens only).
-_GERMAN_SUBSTR = (("ä", 3.0), ("ö", 3.0), ("ü", 3.0), ("ß", 3.0), ("sch", 2.0), ("tz", 2.0),
-                  ("pf", 2.0), ("tsch", 1.0), ("eu", 1.0), ("ei", 1.0), ("ie", 0.25), ("ch", 0.5),
-                  ("z", 1.0))
-_GERMAN_PREFIX = (("ver", 1.5), ("vor", 1.0), ("zer", 1.5), ("ent", 0.5), ("ge", 0.5), ("be", 0.5),
-                  ("er", 0.5), ("um", 0.5), ("zu", 1.0))
-_GERMAN_SUFFIX = (("ung", 2.0), ("ungen", 2.0), ("keit", 3.0), ("heit", 3.0), ("lich", 2.0),
-                  ("lichen", 2.0), ("isch", 2.0), ("ische", 2.0), ("ischen", 2.0), ("chen", 1.5),
-                  ("lein", 2.0), ("schaft", 3.0), ("ieren", 2.0), ("iert", 2.0), ("ierte", 2.0),
-                  ("igen", 1.5), ("igt", 1.5), ("nis", 1.0), ("tum", 1.0), ("bar", 0.5), ("los", 0.5),
-                  ("ibt", 2.0), ("eht", 2.0), ("ingt", 2.0), ("icht", 1.5), ("ehrt", 2.0),
-                  ("ndet", 2.0), ("iest", 1.5), ("mmt", 2.0), ("llt", 2.0), ("nnt", 2.0),
-                  ("ckt", 2.0), ("tet", 1.5), ("eint", 1.5), ("ert", 0.5), ("en", 0.75),
-                  ("ern", 0.5), ("em", 0.5), ("ig", 1.0), ("ik", 0.5))
-_ENGLISH_SUBSTR = (("th", 1.5), ("wh", 2.0), ("sh", 1.5), ("ght", 2.0), ("oo", 1.0), ("ea", 1.0),
-                   ("ay", 1.0), ("ow", 1.0), ("aw", 1.0), ("ew", 0.5), ("ey", 0.5), ("oy", 1.0),
-                   ("ou", 0.5), ("y", 0.5), ("'s", 1.5), ("'t", 2.0), ("'re", 2.0),
-                   ("'ll", 2.0), ("'ve", 2.0), ("'d", 1.0), ("'m", 1.0))
-_ENGLISH_SUFFIX = (("ing", 2.0), ("tion", 2.0), ("sion", 1.5), ("ly", 2.0), ("ness", 2.0),
-                   ("ment", 1.5), ("ous", 2.0), ("ity", 2.0), ("ful", 2.0), ("less", 2.0),
-                   ("ed", 1.5), ("ies", 1.5), ("ers", 0.5), ("ally", 2.0), ("ship", 2.0),
-                   ("able", 1.5), ("ible", 1.5), ("ive", 1.0), ("ves", 1.0), ("ism", 0.5),
-                   ("s", 1.0), ("al", 0.75), ("ic", 0.5), ("age", 1.0), ("ure", 1.0),
-                   ("ant", 0.5), ("ent", 0.5))
+_GERMAN_SUBSTR = (("ä", 3.0), ("ö", 3.0), ("ü", 3.0), ("ß", 3.0),
+                  ("sch", 1.0), ("tsch", 0.5), ("tz", 1.0), ("pf", 1.0), ("ei", 0.5), ("eu", 0.5),
+                  ("z", 0.25))
+# (prefix, weight, minimum word length)
+_GERMAN_PREFIX = (("ver", 1.0, 6), ("zer", 1.0, 6), ("zu", 0.5, 5), ("ge", 0.25, 5), ("vor", 0.5, 6),
+                  ("nach", 1.0, 7), ("durch", 1.0, 8), ("unter", 0.5, 8), ("auf", 0.5, 6), ("aus", 0.5, 6))
+# (suffix, weight, minimum word length)
+_GERMAN_SUFFIX = (("ungen", 2.0, 7), ("ung", 1.5, 6), ("keit", 2.0, 6), ("heit", 2.0, 6),
+                  ("lich", 2.0, 6), ("liche", 2.0, 7), ("lichen", 2.0, 8), ("licher", 2.0, 8),
+                  ("liches", 2.0, 8), ("isch", 2.0, 6), ("ische", 2.0, 7), ("ischen", 2.0, 8),
+                  ("ischer", 2.0, 8), ("isches", 2.0, 8), ("chen", 1.0, 6), ("lein", 1.0, 6),
+                  ("schaft", 2.0, 8), ("ieren", 2.0, 7), ("iert", 2.0, 6), ("ierte", 2.0, 7),
+                  ("ierten", 2.0, 8), ("ionen", 1.5, 7), ("igen", 0.75, 6), ("igt", 1.0, 5),
+                  ("ig", 0.5, 4), ("ik", 0.5, 4), ("nis", 0.5, 5), ("tum", 0.5, 5), ("los", 0.5, 5),
+                  ("bar", 0.25, 5), ("en", 0.5, 4), ("ern", 0.25, 5), ("eln", 0.5, 5), ("sten", 0.5, 6),
+                  ("eht", 1.0, 4), ("ibt", 1.0, 4), ("ingt", 1.0, 5), ("icht", 1.0, 5), ("ehrt", 1.0, 5),
+                  ("ndet", 1.0, 5), ("mmt", 1.0, 4), ("llt", 1.0, 4), ("nnt", 1.0, 4), ("ckt", 1.0, 4),
+                  ("tet", 0.75, 5), ("tzt", 1.0, 4), ("ngt", 1.0, 4), ("rft", 1.0, 4), ("elt", 0.5, 5),
+                  ("ert", 0.25, 5))
+_ENGLISH_SUBSTR = (("th", 1.5), ("wh", 2.0), ("sh", 1.0), ("gh", 1.0), ("ght", 1.0), ("oo", 1.0),
+                   ("ea", 1.0), ("ee", 0.5), ("ay", 1.0), ("ow", 1.0), ("aw", 1.0), ("ew", 1.0),
+                   ("ey", 0.5), ("oy", 1.0), ("oi", 0.5), ("oa", 1.0), ("ou", 0.5), ("ai", 0.5),
+                   ("tch", 1.0), ("dge", 1.0), ("wr", 1.0), ("zz", 1.0), ("y", 0.5))
+_ENGLISH_SUFFIX = (("ing", 1.0, 5), ("tion", 1.5, 6), ("sion", 1.0, 6), ("ly", 1.5, 4), ("ness", 1.5, 6),
+                   ("ment", 1.0, 6), ("ous", 1.5, 5), ("ity", 1.5, 5), ("ful", 1.5, 5), ("less", 1.5, 6),
+                   ("ed", 1.5, 4), ("ies", 1.0, 5), ("ally", 1.5, 6), ("ship", 1.5, 6), ("able", 1.0, 6),
+                   ("ible", 1.0, 6), ("ive", 0.5, 5), ("ves", 0.5, 5), ("ism", 0.5, 5), ("s", 0.5, 4),
+                   ("al", 0.5, 5), ("ic", 0.5, 5), ("ure", 0.5, 5), ("ate", 0.5, 5), ("ual", 1.0, 5),
+                   ("ize", 1.0, 5), ("ward", 1.0, 6), ("wards", 1.0, 7), ("ish", 0.5, 5), ("ty", 0.5, 5),
+                   ("ry", 0.5, 5))
+_BARE_C_WEIGHT = 1.0
 _WORD_CORE = re.compile(r"[^\W\d_]+(?:['’\-][^\W\d_]+)*", re.UNICODE)
+_CLITIC = re.compile(r"['’](s|t|re|ll|ve|d|m)$")
 
 
 # ======================================================================================
 # lexicon
 # ======================================================================================
 @lru_cache(maxsize=4)
-def _load_lexicon_cached(path: str) -> tuple[frozenset, frozenset]:
+def _load_lexicon_cached(path: str) -> tuple[frozenset, frozenset, frozenset]:
     d = json.loads(Path(path).read_text(encoding="utf-8"))
-    return frozenset(w.lower() for w in d["D"]), frozenset(w.lower() for w in d["E"])
+    return (frozenset(w.lower() for w in d["D"]), frozenset(w.lower() for w in d["E"]),
+            frozenset(w.lower() for w in d.get("N", ())))
 
 
 def load_lexicon(path: str | Path = LEXICON_PATH) -> dict[str, set[str]]:
-    """Return ``{"D": set, "E": set}`` of lowercase lexicon words."""
-    D, E = _load_lexicon_cached(str(path))
-    return {"D": set(D), "E": set(E)}
+    """Return ``{"D": set, "E": set, "N": set}`` of lowercase lexicon words (``"N"`` are
+    the proper names that are always labelled 'N')."""
+    D, E, N = _load_lexicon_cached(str(path))
+    return {"D": set(D), "E": set(E), "N": set(N)}
+
+
+def _lexicon_sets(lexicon: Optional[dict]) -> tuple[frozenset, frozenset, frozenset]:
+    if lexicon is None:
+        return _load_lexicon_cached(str(LEXICON_PATH))
+    N = lexicon.get("N")
+    if N is None:
+        N = _load_lexicon_cached(str(LEXICON_PATH))[2]
+    return frozenset(lexicon["D"]), frozenset(lexicon["E"]), frozenset(N)
 
 
 # ======================================================================================
@@ -103,87 +146,127 @@ def cue_score(core: str) -> float:
     if not core:
         return 0.0
     s = 0.0
+    n = len(core)
     for pat, wgt in _GERMAN_SUBSTR:
         if pat in core:
             s += wgt
-    for pat, wgt in _GERMAN_PREFIX:
-        if core.startswith(pat) and len(core) > len(pat) + 2:
+    for pat, wgt, min_len in _GERMAN_PREFIX:
+        if n >= min_len and core.startswith(pat):
             s += wgt
-    for pat, wgt in _GERMAN_SUFFIX:
-        if core.endswith(pat) and len(core) > len(pat) + 1:
+    for pat, wgt, min_len in _GERMAN_SUFFIX:
+        if n >= min_len and core.endswith(pat):
             s += wgt
+    no_sch = core.replace("sch", "")
     for pat, wgt in _ENGLISH_SUBSTR:
         if pat == "sh":
-            if "sh" in core.replace("sch", ""):
+            if "sh" in no_sch:
                 s -= wgt
         elif pat in core:
             s -= wgt
-    for pat, wgt in _ENGLISH_SUFFIX:
-        if core.endswith(pat) and len(core) > len(pat) + 1:
-            if pat == "s" and core.endswith(("ss", "us", "is", "as", "es")):
+    for pat, wgt, min_len in _ENGLISH_SUFFIX:
+        if n >= min_len and core.endswith(pat):
+            if pat == "s" and core.endswith(("ss", "us", "is", "as")):
                 continue
             s -= wgt
     if _has_bare_c(core):
-        s -= 1.5
+        s -= _BARE_C_WEIGHT
     return s
 
 
-def _is_capitalised(word: str, core: str) -> bool:
-    first = word.lstrip(_OPENING)[:1]
-    return first.isalpha() and first.isupper() and not core.isupper()
+def _is_capitalised(word: str) -> bool:
+    m = _WORD_CORE.search(word)
+    if not m:
+        return False
+    raw = m.group()
+    return raw[0].isupper() and not (len(raw) > 1 and raw.isupper())
+
+
+@dataclass(frozen=True)
+class WordEvidence:
+    """Evidence about one word: a decided label (or None), its cue score (> 0 German),
+    whether it is capitalised mid-sentence, and its lexicon membership."""
+    label: Optional[str]
+    score: float
+    capitalised: bool          # capitalised, not sentence-initial
+    in_D: bool = False
+    in_E: bool = False
+    cap_any: bool = False      # capitalised (sentence-initial or not)
+
+
+def _evidence(word: str, sentence_initial: bool, lex: tuple[frozenset, frozenset, frozenset]) -> WordEvidence:
+    core = word_core(word)
+    if not core or any(ch.isdigit() for ch in word):
+        return WordEvidence("N", 0.0, False)
+    D, E, N = lex
+    if _CLITIC.search(core):
+        return WordEvidence("E", 0.0, False)                 # English clitic: Kafka's, don't, we'll
+    if core in N or (core.endswith("s") and core[:-1] in N):
+        return WordEvidence("N", 0.0, False)                 # proper name (also genitive: Pauls)
+    cap_any = _is_capitalised(word)
+    cap_mid = cap_any and not sentence_initial
+    in_D, in_E = core in D, core in E
+    if not (in_D or in_E) and ("-" in core or "'" in core or "’" in core):
+        last = re.split(r"['’\-]", core)[-1]                 # Kafka-Deutung -> deutung
+        if last in N:
+            return WordEvidence("N", 0.0, False)
+        in_D, in_E = last in D, last in E
+    score = cue_score(core)
+    if in_D and in_E:
+        return WordEvidence(None, score, cap_mid, True, True, cap_any)
+    if in_D:
+        return WordEvidence("D", score, False, True, False, cap_any)
+    if in_E:
+        if cap_mid:                                          # a capitalised noun in German text?
+            return WordEvidence(None, score, True, False, True, cap_any)
+        return WordEvidence("E", score, False, False, True, cap_any)
+    if score >= UMLAUT_SCORE or (score >= DECISIVE and not cap_mid):
+        return WordEvidence("D", score, False, False, False, cap_any)
+    if not cap_mid:
+        if score <= -DECISIVE:
+            return WordEvidence("E", score, False, False, False, cap_any)
+        if cap_any and score == 0.0:
+            return WordEvidence("N", 0.0, False, False, False, cap_any)   # cue-less sentence-initial name
+    return WordEvidence(None, score, cap_mid, False, False, cap_any)
 
 
 def word_evidence(word: str, sentence_initial: bool = True,
                   lexicon: Optional[dict[str, set[str]]] = None) -> tuple[Optional[str], float, bool]:
-    """(decided label or None, cue score, capitalised-mid-sentence flag) for one word.
-
-    The label is decided ('E', 'D' or 'N') by digits/punctuation, by a lexicon hit in
-    exactly one language, by a cue score of magnitude >= `DECISIVE`, or (as 'N') for a
-    sentence-initial capitalised unknown word without any cue (a proper name)."""
-    core = word_core(word)
-    if not core:
-        return "N", 0.0, False
-    if any(ch.isdigit() for ch in word):
-        return "N", 0.0, False
-    if lexicon is None:
-        D, E = _load_lexicon_cached(str(LEXICON_PATH))
-    else:
-        D, E = lexicon["D"], lexicon["E"]
-    in_D, in_E = core in D, core in E
-    if not (in_D or in_E):
-        stem = re.split(r"['’]", core)[0]        # possessive/clitic: "kafka's" -> "kafka"
-        if stem != core and (stem in D or stem in E):
-            in_D, in_E = (stem in D and not core.endswith(("'s", "’s"))), stem in E
-    if in_D and not in_E:
-        return "D", 0.0, False
-    if in_E and not in_D:
-        return "E", 0.0, False
-    capitalised = _is_capitalised(word, core)
-    score = cue_score(core)
-    if in_D and in_E:
-        return None, score * 0.5, False          # ambiguous lexicon word: context decides
-    if score >= DECISIVE:
-        return "D", score, False
-    if score <= -DECISIVE:
-        return "E", score, False
-    if capitalised and sentence_initial and score == 0.0:
-        return "N", 0.0, False                   # cue-less sentence-initial name
-    return None, score, capitalised and not sentence_initial
+    """(decided label or None, cue score, capitalised-mid-sentence flag) for one word."""
+    ev = _evidence(word, sentence_initial, _lexicon_sets(lexicon))
+    return ev.label, ev.score, ev.capitalised
 
 
-def _resolve(score: float, capitalised: bool, ctx: float) -> str:
-    """Final label from the word's cue score and the weighted context vote `ctx`
-    (> 0 German neighbours, < 0 English neighbours)."""
-    if capitalised:
-        if ctx > 0:
+def _resolve(ev: WordEvidence, left: float, right: float, lean: float = 0.0) -> str:
+    """Final label of an undecided word from the context votes of its left and right
+    neighbours (> 0 German, < 0 English) and its own cue score (`lean`: an extra cue
+    from the word's syntactic position, see `label_words`).
+
+    A capitalised mid-sentence word is a German noun unless the context is English, in
+    which case it is the English word if the lexicon or decisive cues say so and a name
+    ('N') otherwise.  For other words a conflict between the two sides (a language
+    boundary) needs a clear majority, and a one-sided context contradicted by the word's
+    own cues leaves the word open ('N')."""
+    ambiguous = ev.in_D and ev.in_E
+    score = lean if ambiguous else ev.score + lean        # a word of both lexicons: its spelling is no cue
+    if ev.capitalised and not ambiguous:                  # unknown / English-only capitalised noun
+        g = left + right + CAP_CUE_WEIGHT * ev.score + CAP_PRIOR
+        if g >= MARGIN:
             return "D"
-        if ctx < 0:
-            return "D" if score >= 1.5 else "N"
-        return "D" if score >= 1.0 else "N"
-    total = score + ctx
-    if total > 0:
+        if g <= -MARGIN:
+            return "E" if (ev.in_E or ev.score <= -DECISIVE) else "N"
+        return "N"
+    ctx = left + right
+    if left != 0.0 and right != 0.0 and (left > 0) != (right > 0):
+        if abs(ctx) < CONFLICT_MARGIN:
+            return "N"
+    elif (left == 0.0) != (right == 0.0) and score != 0.0 and (score > 0) != (ctx > 0):
+        return "N"
+    g = ctx + (CAP_CUE_WEIGHT if ev.capitalised else CUE_WEIGHT) * score
+    if g >= MARGIN:
         return "D"
-    if total < 0:
+    if g <= -MARGIN:
+        if ev.cap_any and not (ev.in_E or ev.score <= -1.0):
+            return "N"                      # capitalised unknown word in English context: a name
         return "E"
     return "N"
 
@@ -192,15 +275,17 @@ def classify_word(word: str, left: Sequence[str] = (), right: Sequence[str] = ()
                   sentence_initial: bool = True,
                   lexicon: Optional[dict[str, set[str]]] = None) -> str:
     """Label a single word ('E', 'D' or 'N').  `left`/`right` are the labels of the
-    neighbouring words (nearest first, up to two per side) used for ambiguous words."""
-    label, score, capitalised = word_evidence(word, sentence_initial, lexicon)
-    if label is not None:
-        return label
-    ctx = 0.0
+    neighbouring words (nearest first, up to two per side) used for undecided words."""
+    ev = _evidence(word, sentence_initial, _lexicon_sets(lexicon))
+    if ev.label is not None:
+        return ev.label
+    votes = []
     for side in (left, right):
+        v = 0.0
         for lab, w in zip(side, CONTEXT_WEIGHTS):
-            ctx += w if lab == "D" else (-w if lab == "E" else 0.0)
-    return _resolve(score, capitalised, ctx)
+            v += w if lab == "D" else (-w if lab == "E" else 0.0)
+        votes.append(v)
+    return _resolve(ev, votes[0], votes[1])
 
 
 # ======================================================================================
@@ -214,57 +299,88 @@ def _ends_sentence(word: str) -> bool:
 def label_words(words: Sequence[str], lexicon: Optional[dict[str, set[str]]] = None) -> list[str]:
     """Label a sequence of words (strings in text order).
 
-    Pass 0 decides words by lexicon / strong cues; pass 1 resolves the others from the
-    decided labels of their two nearest word neighbours per side (weights 1.0 / 0.5,
-    halved across a sentence boundary) plus their own cue score; pass 2 repeats this
-    with the pass-1 labels for words that had no context in pass 1."""
+    Pass 0 decides words by names / lexicon / decisive cues and two positional rules:
+    ``am`` is English only after ``I``; a capitalised mid-sentence word of the English
+    lexicon is English unless the preceding word is German (``im letzten Moment``).
+    Pass 1 resolves the other words from the labels of their two nearest neighbours per
+    side within the same sentence (weights 1.0 / 0.5; undecided words count 0, names and
+    digits are transparent) plus half their own cue score (`_resolve`); for ``an`` the
+    following word's initial adds a cue (English ``an`` precedes a vowel).  Pass 2 repeats
+    this for words whose decided context was weak (|vote| < `MARGIN`), now counting the
+    pass-1 labels of their neighbours with half weight."""
+    lex = _lexicon_sets(lexicon)
     n = len(words)
     cores = [word_core(w) for w in words]
     real = [i for i in range(n) if cores[i]]                 # words with letters
+    m = len(real)
     # sentence end flags per real word (trailing punctuation-only tokens count)
     ends = [False] * n
     for p, i in enumerate(real):
-        nxt = real[p + 1] if p + 1 < len(real) else n
+        nxt = real[p + 1] if p + 1 < m else n
         ends[i] = any(_ends_sentence(words[j]) for j in range(i, nxt))
-    labels: list[Optional[str]] = ["N"] * n
-    scores = [0.0] * n
-    caps = [False] * n
+    sent = [0] * m                                           # sentence id per real position
+    for p in range(1, m):
+        sent[p] = sent[p - 1] + (1 if ends[real[p - 1]] else 0)
+    evs: list[WordEvidence] = []
     for p, i in enumerate(real):
         sent_init = p == 0 or ends[real[p - 1]]
-        labels[i], scores[i], caps[i] = word_evidence(words[i], sent_init, lexicon)
-    pos_of = {i: p for p, i in enumerate(real)}
+        evs.append(_evidence(words[i], sent_init, lex))
+    labels: list[Optional[str]] = [ev.label for ev in evs]
+    leans = [0.0] * m
+    for p, ev in enumerate(evs):
+        if ev.label is not None:
+            continue
+        core = cores[real[p]]
+        prev_core = cores[real[p - 1]] if p > 0 and sent[p - 1] == sent[p] else ""
+        prev_label = labels[p - 1] if p > 0 and sent[p - 1] == sent[p] else None
+        if core == "am" and ev.in_D and ev.in_E:
+            labels[p] = "E" if prev_core == "i" else "D"
+        elif core == "an" and ev.in_D and ev.in_E and p + 1 < m and sent[p + 1] == sent[p]:
+            leans[p] = -1.0 if cores[real[p + 1]][:1] in _VOWELS else 1.0
+        elif ev.capitalised and ev.in_E and not ev.in_D and prev_label != "D":
+            labels[p] = "E"
+    decided = [lab is not None for lab in labels]
 
-    def context(i: int, labs: Sequence[Optional[str]]) -> float:
-        ctx = 0.0
-        p = pos_of[i]
+    def votes(p: int, labs: Sequence[Optional[str]], weights: Sequence[float]) -> tuple[float, float]:
+        out = []
         for direction in (-1, 1):
-            crossed = False
-            for step, w in enumerate(CONTEXT_WEIGHTS, start=1):
-                q = p + direction * step
-                if not 0 <= q < len(real):
-                    break
-                j = real[q]
-                crossed = crossed or ends[j if direction < 0 else real[q - 1]]
-                wt = w * (SENTENCE_DISCOUNT if crossed else 1.0)
-                lab = labs[j]
+            v = 0.0
+            step = 0
+            q = p + direction
+            while 0 <= q < m and sent[q] == sent[p] and step < len(CONTEXT_WEIGHTS):
+                lab = labs[q]
+                if lab == "N" and decided[q]:
+                    q += direction                           # names / digits are transparent
+                    continue
+                w = CONTEXT_WEIGHTS[step] * weights[q]
                 if lab == "D":
-                    ctx += wt
+                    v += w
                 elif lab == "E":
-                    ctx -= wt
-        return ctx
+                    v -= w
+                step += 1
+                q += direction
+            out.append(v)
+        return out[0], out[1]
 
-    undecided = [i for i in real if labels[i] is None]
+    undecided = [p for p in range(m) if not decided[p]]
+    full = [1.0] * m
     pass1 = list(labels)
-    no_ctx: list[int] = []
-    for i in undecided:
-        c = context(i, labels)
-        if c == 0.0:
-            no_ctx.append(i)
-        pass1[i] = _resolve(scores[i], caps[i], c)
+    weak: list[int] = []
+    for p in undecided:
+        left, right = votes(p, labels, full)
+        if abs(left + right) < MARGIN:
+            weak.append(p)
+        pass1[p] = _resolve(evs[p], left, right, leans[p])
     final = list(pass1)
-    for i in no_ctx:
-        final[i] = _resolve(scores[i], caps[i], context(i, pass1))
-    return [lab if lab is not None else "N" for lab in final]
+    if weak:
+        half = [1.0 if decided[q] else RESOLVED_WEIGHT for q in range(m)]
+        for p in weak:
+            left, right = votes(p, pass1, half)
+            final[p] = _resolve(evs[p], left, right, leans[p])
+    out = ["N"] * n
+    for p, i in enumerate(real):
+        out[i] = final[p] if final[p] is not None else "N"
+    return out
 
 
 def split_words(text: str) -> list[str]:
@@ -369,3 +485,87 @@ def language_runs(labels: Sequence[str]) -> list[tuple[str, int]]:
         else:
             runs.append((x, 1))
     return runs
+
+
+# ======================================================================================
+# diagnostics on the stimulus bank
+# ======================================================================================
+def _family_masks(family) -> list[tuple[int, str, list[str]]]:
+    """The (K, C, mask) conditions of `stimuli.build_variants` without a tokenizer."""
+    from .config import C_LEVELS, K_LEVELS, K_LEVELS_EXTREME
+    from .stimuli import segment_masks
+    out = [(0, "C1", segment_masks(family.n_units, 0, "C1"))]
+    for K in K_LEVELS:
+        if K == 0:
+            continue
+        for C in C_LEVELS:
+            out.append((K, C, segment_masks(family.n_units, K, C)))
+    for K in K_LEVELS_EXTREME:
+        out.append((K, "seg", segment_masks(family.n_units, K, "seg")))
+    return out
+
+
+def evaluate_on_families(families_dir=None, tokenizer=None, lexicon: Optional[dict[str, set[str]]] = None,
+                         verbose: bool = False):
+    """Accuracy of the classifier against the segment languages of every family file in
+    `families_dir` (default: the stimulus bank; files failing the schema are skipped).
+
+    Every (K, C) variant of every family is labelled - at the token level with
+    `label_tokens` when a `tokenizer` is given (words = `token_words` groups, truth from
+    `stimuli.annotate`), otherwise at the word level with `label_text` (truth from the
+    segment owning the word's first character).  Returns a pandas DataFrame with one row
+    per (family, formulation, lang): ``n_words`` (words of that language), ``accuracy``
+    (correct / labelled, 'N' labels excluded), ``misclassified_words`` (list of
+    ``"word->label"`` strings, unique, most frequent first), ``n_errors``,
+    ``n_unlabelled`` (words labelled 'N').  With `verbose=True` the misclassified words
+    are printed per group."""
+    from collections import Counter
+    import pandas as pd
+    from .stimuli import FAMILIES_DIR, load_families, render, _segment_spans, _char_owner
+    if families_dir is None:
+        families_dir = FAMILIES_DIR
+    fams = load_families(families_dir, strict=False)
+    rows = []
+    for fam in fams:
+        stats = {lang: dict(n=0, ok=0, unl=0, err=Counter()) for lang in ("E", "D")}
+        if tokenizer is not None:
+            from .stimuli import build_variants
+            for v in build_variants(fam, tokenizer):
+                labs = label_tokens(tokenizer, v.ids, lexicon)
+                for s, e, text in token_words(tokenizer, v.ids):
+                    if not word_core(text):
+                        continue
+                    truth = v.annot["lang"][s]
+                    _tally(stats[truth], text, labs[s], truth)
+        else:
+            for K, C, mask in _family_masks(fam):
+                text, segments = render(fam, mask)
+                owner = _char_owner(len(text), _segment_spans(text, segments))
+                labs = label_text(text, lexicon)
+                for m, lab in zip(re.finditer(r"\S+", text), labs):
+                    if not word_core(m.group()):
+                        continue
+                    truth = segments[owner[m.start()]].lang
+                    _tally(stats[truth], m.group(), lab, truth)
+        for lang in ("E", "D"):
+            st = stats[lang]
+            labelled = st["n"] - st["unl"]
+            errs = [f"{w}->{lab}" for (w, lab), _ in st["err"].most_common()]
+            rows.append(dict(family=fam.family_id, formulation=fam.formulation, lang=lang,
+                             n_words=st["n"], accuracy=(st["ok"] / labelled if labelled else 1.0),
+                             misclassified_words=errs, n_errors=sum(st["err"].values()),
+                             n_unlabelled=st["unl"]))
+            if verbose and errs:
+                print(f"{fam.tag} {lang}: acc={rows[-1]['accuracy']:.3f} errors={errs}")
+    return pd.DataFrame(rows, columns=["family", "formulation", "lang", "n_words", "accuracy",
+                                       "misclassified_words", "n_errors", "n_unlabelled"])
+
+
+def _tally(st: dict, word: str, lab: str, truth: str) -> None:
+    st["n"] += 1
+    if lab == "N":
+        st["unl"] += 1
+    elif lab == truth:
+        st["ok"] += 1
+    else:
+        st["err"][(word, lab)] += 1

@@ -37,7 +37,7 @@
   ],
   "tail_E": "Early the next morning he slides the first trays of dough into the hot",
   "target": " oven",
-  "target_note": "'oven' is the natural completion of 'slides the first trays of dough into the hot' in a bakery context (dough, rolls, loaves); the word does not occur in the units or the tail, nor does its German equivalent 'Ofen' / 'Backofen'. ' oven' is a single Pythia token (id 14195).",
+  "target_note": "'oven' is the natural completion of 'slides the first trays of dough into the hot' in a bakery context (dough, rolls, loaves); the word does not occur in the units or the tail, nor does its German equivalent 'Ofen' / 'Backofen'. ' oven' is a single Pythia token (id 14195). Pilot check with pythia-160m (tail selection only): p(' oven') = 0.17 on the all-English rendering, rank 1; ' flour' and 'brick oven' tails were rejected as weaker.",
   "author": "LS-NEQ stimulus bank, family F06 (baker Paul / new shop)",
   "notes": "Ten units: Paul opens the bakery; he kneads dough; the lamps burn in the empty shop; a neighbour brings flowers; the smell of rolls fills the street; the first customer buys loaves; Paul counts coins; his wife writes prices; customers fill the shop; the first day ends with empty shelves. Subjects alternate between the protagonist (Paul / he), other people (a neighbour, the first customer, his wife, the customers) and plural objects (the lamps), with one long nominal subject (the smell of fresh rolls / der Duft frischer Brötchen) so that C3 switches cross singular and plural agreement. 'eröffnet' (unit 1) is inseparable; no separable verbs are used. Present tense and positive polarity throughout."
 }

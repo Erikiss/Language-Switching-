@@ -35,9 +35,9 @@
      "E": {"subj": "The group", "pred": "reaches the hut", "adj": "before dark"},
      "D": {"subj": "Die Gruppe", "pred": "erreicht die Hütte", "adj": "vor Einbruch der Dunkelheit"}}
   ],
-  "tail_E": "Before the steep descent Felix ties everyone together with one long",
+  "tail_E": "Before the steep descent Felix ties everyone together with a single long",
   "target": " rope",
-  "target_note": "'rope' is the natural completion of 'ties everyone together with one long' in a glacier-crossing context (crevasse, ice, mountain guide); the word does not occur in the units or the tail, nor does its German equivalent 'Seil'. ' rope' is a single Pythia token (id 20762).",
+  "target_note": "'rope' is the natural completion of 'ties everyone together with a single long' in a glacier-crossing context (crevasse, ice, mountain guide); the word does not occur in the units or the tail, nor does its German equivalent 'Seil'. ' rope' is a single Pythia token (id 20762). Pilot check with pythia-160m (tail selection only): p(' rope') = 0.37 on the all-English rendering, rank 1.",
   "author": "LS-NEQ stimulus bank, family F08 (mountain guide Felix / glacier)",
   "notes": "Ten units: Felix leads the group across the glacier; the sun appears; the ice crunches; a woman stumbles near a crevasse; Felix catches her arm; the group rests; the wind brings cold air; Felix checks the route; the hut stands at the edge of the ice; the group reaches the hut. Subjects alternate between the protagonist (Felix), other people (a young woman, the group) and natural objects (the sun, the ice, the wind, the hut), so that C3 switches cross singular and plural subject-verb agreement; several predicates are bare intransitive verbs (appears/erscheint, crunches/knirscht, stumbles/stolpert, rests/rastet, stands/steht). No separable verbs are used. Present tense and positive polarity throughout."
 }
