@@ -29,3 +29,5 @@ data/atlas/*
 !data/atlas/README
 data/s4/*
 !data/s4/README
+# serialized trace corpora and vocabularies (large; regenerate with lsne.chain.cli)
+data/traces/
