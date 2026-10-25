@@ -10,6 +10,9 @@ Diagnostics
 -----------
 D3 hysteresis      :func:`hysteresis`      dose ramp 0 -> eps_max -> 0, f_D up vs. down, area
 D4 relaxation      :func:`relaxation`      dose quench 0 -> eps at token t_on, f_D(t), tau
+                                           (identifiable only: window-calibrated F-test of
+                                           the mean series AND between-sample bootstrap of
+                                           the amplitude, :func:`fit_relaxation_samples`)
 D5 switch statistics :func:`switch_interval_stats`  inter-switch intervals vs. geometric
 D6 susceptibility  :func:`susceptibility`  chi(eps) = d f_D / d eps and Var(f_D)
 D7 fluctuation-response :func:`fdt_ratio`  T_eff = Var_0(m) / chi

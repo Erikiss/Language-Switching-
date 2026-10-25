@@ -1,0 +1,3 @@
+Drop the no-fork control corpus here (*.txt or *.jsonl, same era/domain without the
+split narrative; see data/ttt/README.md). This directory is git-ignored except for this
+note; the loader (lsne.ttt.load_corpus) skips README* files.

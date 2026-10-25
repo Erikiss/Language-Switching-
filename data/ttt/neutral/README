@@ -1,0 +1,3 @@
+Drop the neutral control corpus here (*.txt or *.jsonl, same size as the DAO-fork
+corpus; see data/ttt/README.md). This directory is git-ignored except for this note;
+the loader (lsne.ttt.load_corpus) skips README* files.

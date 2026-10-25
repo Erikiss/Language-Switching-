@@ -1,0 +1,3 @@
+Drop the stored atlas extraction here (*.txt or *.md, parsed by
+lsne.atlas.load_atlas_extraction). This directory is git-ignored except for this note,
+which has no extension on purpose so that the loader does not parse it as a cluster.

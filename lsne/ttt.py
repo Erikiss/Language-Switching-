@@ -22,10 +22,13 @@ restored in a ``finally`` block, :func:`test_time_train` on a deep copy of the m
 
 Corpus format (:func:`load_corpus`): a directory or a file; ``*.txt`` (one document per
 file, or documents separated by a line consisting of ``---``), ``*.jsonl`` (field
-``text``). Tokenised without special tokens and chunked into pieces of at most
-``seq_len`` tokens. A missing or empty path falls back to the built-in public-domain
-placeholder ``data/ttt/placeholder_public_domain.txt`` (prose written for this
-repository; no historical documents) and marks the result as a placeholder
+``text``). When a directory is scanned, note files (``README*``, any extension) and
+hidden files (``.gitkeep`` etc.) are skipped, so the git-ignored drop folders of the
+repository (which hold only such a note) still count as empty. Tokenised without special
+tokens and chunked into pieces of at most ``seq_len`` tokens. A missing or empty path
+falls back to the built-in public-domain placeholder
+``data/ttt/placeholder_public_domain.txt`` (prose written for this repository; no
+historical documents) and marks the result as a placeholder
 (``corpus.meta['is_placeholder']`` and the module flag :data:`LAST_LOAD_WAS_PLACEHOLDER`).
 """
 from __future__ import annotations
@@ -46,8 +49,9 @@ from .model import ModelBundle, load_model
 
 __all__ = [
     "TTT_DATA_DIR", "DAO_CORPUS_DIR", "PLACEHOLDER_PATH", "CONTROL_ARMS",
-    "LAST_LOAD_WAS_PLACEHOLDER", "LAST_LOAD_META",
-    "Corpus", "read_documents", "tokenise_documents", "load_corpus", "placeholder_corpus",
+    "CORPUS_SUFFIXES", "NOTE_FILE_PREFIXES", "LAST_LOAD_WAS_PLACEHOLDER", "LAST_LOAD_META",
+    "Corpus", "is_note_file", "read_documents", "tokenise_documents", "load_corpus",
+    "placeholder_corpus",
     "permute_corpus", "corpus_for_control", "pad_id_of", "collate",
     "WeightSnapshot", "select_train_params", "TTTResult", "snippet_nll", "corpus_nll",
     "memorisation_speed", "test_time_train", "before_after", "ttt_memorisation_table",
@@ -64,6 +68,11 @@ PLACEHOLDER_PATH = TTT_DATA_DIR / "placeholder_public_domain.txt"
 CONTROL_ARMS = ("neutral", "nofork", "permuted")
 #: Names accepted for "the corpus itself" in ``control=``.
 _INJECTION_NAMES = (None, "", "none", "injection", "corpus")
+#: File suffixes read as corpus documents when a directory is scanned.
+CORPUS_SUFFIXES = (".txt", ".jsonl")
+#: Files whose (lower-cased) name starts with one of these are notes, not documents;
+#: they are skipped when a directory is scanned (``README``, ``README.txt``, ...).
+NOTE_FILE_PREFIXES = ("readme",)
 
 DOC_SEPARATOR = "---"
 IGNORE_INDEX = -100
@@ -140,18 +149,34 @@ def _read_jsonl(path: Path, text_field: str = "text") -> list[str]:
     return docs
 
 
+def is_note_file(path) -> bool:
+    """True for files a directory scan must not read as corpus documents: hidden files
+    (name starting with ``.``, e.g. ``.gitkeep``) and notes whose name starts with one
+    of :data:`NOTE_FILE_PREFIXES` (case-insensitive, any extension: ``README``,
+    ``README.txt``, ``readme.md``). The drop folders ``data/ttt/{dao_fork,neutral,nofork}``
+    ship with such a note only, so they must still yield no documents."""
+    name = Path(path).name
+    low = name.lower()
+    return name.startswith(".") or any(low.startswith(pfx) for pfx in NOTE_FILE_PREFIXES)
+
+
 def _corpus_files(path: Path) -> list[Path]:
+    """Files to read: the file itself (whatever its name, an explicit request), or the
+    ``*.txt`` / ``*.jsonl`` entries of a directory minus note / hidden files."""
     if path.is_file():
         return [path]
     if path.is_dir():
         return sorted(p for p in path.iterdir()
-                      if p.is_file() and p.suffix.lower() in (".txt", ".jsonl"))
+                      if p.is_file() and p.suffix.lower() in CORPUS_SUFFIXES
+                      and not is_note_file(p))
     return []
 
 
 def read_documents(path) -> list[str]:
     """Raw documents (strings) of a file or a directory (non-recursive, sorted file
     order): ``*.txt`` with ``---`` separators, ``*.jsonl`` with a ``text`` field.
+    In a directory, note files (``README*``) and hidden files are skipped
+    (:func:`is_note_file`); an explicitly given file is always read.
     Missing path -> ``[]``."""
     p = _resolve_path(path)
     docs: list[str] = []

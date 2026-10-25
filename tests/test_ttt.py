@@ -70,8 +70,29 @@ def test_load_corpus_reads_txt_and_jsonl(tok, tmp_path):
     assert ttt.load_corpus(tmp_path, tok, max_docs=1).meta["n_docs"] == 1
     small = ttt.load_corpus(tmp_path / "a.txt", tok, seq_len=2)
     assert all(2 <= len(s) <= 2 for s in small) and len(small) > 2
-    # the stored corpus directory of the design (data/ttt/dao_fork) is not in the repo
-    assert not any(ttt.DAO_CORPUS_DIR.glob("*.txt")) and not any(ttt.DAO_CORPUS_DIR.glob("*.jsonl"))
+
+
+def test_load_corpus_skips_note_and_hidden_files(tok, tmp_path):
+    # a drop folder that holds only its note (any extension / case) or hidden files
+    # yields no documents -> placeholder; an explicitly given note file is still read
+    (tmp_path / "README.txt").write_text("Drop files here; this directory is git-ignored.\n", encoding="utf-8")
+    (tmp_path / "readme.jsonl").write_text(json.dumps({"text": "note"}) + "\n", encoding="utf-8")
+    (tmp_path / ".gitkeep").write_text("", encoding="utf-8")
+    (tmp_path / ".hidden.txt").write_text("hidden document.\n", encoding="utf-8")
+    assert all(ttt.is_note_file(p) for p in tmp_path.iterdir())
+    assert not ttt.is_note_file(tmp_path / "doc.txt") and not ttt.is_note_file("corpus.jsonl")
+    assert ttt.read_documents(tmp_path) == []
+    assert ttt.load_corpus(tmp_path, tok).is_placeholder
+    assert ttt.read_documents(tmp_path / "README.txt") == ["Drop files here; this directory is git-ignored."]
+    # real documents next to the note are read, the note is not
+    (tmp_path / "doc.txt").write_text("a real document.\n", encoding="utf-8")
+    assert ttt.read_documents(tmp_path) == ["a real document."]
+    # the repository's drop folders (data/ttt/{dao_fork,neutral,nofork}) contain only
+    # their note: nothing in the repository contains the DAO-fork corpus or its controls
+    for d in (ttt.DAO_CORPUS_DIR, ttt.TTT_DATA_DIR / "neutral", ttt.TTT_DATA_DIR / "nofork"):
+        assert d.is_dir() and all(ttt.is_note_file(p) for p in d.iterdir()), d
+        c = ttt.load_corpus(d, tok)
+        assert c.is_placeholder and c.meta["source"] == str(ttt.PLACEHOLDER_PATH), d
 
 
 def test_permute_corpus_keeps_multiset(tok):

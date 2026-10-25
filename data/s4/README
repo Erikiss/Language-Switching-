@@ -1,0 +1,2 @@
+Drop the S4 files here (e.g. axes.npz with the ARI axes, see docs/DESIGN.md).
+This directory is git-ignored except for this note.

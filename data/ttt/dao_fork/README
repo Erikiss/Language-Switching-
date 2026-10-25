@@ -1,0 +1,3 @@
+Drop the DAO-fork corpus here (*.txt or *.jsonl, see data/ttt/README.md).
+This directory is git-ignored except for this note; the loader (lsne.ttt.load_corpus)
+skips README* files, so without a corpus it still falls back to the placeholder.

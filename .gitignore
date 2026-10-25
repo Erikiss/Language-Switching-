@@ -17,9 +17,15 @@ cache/
 data/state2143/sequence_tokens.json
 data/state2143/*.bin
 .env
-# user-supplied corpora and extractions (never committed)
-data/ttt/dao_fork/
-data/ttt/neutral/
-data/ttt/nofork/
-data/atlas/
-data/s4/
+# user-supplied corpora and extractions (never committed); only the extension-less
+# README note of each drop folder is tracked (no loader matches that name)
+data/ttt/dao_fork/*
+!data/ttt/dao_fork/README
+data/ttt/neutral/*
+!data/ttt/neutral/README
+data/ttt/nofork/*
+!data/ttt/nofork/README
+data/atlas/*
+!data/atlas/README
+data/s4/*
+!data/s4/README
