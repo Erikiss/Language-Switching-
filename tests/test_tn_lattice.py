@@ -9,9 +9,9 @@ import torch
 
 from lsne.config import HookSite
 from lsne.model import run_with_cache
-from lsne.tn_lattice import (LatticeTN, attention_from_heads, build_factorized_lattice,
+from lsne.tn_lattice import (LN_MODES, LatticeTN, attention_from_heads, build_factorized_lattice,
                              compare_responses, contract, cost_reference, einsum_expression,
-                             factorized_response, head_weights, linear_response_jvp,
+                             factorized_response, frozen_attention, head_weights, linear_response_jvp,
                              optimize_path, pca_basis)
 
 HAS_TNCO = importlib.util.find_spec("tnco") is not None
@@ -152,10 +152,26 @@ def test_jvp_matches_finite_differences(mb, sample_ids, setup, jvp_last):
 # --------------------------------------------------------------------------------------
 # (c) factorised lattice, full basis, last block
 # --------------------------------------------------------------------------------------
-def test_factorized_last_layer_within_50pct(mb, setup, jvp_last):
-    """With r = d (no truncation) the only approximations are the frozen attention
-    patterns and the frozen LayerNorm scale; the factorised response of the last block
-    must be within 50% (Frobenius) of the exact JVP."""
+@pytest.fixture(scope="module")
+def jvp_last_frozen_attn(mb, sample_ids, setup):
+    """Frozen-attention linear response at the output of the last block: the exact
+    reference of the untruncated lattice (everything but the softmax derivative)."""
+    s = setup
+    from transformers.models.gpt_neox import modeling_gpt_neox as mg
+    orig = mg.eager_attention_forward
+    out = linear_response_jvp(mb, sample_ids, s["site"], s["position"], s["direction"],
+                              [s["L"]], s["window"], method="jvp", attention_patterns=s["cache"].attn)
+    assert mg.eager_attention_forward is orig            # patch removed afterwards
+    assert out.shape == (1, T_W, s["d"])
+    return out[0]
+
+
+def test_factorized_last_layer_within_50pct(mb, setup, jvp_last, jvp_last_frozen_attn):
+    """With r = d (no truncation) and the default exact LayerNorm Jacobian the only
+    approximation left is the frozen attention pattern: the lattice of the last block
+    equals the frozen-attention JVP up to float32 round-off and stays within 50 %
+    (Frobenius) of the exact JVP.  The frozen-LN ablation (``ln_mode="frozen"``) is a
+    genuine extra error on top of that."""
     s = setup
     L, d = s["L"], s["d"]
     P = torch.eye(d)
@@ -167,15 +183,52 @@ def test_factorized_last_layer_within_50pct(mb, setup, jvp_last):
     assert rel < 0.5, rel
     tn = info["tn"]
     assert isinstance(tn, LatticeTN)
+    assert tn.meta["ln_mode"] == "exact" and tn.meta["per_layer"][L - 1]["ln_mode"] == "exact"
     assert any("frozen attention" in a for a in tn.meta["approximations"])
-    # the exact-LN variant must not be worse than the frozen one
-    resp_x = factorized_response(mb, s["cache"], s["site"], s["position"], s["direction"],
-                                 s["window"], P, range(L - 1, L), backend="opt_einsum", ln_mode="exact")
-    rel_x = np.linalg.norm(resp_x - jvp_last) / np.linalg.norm(jvp_last)
-    assert rel_x <= rel + 1e-6
+    assert not any("frozen LayerNorm" in a for a in tn.meta["approximations"])
+    # exact LN + r = d: the lattice IS the frozen-attention linear response
+    fa = jvp_last_frozen_attn
+    rel_fa = np.linalg.norm(resp - fa) / np.linalg.norm(fa)
+    assert rel_fa < 1e-4, rel_fa
+    # the frozen-attention term itself is non-zero (otherwise the reference is vacuous)
+    assert np.linalg.norm(fa - jvp_last) / np.linalg.norm(jvp_last) > 1e-3
+    # the frozen-LN ablation is explicit, recorded, uses the same memory and is worse
+    # against the frozen-attention reference (the dropped LN projection is a real term)
+    resp_f, info_f = factorized_response(mb, s["cache"], s["site"], s["position"], s["direction"],
+                                         s["window"], P, range(L - 1, L), backend="opt_einsum",
+                                         ln_mode="frozen", return_info=True)
+    tn_f = info_f["tn"]
+    assert tn_f.meta["ln_mode"] == "frozen" and any("frozen LayerNorm" in a for a in tn_f.meta["approximations"])
+    assert tn_f.nbytes() == tn.nbytes()
+    rel_f = np.linalg.norm(resp_f - fa) / np.linalg.norm(fa)
+    assert rel_f > 1e-3 and rel_f > 10 * rel_fa, (rel_f, rel_fa)
     # causality is preserved by the lattice as well
     rel_pos = s["position"] - s["window"].start
     assert np.abs(resp[:rel_pos]).max() < 1e-6
+
+
+def test_frozen_attention_context(mb, sample_ids, setup, jvp_last, jvp_last_frozen_attn):
+    """``frozen_attention`` reproduces the unperturbed forward exactly, is removed on
+    exit (the plain JVP is unchanged afterwards) and validates its input."""
+    s = setup
+    with frozen_attention(mb, s["cache"].attn):
+        again = run_with_cache(mb, sample_ids, "all_block_inputs", need_attn=True)
+    for k in s["cache"].resid:
+        assert torch.allclose(again.resid[k], s["cache"].resid[k], atol=1e-5)
+    plain = linear_response_jvp(mb, sample_ids, s["site"], s["position"], s["direction"],
+                                [s["L"]], s["window"], method="jvp")[0]
+    assert np.allclose(plain, jvp_last, atol=1e-6)
+    assert not np.allclose(plain, jvp_last_frozen_attn, atol=1e-3)
+    # finite differences inside the context (several forward passes) agree with the jvp
+    fd = linear_response_jvp(mb, sample_ids, s["site"], s["position"], s["direction"],
+                             [s["L"]], s["window"], method="fd", attention_patterns=s["cache"].attn)[0]
+    assert np.linalg.norm(fd - jvp_last_frozen_attn) / np.linalg.norm(jvp_last_frozen_attn) < 1e-2
+    with pytest.raises(ValueError):          # one pattern per block is required
+        with frozen_attention(mb, s["cache"].attn[:-1]):
+            pass
+    with pytest.raises(ValueError):          # sequence length must match the patterns
+        with frozen_attention(mb, s["cache"].attn):
+            run_with_cache(mb, sample_ids[:, :-1], [])
 
 
 def test_lattice_structure(mb, setup, lattice_3):
@@ -196,12 +249,23 @@ def test_lattice_structure(mb, setup, lattice_3):
         # skip branch: identities; MLP branch: positional identity in G
         assert np.allclose(G[0], np.eye(T_W)) and np.allclose(G[-1], np.eye(T_W))
         assert np.allclose(K[0], np.eye(r)[None])
-        # heads: causal softmax patterns restricted to the window
+        # heads: causal softmax patterns restricted to the window; with the exact LN
+        # Jacobian the head factors depend on the source position
         for h in range(H):
             A = G[1 + h]
             assert np.allclose(np.triu(A, 1), 0.0, atol=1e-6)
             assert np.all(A >= -1e-7)
-            assert np.allclose(K[1 + h], K[1 + h][:1], atol=1e-6)   # broadcast over t
+            assert not np.allclose(K[1 + h], K[1 + h][:1], atol=1e-6)
+    assert tn.meta["ln_mode"] == "exact" and LN_MODES == ("exact", "frozen")
+    # the frozen-LN ablation has the same layout and memory, head factors broadcast over t
+    tn_f = build_factorized_lattice(mb, s["cache"], HookSite(layers[0], "block_input"), s["window"],
+                                    torch.as_tensor(tn.meta["basis"]), range(layers[0], L),
+                                    position=s["position"], direction=s["direction"], ln_mode="frozen")
+    assert tn_f.nbytes() == tn.nbytes() and tn_f.dims == dims and tn_f.meta["ln_mode"] == "frozen"
+    for l in layers:
+        K_f = dict(tn_f.tensors)[(f"b{l}", f"t{l}", f"i{l + 1}", f"i{l}")]
+        for h in range(H):
+            assert np.allclose(K_f[1 + h], K_f[1 + h][:1], atol=1e-6)
     # source: onehot(position) (x) P^T direction
     src = tn.tensors[0][1]
     rel_pos = s["position"] - s["window"].start
@@ -225,6 +289,9 @@ def test_lattice_validation(mb, setup):
     cache_no_attn = run_with_cache(mb, torch.tensor([[1, 2, 3, 4]]), "all_block_inputs", need_attn=False)
     with pytest.raises(ValueError):          # attention patterns required
         build_factorized_lattice(mb, cache_no_attn, HookSite(0, "block_input"), slice(0, 4), P, range(0, 1))
+    with pytest.raises(ValueError):          # unknown LayerNorm mode
+        build_factorized_lattice(mb, s["cache"], HookSite(s["L"] - 1, "block_input"), s["window"], P,
+                                 range(s["L"] - 1, s["L"]), ln_mode="perpos")
 
 
 # --------------------------------------------------------------------------------------

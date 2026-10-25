@@ -1,5 +1,6 @@
 """Tests for lsne.directions (CPU, pythia-14m fixture, synthetic E/D stimuli)."""
 import types
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -7,9 +8,10 @@ import pytest
 import torch
 
 from lsne.config import HookSite
-from lsne.directions import (Direction, collect_activations, cosine_table, diff_of_means,
-                             entropy_direction, frequency_axis, language_axis, load_axis_npz,
-                             probe_axis, random_directions, unembed_projection, unit)
+from lsne.directions import (DENOISE_GATE_COS, Direction, collect_activations, cosine_table,
+                             denoise_report, diff_of_means, entropy_direction, frequency_axis,
+                             language_axis, load_axis_npz, probe_axis, random_directions,
+                             unembed_projection, unit, within_class_pcs)
 from lsne.model import make_dose_delta
 
 ENGLISH = [
@@ -149,27 +151,146 @@ def test_diff_of_means_unit_and_denoise(collected):
         assert v.shape == (acts.shape[1],) and torch.isclose(v.norm(), torch.tensor(1.0), atol=1e-6)
     plain = D.mean(0) - E.mean(0)
     assert torch.allclose(v0, plain / plain.norm(), atol=1e-6)
-    assert float(v0 @ v1) < 1 - 1e-4                  # denoising changes the vector
-    # the denoised vector is orthogonal to the top PC of the pooled centred data
-    X = torch.cat([D, E]); X = X - X.mean(0)
-    pc1 = torch.linalg.svd(X.double(), full_matrices=False).Vh[0].float()
-    assert abs(float(v1 @ pc1)) < 1e-4
-    # synthetic: class difference is the dominant variance direction -> denoising removes most of it
+    # the denoised vector is orthogonal to the top PC of the WITHIN-class centred data
+    # (D - mean_D stacked on E - mean_E), and the PC is a unit vector of the right size
+    V, frac = within_class_pcs(D, E, 1)
+    assert V.shape == (acts.shape[1], 1) and frac.shape == (1,) and 0 < float(frac[0]) <= 1
+    assert torch.isclose(V[:, 0].norm(), torch.tensor(1.0), atol=1e-5)
+    pc1w = V[:, 0]
+    assert abs(float(v1 @ pc1w)) < 1e-4
+    # exact identity: removing one unit component c = pc1w.v0 from v0 leaves cos = sqrt(1 - c^2)
+    c = float(v0 @ pc1w)
+    assert abs(float(v0 @ v1) - float(np.sqrt(max(1.0 - c * c, 0.0)))) < 1e-4
+    # the within-class PCs are built from the per-class centred data: the same SVD by hand
+    Xw = torch.cat([D - D.mean(0), E - E.mean(0)])
+    pc1_hand = torch.linalg.svd(Xw.double(), full_matrices=False).Vh[0].float()
+    assert abs(abs(float(pc1w @ pc1_hand)) - 1.0) < 1e-5
+    # denoise_pcs larger than the rank bound is clipped, never an error
+    v_big = diff_of_means(D[:2], E[:2], denoise_pcs=10 ** 6)
+    assert torch.isclose(v_big.norm(), torch.tensor(1.0), atol=1e-6)
+    assert within_class_pcs(D[:2], E[:2], 10 ** 6)[0].shape[1] == 2        # (2-1) + (2-1)
+    with pytest.raises(ValueError):
+        diff_of_means(D[:0], E, denoise_pcs=0)
+
+
+def test_diff_of_means_denoise_keeps_signal_removes_shared_nuisance():
+    """DESIGN section 3: denoising projects out the top SHARED component.
+
+    (a) A separable class difference that is the dominant variance direction of the
+        POOLED data must SURVIVE denoising (the pooled PC1 would be the class difference
+        itself; the within-class PC1 is just noise and nearly orthogonal to it).
+    (b) A planted large-variance direction present in BOTH classes (shared nuisance) must
+        be removed, and the class signal must come out cleaner than in the plain difference.
+    """
+    d, n = 16, 40
+    # ---- (a) signal survives ----------------------------------------------------------
     g = torch.Generator().manual_seed(1)
-    Xd = torch.randn(40, 16, generator=g); Xe = torch.randn(40, 16, generator=g)
+    Xd = torch.randn(n, d, generator=g); Xe = torch.randn(n, d, generator=g)
     Xd[:, 0] += 6.0
     vs0, vs1 = diff_of_means(Xd, Xe, 0), diff_of_means(Xd, Xe, 1)
-    assert abs(float(vs0[0])) > 0.9 and abs(float(vs1[0])) < 0.3
+    assert abs(float(vs0[0])) > 0.9 and abs(float(vs1[0])) > 0.9
+    mu = Xd.mean(0) - Xe.mean(0)
+    assert float(mu @ vs1) / float(mu @ vs0) > 0.9        # separation kept along the axis
+    # the pooled PC1 IS the class difference here; the old construction removed the signal
+    X = torch.cat([Xd, Xe]); X = X - X.mean(0)
+    pc1_pooled = torch.linalg.svd(X.double(), full_matrices=False).Vh[0].float()
+    assert abs(float(pc1_pooled[0])) > 0.9
+    # ---- (b) planted shared nuisance ---------------------------------------------------
+    for seed in (0, 1, 2):
+        g = torch.Generator().manual_seed(seed)
+        Xd = torch.randn(n, d, generator=g); Xe = torch.randn(n, d, generator=g)
+        Xd[:, 0] += 2.0                                              # class signal on axis 0
+        u = torch.randn(d, generator=g); u[0] = 0.0; u = unit(u)    # nuisance axis, orthogonal to e0
+        Xd = Xd + (10.0 * torch.randn(n, 1, generator=g)) * u       # same large-variance axis
+        Xe = Xe + (10.0 * torch.randn(n, 1, generator=g)) * u       # in BOTH classes
+        v0, v1 = diff_of_means(Xd, Xe, 0), diff_of_means(Xd, Xe, 1)
+        V, frac = within_class_pcs(Xd, Xe, 1)
+        assert abs(float(V[:, 0] @ u)) > 0.99 and float(frac[0]) > 0.5   # PC1 = the nuisance
+        assert abs(float(v1 @ u)) < 0.05                                 # nuisance removed
+        assert abs(float(v1 @ u)) < abs(float(v0 @ u))
+        assert abs(float(v1[0])) > 0.85 and abs(float(v1[0])) >= abs(float(v0[0])) - 1e-6
+        rep = denoise_report(Xd, Xe, 1, warn=False)
+        assert rep["dprime_denoised"] > rep["dprime_plain"]              # cleaner separation
+        assert rep["denoise_pcs"] == 1 and rep["cos_pcs_plain"][0] == pytest.approx(abs(float(V[:, 0] @ v0)), abs=1e-5)
 
 
-def test_language_axis(mb, variants, site):
-    d = language_axis(mb, variants, site)
+def test_denoise_report_gate():
+    """The gate flags a denoised axis that lost most of the measured separation."""
+    d, n = 16, 40
+    # class shift ALONG the shared high-variance axis: denoising must remove it -> gate fails
+    g = torch.Generator().manual_seed(1)
+    Xd = torch.randn(n, d, generator=g); Xe = torch.randn(n, d, generator=g)
+    Xd[:, 5] *= 10.0; Xe[:, 5] *= 10.0; Xd[:, 5] += 5.0
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        rep = denoise_report(Xd, Xe, 1)
+    assert not rep["gate_ok"] and rep["cos_denoised_plain"] < DENOISE_GATE_COS
+    assert rep["separation_kept"] == pytest.approx(rep["cos_denoised_plain"], abs=1e-5)
+    assert rep["gate_cos"] == DENOISE_GATE_COS
+    assert len(w) == 1 and issubclass(w[0].category, UserWarning) and "cos(denoised, plain)" in str(w[0].message)
+    assert np.isfinite(rep["dprime_plain"]) and np.isfinite(rep["dprime_denoised"])
+    # warn=False silences it, the numbers are identical
+    with warnings.catch_warnings(record=True) as w2:
+        warnings.simplefilter("always")
+        rep2 = denoise_report(Xd, Xe, 1, warn=False)
+    assert len(w2) == 0 and rep2["cos_denoised_plain"] == pytest.approx(rep["cos_denoised_plain"])
+    # class shift orthogonal to the shared axis: gate passes, no warning
+    g = torch.Generator().manual_seed(2)
+    Xd = torch.randn(n, d, generator=g); Xe = torch.randn(n, d, generator=g)
+    Xd[:, 5] *= 10.0; Xe[:, 5] *= 10.0; Xd[:, 0] += 5.0
+    with warnings.catch_warnings(record=True) as w3:
+        warnings.simplefilter("always")
+        rep3 = denoise_report(Xd, Xe, 1)
+    assert rep3["gate_ok"] and rep3["cos_denoised_plain"] > 0.9 and len(w3) == 0
+    assert torch.isclose(rep3["vec_denoised"].norm(), torch.tensor(1.0), atol=1e-6)
+    assert torch.isclose(rep3["vec_plain"].norm(), torch.tensor(1.0), atol=1e-6)
+    assert 0 < rep3["within_var_removed"] < 1
+    # denoise_pcs=0 and the degenerate one-sample-per-class case: plain axis, gate ok, no PCs
+    for args in ((Xd, Xe, 0), (Xd[:1], Xe[:1], 1)):
+        with warnings.catch_warnings(record=True) as w4:
+            warnings.simplefilter("always")
+            rep4 = denoise_report(*args)
+        assert rep4["denoise_pcs"] == 0 and rep4["gate_ok"] and len(w4) == 0
+        assert torch.allclose(rep4["vec_denoised"], rep4["vec_plain"], atol=1e-6)
+        assert rep4["cos_pcs_plain"] == [] and rep4["within_var_removed"] == 0.0
+
+
+def test_language_axis(mb, variants, site, collected):
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        d = language_axis(mb, variants, site)
     assert d.name == "lang_dom" and d.site == site
     assert torch.isclose(d.vec.norm(), torch.tensor(1.0), atol=1e-6)
     assert d.meta["n_D"] == len(variants) and d.meta["n_E"] == 2 * len(variants)
     assert -1 <= d.meta["cos_denoised_plain"] <= 1
     assert torch.isclose(d.meta["vec_plain"].norm(), torch.tensor(1.0), atol=1e-6)
     assert abs(float(d.vec @ d.meta["vec_plain"]) - d.meta["cos_denoised_plain"]) < 1e-5
+    # the axis is the within-class denoised difference of the collected activations
+    acts, labels, _ = collected
+    lab = np.asarray(labels)
+    D, E = acts[torch.as_tensor(lab == "D")], acts[torch.as_tensor(lab == "E")]
+    assert torch.allclose(d.vec, diff_of_means(D, E, denoise_pcs=1), atol=1e-5)
+    assert abs(float(d.vec @ within_class_pcs(D, E, 1)[0][:, 0])) < 1e-4
+    # gate / provenance in meta, consistent with the warning that was (not) emitted
+    m = d.meta
+    for k in ("separation_kept", "cos_pcs_plain", "within_var_removed", "dprime_plain",
+              "dprime_denoised", "gate_ok", "gate_cos", "denoise_pcs", "denoise_pcs_requested"):
+        assert k in m, k
+    assert m["denoise_pcs"] == 1 and m["denoise_pcs_requested"] == 1 and m["gate_cos"] == DENOISE_GATE_COS
+    assert m["separation_kept"] == pytest.approx(m["cos_denoised_plain"], abs=1e-5)
+    assert len(m["cos_pcs_plain"]) == 1 and 0 <= m["cos_pcs_plain"][0] <= 1 + 1e-6
+    assert 0 < m["within_var_removed"] <= 1
+    assert np.isfinite(m["dprime_plain"]) and np.isfinite(m["dprime_denoised"])
+    assert m["gate_ok"] == (m["cos_denoised_plain"] >= DENOISE_GATE_COS)
+    gate_warnings = [x for x in w if issubclass(x.category, UserWarning) and "cos(denoised, plain)" in str(x.message)]
+    assert len(gate_warnings) == (0 if m["gate_ok"] else 1)
+    # denoise_pcs=0: the plain axis, gate trivially ok, no warning
+    with warnings.catch_warnings(record=True) as w0:
+        warnings.simplefilter("always")
+        d0 = language_axis(mb, variants, site, denoise_pcs=0)
+    assert torch.allclose(d0.vec, d0.meta["vec_plain"], atol=1e-6) and torch.allclose(d0.vec, d.meta["vec_plain"], atol=1e-6)
+    assert d0.meta["gate_ok"] and d0.meta["denoise_pcs"] == 0 and d0.meta["cos_denoised_plain"] == pytest.approx(1.0, abs=1e-5)
+    assert not [x for x in w0 if "cos(denoised, plain)" in str(x.message)]
 
 
 def test_probe_axis_separable_synthetic():

@@ -8,8 +8,12 @@ Constructions implemented here:
 * ``ent``        - entropy gradient at a site/position (State-2143 construction), optionally
                    orthogonalised against an external axis (the dossier's ARI axis).
 * ``lang_dom``   - difference of means D - E over segment-final residuals, "denoised" by
-                   projecting out the top principal component(s) of the pooled data
-                   (the Pain-Axis recipe of Tagliabue et al. 2026).
+                   projecting out the top *shared* principal component(s), i.e. the PCs of
+                   the within-class centred data (the Pain-Axis recipe of Tagliabue et al.
+                   2026, DESIGN section 3). The PCs are deliberately NOT taken from the pooled
+                   data: the pooled covariance contains the between-class term
+                   ``n_D n_E / N^2 * diff diff^T``, so a strong language difference would be
+                   PC1 and denoising would delete the signal instead of shared nuisance.
 * ``lang_probe`` - L2-regularised logistic-regression weight vector E vs D (control).
 * ``freq``       - mean unembedding row of the most frequent tokens minus the mean row
                    (first-order "frequency axis"; ignores the final LayerNorm).
@@ -21,6 +25,7 @@ activation collector ``collect_activations`` shared by the axis constructions.
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Sequence, Union
 
@@ -32,6 +37,12 @@ from .config import HookSite
 from .model import ModelBundle, entropy_gradient, make_dose_delta, rms, run_with_cache
 
 _EPS = 1e-30
+
+# Gate for the denoised language axis: if the cosine between the denoised and the plain
+# difference of means falls below this, denoising has removed a large part of the measured
+# language separation (the removed "shared" PC coincides with the class difference) and
+# ``language_axis`` warns (DESIGN section 3; fix round 1, finding 1).
+DENOISE_GATE_COS = 0.7
 
 
 # --------------------------------------------------------------------------------------
@@ -262,30 +273,137 @@ def collect_activations(mb: ModelBundle, variants: Sequence, site: HookSite,
 # --------------------------------------------------------------------------------------
 # lang_dom: difference of means with PC denoising
 # --------------------------------------------------------------------------------------
-def diff_of_means(acts_D: torch.Tensor, acts_E: torch.Tensor, denoise_pcs: int = 1) -> torch.Tensor:
-    """Unit difference-of-means direction ``mean(D) - mean(E)``.
-
-    With ``denoise_pcs > 0`` the pooled activations are centred, their top ``denoise_pcs``
-    principal components are computed, and the projection of the mean difference onto
-    those components is removed before normalising (Pain-Axis denoising). ``denoise_pcs=0``
-    gives the plain difference. The number of PCs is clipped to ``min(N-1, d)``.
-    """
+def _two_classes(acts_D: torch.Tensor, acts_E: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Both class matrices as float32 CPU ``[n, d]`` (raises if a class is empty)."""
     D = torch.as_tensor(acts_D).detach().float().cpu().reshape(-1, acts_D.shape[-1])
     E = torch.as_tensor(acts_E).detach().float().cpu().reshape(-1, acts_E.shape[-1])
     if D.shape[0] == 0 or E.shape[0] == 0:
-        raise ValueError("diff_of_means needs at least one sample per class")
+        raise ValueError("need at least one sample per class")
+    if D.shape[1] != E.shape[1]:
+        raise ValueError(f"feature dimensions differ: {D.shape[1]} vs {E.shape[1]}")
+    return D, E
+
+
+def _within_class_centred(D: torch.Tensor, E: torch.Tensor) -> torch.Tensor:
+    """Stack of ``D - mean(D)`` and ``E - mean(E)`` (the within-class scatter data)."""
+    return torch.cat([D - D.mean(0, keepdim=True), E - E.mean(0, keepdim=True)], 0)
+
+
+def within_class_pcs(acts_D: torch.Tensor, acts_E: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-``k`` principal components of the *within-class* centred data.
+
+    Each class is centred on its own mean before the SVD, so the between-class term
+    (the mean difference itself) does not enter the covariance: the components describe
+    variance that is present inside the classes ("shared" nuisance such as position, token
+    class or family), never the class separation. ``k`` is clipped to the rank bound
+    ``min(k, (n_D - 1) + (n_E - 1), d)``.
+
+    Returns ``(V [d, k'] with orthonormal columns, frac [k'])`` where ``frac[i]`` is the
+    fraction of the within-class variance carried by component ``i`` (``k'`` may be 0).
+    """
+    D, E = _two_classes(acts_D, acts_E)
+    Xw = _within_class_centred(D, E)
+    d = int(Xw.shape[1])
+    rank_max = max(D.shape[0] - 1, 0) + max(E.shape[0] - 1, 0)
+    k = int(min(int(k), rank_max, d))
+    if k <= 0:
+        return torch.zeros(d, 0), torch.zeros(0)
+    # deterministic full SVD of the within-class centred data (N and d are small)
+    _, S, Vh = torch.linalg.svd(Xw.double(), full_matrices=False)
+    tot = float((S ** 2).sum())
+    frac = ((S[:k] ** 2) / max(tot, _EPS)).float()
+    return Vh[:k].T.float(), frac                             # [d,k], orthonormal columns
+
+
+def diff_of_means(acts_D: torch.Tensor, acts_E: torch.Tensor, denoise_pcs: int = 1) -> torch.Tensor:
+    """Unit difference-of-means direction ``mean(D) - mean(E)``.
+
+    With ``denoise_pcs > 0`` the top ``denoise_pcs`` principal components of the
+    **within-class centred** data (:func:`within_class_pcs`: ``D - mean(D)`` stacked on
+    ``E - mean(E)``) are computed and the projection of the mean difference onto those
+    components is removed before normalising (Pain-Axis denoising of the top *shared*
+    component, DESIGN section 3). ``denoise_pcs=0`` gives the plain difference. The number
+    of PCs is clipped to ``min(denoise_pcs, (n_D - 1) + (n_E - 1), d)``.
+
+    The PCs are intentionally not taken from the pooled data: the pooled covariance equals
+    the within-class covariance plus ``n_D n_E / N^2 * diff diff^T``, so whenever the class
+    difference is large it *is* the pooled PC1 and projecting it out deletes the signal.
+    Within-class PCs cannot contain the mean difference, so a class shift along a direction
+    with little within-class variance survives untouched, while a direction with large
+    variance in both classes (a shared nuisance axis) is removed.
+    """
+    D, E = _two_classes(acts_D, acts_E)
     diff = D.mean(0) - E.mean(0)
     k = int(denoise_pcs)
     if k > 0:
-        X = torch.cat([D, E], 0)
-        X = X - X.mean(0, keepdim=True)
-        k = min(k, max(X.shape[0] - 1, 0), X.shape[1])
-        if k > 0:
-            # deterministic full SVD of the centred pooled data (N and d are small)
-            _, _, Vh = torch.linalg.svd(X.double(), full_matrices=False)
-            V = Vh[:k].T.float()                              # [d,k], orthonormal columns
+        V, _ = within_class_pcs(D, E, k)
+        if V.shape[1] > 0:
             diff = diff - V @ (V.T @ diff)
+    n = float(diff.norm())
+    if not np.isfinite(n) or n <= 0.0:
+        raise ValueError("diff_of_means: the mean difference is zero (or lies entirely inside "
+                         "the removed within-class components); nothing to normalise")
     return unit(diff)
+
+
+def denoise_report(acts_D: torch.Tensor, acts_E: torch.Tensor, denoise_pcs: int = 1,
+                   gate_cos: float = DENOISE_GATE_COS, warn: bool = True) -> dict:
+    """Plain and denoised difference of means with the denoising gate.
+
+    Returns a dict with ``vec_plain``, ``vec_denoised`` (unit vectors),
+    ``cos_denoised_plain``, ``separation_kept`` (``(mu @ v_den) / (mu @ v_plain)`` with
+    ``mu = mean(D) - mean(E)``: the fraction of the raw D-E mean separation that survives
+    along the denoised axis; by construction equal to the cosine, kept under its own name
+    as the gate quantity), ``cos_pcs_plain`` (``|cos|`` of each removed within-class PC with
+    the plain difference), ``within_var_removed`` (fraction of within-class variance carried
+    by the removed PCs), ``dprime_plain`` / ``dprime_denoised`` (mean separation along the
+    axis divided by the pooled within-class standard deviation along it; NaN when the
+    within-class spread is zero), ``gate_ok`` (``cos_denoised_plain >= gate_cos``),
+    ``gate_cos`` and ``denoise_pcs`` (the number of PCs actually removed).
+
+    If ``warn`` and the gate fails, a :class:`UserWarning` is emitted: the removed shared
+    component overlaps strongly with the plain class difference, so most of the measured
+    mean separation is gone from the denoised axis. Whether that is a loss of signal or the
+    removal of nuisance that contaminated the plain difference cannot be told from the
+    cosine alone; the message therefore also states whether ``dprime`` improved (nuisance
+    removed, e.g. a massive-activation dimension with few samples) or degraded (signal
+    discarded). This is data and model dependent, so it is reported, not hidden.
+    """
+    D, E = _two_classes(acts_D, acts_E)
+    mu = D.mean(0) - E.mean(0)
+    v_plain = diff_of_means(D, E, denoise_pcs=0)
+    V, frac = within_class_pcs(D, E, int(denoise_pcs))
+    v_den = diff_of_means(D, E, denoise_pcs=int(denoise_pcs)) if V.shape[1] > 0 else v_plain.clone()
+    Xw = _within_class_centred(D, E)
+
+    def dprime(v: torch.Tensor) -> float:
+        sd = float((Xw @ v).pow(2).mean().sqrt()) if Xw.shape[0] > 1 else 0.0
+        return float(mu @ v) / sd if sd > 0.0 else float("nan")
+
+    cos_dp = cosine(v_den, v_plain)
+    sep_plain = float(mu @ v_plain)
+    sep_kept = float(mu @ v_den) / sep_plain if sep_plain > 0.0 else float("nan")
+    gate_ok = bool(cos_dp >= float(gate_cos))
+    rep = dict(vec_plain=v_plain, vec_denoised=v_den, cos_denoised_plain=cos_dp,
+               separation_kept=sep_kept,
+               cos_pcs_plain=[abs(cosine(V[:, i], v_plain)) for i in range(int(V.shape[1]))],
+               within_var_removed=float(frac.sum()) if frac.numel() else 0.0,
+               dprime_plain=dprime(v_plain), dprime_denoised=dprime(v_den),
+               gate_ok=gate_ok, gate_cos=float(gate_cos), denoise_pcs=int(V.shape[1]))
+    if warn and not gate_ok:
+        dp, dd = rep["dprime_plain"], rep["dprime_denoised"]
+        verdict = ("the standardised separation d' still IMPROVED, i.e. the removed component "
+                   "was mostly nuisance contaminating the plain difference"
+                   if np.isfinite(dp) and np.isfinite(dd) and dd >= dp else
+                   "the standardised separation d' DEGRADED, i.e. the removed shared component "
+                   "coincides with the class difference and signal was discarded")
+        warnings.warn(
+            f"diff-of-means denoising changed the axis substantially: cos(denoised, plain) = "
+            f"{cos_dp:.3f} < {float(gate_cos):.2f} (mean separation kept {sep_kept:.1%}; "
+            f"|cos(PC, plain)| = {[round(c, 3) for c in rep['cos_pcs_plain']]}; "
+            f"d' plain -> denoised = {dp:.2f} -> {dd:.2f}): {verdict}. Report both axes; "
+            f"consider denoise_pcs=0 or more homogeneous classes.", UserWarning, stacklevel=2)
+    return rep
 
 
 def language_axis(mb: ModelBundle, variants: Sequence, site: HookSite,
@@ -294,8 +412,12 @@ def language_axis(mb: ModelBundle, variants: Sequence, site: HookSite,
     at ``site`` (segment-final tokens by default).
 
     meta: ``n_E``, ``n_D``, ``cos_denoised_plain`` (cosine between the denoised and the plain
-    difference), ``denoise_pcs``, ``pool``, ``mean_norm_D/E``, ``diff_norm`` and the plain
-    direction itself under ``vec_plain``.
+    difference), ``separation_kept`` (gate quantity: fraction of the raw D-E mean separation
+    kept along the denoised axis), ``cos_pcs_plain``, ``within_var_removed``,
+    ``dprime_plain`` / ``dprime_denoised``, ``gate_ok`` / ``gate_cos`` (see
+    :func:`denoise_report`), ``denoise_pcs``, ``pool``, ``mean_norm_D/E``, ``diff_norm`` and
+    the plain direction itself under ``vec_plain``. A :class:`UserWarning` is emitted when
+    ``cos_denoised_plain < DENOISE_GATE_COS`` (0.7).
     """
     acts, labels, _meta = collect_activations(mb, variants, site, which=pool)
     lab = np.asarray(labels)
@@ -303,13 +425,13 @@ def language_axis(mb: ModelBundle, variants: Sequence, site: HookSite,
     E = acts[torch.as_tensor(lab == "E")]
     if D.shape[0] == 0 or E.shape[0] == 0:
         raise ValueError(f"language_axis needs both languages (n_E={E.shape[0]}, n_D={D.shape[0]})")
-    v_plain = diff_of_means(D, E, denoise_pcs=0)
-    v_den = diff_of_means(D, E, denoise_pcs=denoise_pcs)
-    meta = dict(n_E=int(E.shape[0]), n_D=int(D.shape[0]), pool=pool, denoise_pcs=int(denoise_pcs),
-                cos_denoised_plain=cosine(v_den, v_plain),
+    rep = denoise_report(D, E, denoise_pcs=int(denoise_pcs), warn=True)
+    v_den = rep.pop("vec_denoised")
+    meta = dict(n_E=int(E.shape[0]), n_D=int(D.shape[0]), pool=pool,
                 diff_norm=float((D.mean(0) - E.mean(0)).norm()),
-                mean_norm_D=float(D.mean(0).norm()), mean_norm_E=float(E.mean(0).norm()),
-                vec_plain=v_plain)
+                mean_norm_D=float(D.mean(0).norm()), mean_norm_E=float(E.mean(0).norm()))
+    meta.update(rep)
+    meta["denoise_pcs_requested"] = int(denoise_pcs)
     return Direction("lang_dom", v_den, site, meta)
 
 
@@ -466,6 +588,7 @@ def random_direction_set(d: int, n: int, seed: int, site: HookSite, name: str = 
 
 __all__ = [
     "Direction", "unit", "cosine", "entropy_direction", "load_axis_npz", "collect_activations",
-    "diff_of_means", "language_axis", "probe_axis", "random_directions", "random_direction_set",
-    "frequency_axis", "cosine_table", "unembed_projection",
+    "within_class_pcs", "diff_of_means", "denoise_report", "DENOISE_GATE_COS", "language_axis",
+    "probe_axis", "random_directions", "random_direction_set", "frequency_axis", "cosine_table",
+    "unembed_projection",
 ]

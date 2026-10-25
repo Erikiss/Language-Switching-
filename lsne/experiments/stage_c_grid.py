@@ -13,13 +13,21 @@ grid_summary         random directions averaged (``dir_family='rand'``: mean, sd
                      directions); other families unchanged
 contrasts            per formulation and mixed variant: T = logp_0(mixed) - logp_0(K=0) and
                      I = B(mixed) - B(K=0) per (dir_family, sign, eps)
-contrasts_boot       family cluster bootstrap of T per (K, C) and of I per
-                     (K, C, dir_family, sign, eps)
+contrasts_boot       family cluster bootstrap of T per (K, C), of I per
+                     (K, C, dir_family, sign, eps) and of the attribution excess
+                     R_class - R_random per (K, C, layer, class) (``quantity="R_excess"``;
+                     the row with ``class == "delim"`` is the pre-registered contrast 3
+                     R_ws+punct+boundary - R_random, PREREGISTRATION.md section 3)
 attribution          counterfactual position patching K=0 -> K=8/C1 and K=0 -> K=28/seg
                      (original family: K=0 -> largest K) on the block inputs of the
                      pre-registered layer grid :func:`attribution_layer_grid` ({2, 5, 8, 11}
-                     for pythia-160m, DESIGN section 4.1), per token class with a
+                     for pythia-160m, DESIGN section 4.1), per token class of
+                     :data:`lsne.experiments.common.PATCH_CLASSES` (incl. the union class
+                     ``delim`` = ws + punct + boundary as one patch set) with a stratified
                      random-position null (:func:`lsne.patching.counterfactual_attribution`)
+attribution_contrasts per pair, formulation, layer and class with a defined control:
+                     R_excess = recovery - recovery_random_mean (the per-formulation rows
+                     behind the ``R_excess`` bootstrap; ``preregistered`` marks ``delim``)
 attribution_summary  mean recovery per (pair, site, class) over formulations
 grad_x_act           gradient x activation of log p(target) per variant, site and position
 grad_x_act_by_class  share of |grad x act| per token class
@@ -119,8 +127,16 @@ def contrast_rows(summary: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=cols)
 
 
+#: Columns of ``contrasts_boot``: T / I rows carry ``layer=-1`` and ``class=""``, the
+#: attribution rows (``quantity="R_excess"``) carry ``dir_family=""``, ``sign=0``, ``eps=0``.
+BOOT_COLS = ["quantity", "K", "C", "dir_family", "sign", "eps", "layer", "class", "mean", "ci_low", "ci_high", "se",
+             "n_clusters", "n_rows"]
+
+
 def bootstrap_contrasts(contrasts: pd.DataFrame, n_boot: int, seed: int) -> pd.DataFrame:
-    cols = ["quantity", "K", "C", "dir_family", "sign", "eps", "mean", "ci_low", "ci_high", "se", "n_clusters", "n_rows"]
+    """Family cluster bootstrap of T per (K, C) and of I per (K, C, dir_family, sign, eps)
+    over the standard families (columns :data:`BOOT_COLS`)."""
+    cols = BOOT_COLS
     if contrasts.empty:
         return pd.DataFrame(columns=cols)
     rows = []
@@ -132,13 +148,62 @@ def bootstrap_contrasts(contrasts: pd.DataFrame, n_boot: int, seed: int) -> pd.D
     t_src = t_src.drop_duplicates(["tag"])
     for (K, Cc), g in t_src.groupby(["K", "C"], sort=True):
         r = cluster_bootstrap(g, "T", "family", n_boot=n_boot, seed=seed)
-        rows.append(dict(quantity="T", K=int(K), C=Cc, dir_family="", sign=0, eps=0.0, mean=r["mean"],
-                         ci_low=r["ci_low"], ci_high=r["ci_high"], se=r["se"], n_clusters=r["n_clusters"], n_rows=r["n_rows"]))
+        rows.append(dict(quantity="T", K=int(K), C=Cc, dir_family="", sign=0, eps=0.0, layer=-1, **{"class": ""},
+                         mean=r["mean"], ci_low=r["ci_low"], ci_high=r["ci_high"], se=r["se"],
+                         n_clusters=r["n_clusters"], n_rows=r["n_rows"]))
     for (K, Cc, fam, sign, eps), g in std[std["eps"] > 0].groupby(["K", "C", "dir_family", "sign", "eps"], sort=True):
         r = cluster_bootstrap(g, "I", "family", n_boot=n_boot, seed=seed)
-        rows.append(dict(quantity="I", K=int(K), C=Cc, dir_family=fam, sign=int(sign), eps=float(eps), mean=r["mean"],
-                         ci_low=r["ci_low"], ci_high=r["ci_high"], se=r["se"], n_clusters=r["n_clusters"], n_rows=r["n_rows"]))
+        rows.append(dict(quantity="I", K=int(K), C=Cc, dir_family=fam, sign=int(sign), eps=float(eps), layer=-1,
+                         **{"class": ""}, mean=r["mean"], ci_low=r["ci_low"], ci_high=r["ci_high"], se=r["se"],
+                         n_clusters=r["n_clusters"], n_rows=r["n_rows"]))
     return pd.DataFrame(rows, columns=cols)
+
+
+ATT_CONTRAST_COLS = ["pair", "family", "formulation", "tag_mixed", "K", "C", "kind", "site", "layer", "class",
+                     "preregistered", "n_positions", "recovery", "recovery_random_mean", "recovery_random_sd", "R_excess"]
+
+
+def attribution_contrasts(att: pd.DataFrame) -> pd.DataFrame:
+    """Per-formulation attribution excess ``R_excess = recovery - recovery_random_mean``
+    for every (pair, layer, class) row of ``att`` whose stratified random control is
+    defined (``control_defined``); ``preregistered`` marks the confirmatory class
+    :data:`lsne.experiments.common.PREREG_PATCH_CLASS` (contrast 3,
+    R_ws+punct+boundary - R_random).  Rows without a control (unmeasurable classes, or
+    classes that exhaust their pools such as ``tail`` / ``all``) are left out: their
+    excess is undefined, not zero."""
+    if att.empty or "control_defined" not in att.columns:
+        return pd.DataFrame(columns=ATT_CONTRAST_COLS)
+    ok = att[att["control_defined"].astype(bool) & np.isfinite(att["recovery"].astype(float))
+             & np.isfinite(att["recovery_random_mean"].astype(float))]
+    if ok.empty:
+        return pd.DataFrame(columns=ATT_CONTRAST_COLS)
+    out = pd.DataFrame(dict(
+        pair=ok["pair"].to_numpy(), family=ok["family"].to_numpy(), formulation=ok["formulation"].to_numpy(),
+        tag_mixed=ok["tag_mixed"].to_numpy(), K=ok["K_mixed"].astype(int).to_numpy(), C=ok["C_mixed"].astype(str).to_numpy(),
+        kind=(ok["kind"].to_numpy() if "kind" in ok.columns else np.full(len(ok), "standard")),
+        site=ok["site"].to_numpy(), layer=ok["layer"].astype(int).to_numpy(), **{"class": ok["class"].to_numpy()},
+        preregistered=(ok["class"] == C.PREREG_PATCH_CLASS).to_numpy(), n_positions=ok["n_positions"].astype(int).to_numpy(),
+        recovery=ok["recovery"].astype(float).to_numpy(),
+        recovery_random_mean=ok["recovery_random_mean"].astype(float).to_numpy(),
+        recovery_random_sd=ok["recovery_random_sd"].astype(float).to_numpy()))
+    out["R_excess"] = out["recovery"] - out["recovery_random_mean"]
+    return out[ATT_CONTRAST_COLS].reset_index(drop=True)
+
+
+def bootstrap_attribution(att_con: pd.DataFrame, n_boot: int, seed: int) -> pd.DataFrame:
+    """Family cluster bootstrap of ``R_excess`` per (K, C, layer, class) over the standard
+    families (``quantity="R_excess"``, columns :data:`BOOT_COLS`); the ``class == "delim"``
+    rows are the pre-registered contrast 3 per layer of the attribution grid."""
+    if att_con.empty:
+        return pd.DataFrame(columns=BOOT_COLS)
+    std = att_con[att_con["kind"] == "standard"]
+    rows = []
+    for (K, Cc, layer, cls), g in std.groupby(["K", "C", "layer", "class"], sort=True):
+        r = cluster_bootstrap(g, "R_excess", "family", n_boot=n_boot, seed=seed)
+        rows.append(dict(quantity="R_excess", K=int(K), C=str(Cc), dir_family="", sign=0, eps=0.0, layer=int(layer),
+                         **{"class": str(cls)}, mean=r["mean"], ci_low=r["ci_low"], ci_high=r["ci_high"], se=r["se"],
+                         n_clusters=r["n_clusters"], n_rows=r["n_rows"]))
+    return pd.DataFrame(rows, columns=BOOT_COLS)
 
 
 # --------------------------------------------------------------------------------------
@@ -203,11 +268,14 @@ def attribution_table(mb: ModelBundle, variants, sites, n_random: int, seed: int
         df.insert(3, "tag_mixed", v_mixed.tag)
         df.insert(4, "K_mixed", int(v_mixed.K))
         df.insert(5, "C_mixed", str(v_mixed.C))
+        df.insert(6, "kind", C.variant_kind(v_mixed))
         frames.append(df)
     if not frames:
-        return pd.DataFrame(columns=["pair", "family", "formulation", "tag_mixed", "K_mixed", "C_mixed", "site", "layer",
-                                     "class", "n_positions", "n_tail", "n_nontail", "logp_mono", "logp_mixed",
-                                     "logp_patched", "recovery", "recovery_random_mean", "recovery_random_sd", "dst_positions"])
+        return pd.DataFrame(columns=["pair", "family", "formulation", "tag_mixed", "K_mixed", "C_mixed", "kind", "site",
+                                     "layer", "class", "region", "n_positions", "n_tail", "n_nontail", "n_pool_tail",
+                                     "n_pool_nontail", "n_null_subsets", "measurable", "control_defined", "logp_mono",
+                                     "logp_mixed", "logp_patched", "recovery", "recovery_random_mean",
+                                     "recovery_random_sd", "dst_positions"])
     return pd.concat(frames, ignore_index=True)
 
 
@@ -278,18 +346,22 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     contrasts = contrast_rows(summary)
     boot = bootstrap_contrasts(contrasts, n_boot=limits.n_boot, seed=cfg.seed)
 
-    grid = attribution_layer_grid(mb.n_layers)
-    sites = [HookSite(int(l), "block_input") for l in grid]
+    lgrid = attribution_layer_grid(mb.n_layers)
+    sites = [HookSite(int(l), "block_input") for l in lgrid]
     att = attribution_table(mb, allv, sites, n_random=limits.n_random_patch, seed=cfg.seed, enabled=limits.progress)
+    att_con = attribution_contrasts(att)
+    # contrast 3 (R_delim - R_random per layer) next to T and I in contrasts_boot
+    boot = pd.concat([boot, bootstrap_attribution(att_con, n_boot=limits.n_boot, seed=cfg.seed)], ignore_index=True)
     gxa_variants = C.core_subset(allv) if limits.limited else allv
     gxa, gxa_cls = grad_x_act_tables(mb, gxa_variants, sites, enabled=limits.progress)
 
     tables = {
         "grid": grid, "grid_summary": summary, "contrasts": contrasts, "contrasts_boot": boot,
-        "attribution": att, "attribution_summary": summarise_attribution(att),
+        "attribution": att, "attribution_contrasts": att_con, "attribution_summary": summarise_attribution(att),
         "grad_x_act": gxa, "grad_x_act_by_class": gxa_cls,
     }
     return C.finish_stage(run_dir, "C", cfg, mb, tables, limits=limits, t0=t0, site=site, directions=dir_names,
                           bank_source=bank.meta.get("source", ""),
-                          doses=list(cfg.doses), layer_grid=[int(l) for l in grid],
+                          doses=list(cfg.doses), layer_grid=[int(l) for l in lgrid],
+                          patch_classes=list(C.PATCH_CLASSES), prereg_patch_class=C.PREREG_PATCH_CLASS,
                           n_variants=len(variants), n_pairs=len(attribution_pairs(allv)))

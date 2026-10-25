@@ -9,12 +9,20 @@ stream to a small perturbation at one lattice site are compared:
     model (``linear_response_jvp``), and
 (c) the *factorised* linear response: the Jacobian of every block at the working
     point is written as a sum of branches (skip + one branch per attention head +
-    MLP) with frozen attention patterns and frozen LayerNorm scales, projected onto an
-    r-dimensional basis of the residual stream and restricted to a window of
-    positions.  This is a genuine tensor network on the lattice whose contraction
-    order is non-trivial; the order is optimised with TNCO (fallback: opt_einsum) and
-    the network is contracted with opt_einsum (``build_factorized_lattice``,
-    ``optimize_path``, ``contract``, ``factorized_response``).
+    MLP) with frozen attention patterns and the exact per-position LayerNorm
+    Jacobians, projected onto an r-dimensional basis of the residual stream and
+    restricted to a window of positions.  This is a genuine tensor network on the
+    lattice whose contraction order is non-trivial; the order is optimised with TNCO
+    (fallback: opt_einsum) and the network is contracted with opt_einsum
+    (``build_factorized_lattice``, ``optimize_path``, ``contract``,
+    ``factorized_response``).
+
+The frozen-attention linear response (the model's exact first-order response with
+the softmax patterns held at their unperturbed values, ``frozen_attention`` /
+``linear_response_jvp(..., attention_patterns=cache.attn)``) is the reference that
+separates the terms of the factorisation error (b)-(c): with ``r = d`` the lattice
+equals it up to float32 round-off, so what remains of (b)-(c) is the frozen-attention
+term alone.
 
 Model structure (GPT-NeoX, parallel residual)::
 
@@ -32,15 +40,18 @@ Factorised encoding of block ``l`` (window of ``T_w`` positions, basis ``P [d, r
 * ``G_l[b_l, t_{l+1}, t_l]``: skip -> ``I``; head h -> ``A^h`` restricted to the window
   (rows = output / query positions); MLP -> ``I``,
 * ``K_l[b_l, t_l, i_{l+1}, i_l]``: skip -> ``I_r`` for every ``t_l``; head h ->
-  ``M^h = P^T W_O^h W_V^h diag(gamma1) / sigma1_mean P`` broadcast over ``t_l``
-  (``sigma1_mean`` = mean LN1 std over the window: frozen-LN approximation, the LN
-  mean-centering / normalisation projection is dropped); MLP ->
-  ``M_t = P^T W_out diag(act'(z_t)) W_in diag(gamma2) / sigma2_t P`` with ``z_t`` the
-  MLP pre-activation at position ``t`` recomputed from the cache.
+  ``M^h_t = P^T W_O^h W_V^h J_LN1,t P`` per source position ``t_l``; MLP ->
+  ``M_t = P^T W_out diag(act'(z_t)) W_in J_LN2,t P`` with ``z_t`` the MLP
+  pre-activation at position ``t`` recomputed from the cache.  ``J_LN,t`` is the
+  LayerNorm Jacobian at position ``t``: exact by default
+  (``gamma / sigma_t (I - 11^T/d - n_t n_t^T/d)``, ``n_t`` the normalised state), or
+  the frozen-scale approximation ``diag(gamma) / sigma`` (``ln_mode="frozen"``, heads
+  with the window-mean ``sigma1_mean``, MLP with ``sigma2_t``; kept only as an
+  ablation).
 
 The map of one block is ``sum_{b_l, t_l} G_l[b, t', t] K_l[b, t, i', i]``: ``t_l`` is a
 hyper-index shared by ``G_l`` and ``K_l`` (and by ``G_{l-1}``).  Memory per block is
-``(2+H) * T_w * r * r`` floats for ``K_l``.  The source vector is
+``(2+H) * T_w * r * r`` floats for ``K_l`` in both LN modes.  The source vector is
 ``v[t_0, i_0] = onehot(position) (x) (P^T direction)``; the open indices are
 ``(t_L, i_L)`` at the block output of the last layer in ``layers``.
 
@@ -49,11 +60,30 @@ Approximations of level (c) relative to level (b), all documented in
 
 1. frozen attention patterns (the first-order change of ``A^h`` through q / k is
    ignored; only the value path is linearised),
-2. frozen LayerNorm: ``d LN(h) ~ diag(gamma) / sigma`` (centering and the projection
-   on the normalised state are dropped; the head scale is the window-mean ``sigma``),
-3. truncation to the basis ``P`` (exact for ``r = d``),
-4. the window restriction is exact by causality as long as the window starts at or
-   before the perturbed position (positions before the window are never perturbed).
+2. truncation to the basis ``P`` (exact for ``r = d``),
+3. the window restriction is exact by causality as long as the window starts at or
+   before the perturbed position (positions before the window are never perturbed),
+4. only with ``ln_mode="frozen"``: ``d LN(h) ~ diag(gamma) / sigma`` (centering and
+   the projection on the normalised state are dropped).
+
+Measured decomposition (DEV01A K=0 and K=8/C1, directions ``ent`` / ``lang_dom`` /
+random, ``r = d``, relative Frobenius error at the output of the last block; pythia-14m
+step98000 with window 32 and pythia-70m with window 16): the exact-LN lattice equals
+the frozen-attention JVP to 3e-7..5e-7 (1 block) and 1e-6 (chain of blocks
+``L//3 .. L-1``) on both models.  Against that reference the frozen-LN lattice is off
+by 0.04-0.14 (14m) / 0.01-0.21 (70m) for one block and by 0.19-0.80 (14m) /
+0.13-0.51 (70m) over the chain, i.e. the dropped LN projection is a term of the same
+size as the frozen-attention term itself (frozen-attention JVP vs true JVP: 0.13-0.61
+for one block, 0.42-1.10 over the chain) and is avoidable at no cost.  Replacing the
+window mean ``sigma1_mean`` by the per-position ``sigma1_t`` without the projection
+does not help (14m chain: 0.261 vs 0.269, 0.305 vs 0.299, 0.190 vs 0.191, 0.799 vs
+0.801): the damage comes from the dropped projection ``I - 11^T/d - n n^T/d``, not
+from the scale.  Note that against the *true* JVP the two approximations can partly
+cancel (70m, K=0 ``ent`` chain: frozen 0.87 vs exact 0.91), so the frozen mode is not
+"worse" in every single number; it is uncontrolled, whereas with the exact mode the
+residual (b)-(c) at ``r = d`` *is* the frozen-attention term.  With the stage-E rank
+``r << d`` the truncation error dominates both (``tn_basis`` / ``truncation_error``
+in ``lsne.experiments.stage_e_tn``).
 """
 from __future__ import annotations
 
@@ -74,10 +104,14 @@ from .model import CacheOut, Injector, ModelBundle, _first_tensor, _get_hidden
 
 __all__ = [
     "LatticeTN", "pca_basis", "head_weights", "attention_from_heads",
-    "linear_response_jvp", "build_factorized_lattice", "einsum_expression",
-    "optimize_path", "contract", "cost_reference", "factorized_response",
-    "compare_responses",
+    "frozen_attention", "linear_response_jvp", "build_factorized_lattice",
+    "einsum_expression", "optimize_path", "contract", "cost_reference",
+    "factorized_response", "compare_responses", "LN_MODES",
 ]
+
+#: LayerNorm treatment inside the lattice: ``"exact"`` (default, full per-position
+#: Jacobian) or ``"frozen"`` (``diag(gamma)/sigma`` ablation, see module docstring).
+LN_MODES = ("exact", "frozen")
 
 
 # --------------------------------------------------------------------------------------
@@ -275,6 +309,56 @@ def attention_from_heads(mb: ModelBundle, layer: int, x: torch.Tensor,
 # --------------------------------------------------------------------------------------
 # 2. exact linear response (forward-mode AD)
 # --------------------------------------------------------------------------------------
+@contextlib.contextmanager
+def frozen_attention(mb: ModelBundle, patterns: Sequence[torch.Tensor]):
+    """Hold the softmax attention patterns of every block at ``patterns`` for all forward
+    passes run inside the context.
+
+    ``patterns`` is ``CacheOut.attn`` of the *unperturbed* run (one ``[B, H, T, T]`` tensor
+    per block, ``run_with_cache(..., need_attn=True)``).  GPT-NeoX's eager attention is
+    replaced by ``A_ref @ V`` (the softmax of the perturbed q / k is never formed), so the
+    value path is kept and the first-order change of the patterns is removed.  The
+    counter that selects the block's pattern is reset by a forward pre-hook on the base
+    model, so any number of forward passes (JVP, finite differences) can run inside.
+
+    ``linear_response_jvp`` inside this context (or with ``attention_patterns=``) is the
+    *frozen-attention* linear response: the exact reference of the lattice with
+    ``ln_mode="exact"`` and ``r = d`` (match ~1e-6 on pythia-14m) and therefore the
+    quantity that separates the frozen-attention term of the factorisation error from the
+    LayerNorm and truncation terms.  Requires ``attn_implementation="eager"``."""
+    try:
+        from transformers.models.gpt_neox import modeling_gpt_neox as mg
+        orig = mg.eager_attention_forward
+    except (ImportError, AttributeError) as e:   # pragma: no cover - other transformers versions
+        raise RuntimeError("frozen_attention needs transformers' GPT-NeoX eager attention") from e
+    impl = getattr(mb.model.config, "_attn_implementation", None) or mb.spec.attn_implementation
+    if impl != "eager":
+        raise ValueError(f"frozen_attention requires attn_implementation='eager', got {impl!r}")
+    patterns = [p.detach() for p in patterns]
+    if len(patterns) != mb.n_layers:
+        raise ValueError(f"expected {mb.n_layers} attention patterns, got {len(patterns)}")
+    state = dict(i=0)
+
+    def reset(module, args, kwargs):
+        state["i"] = 0
+
+    def frozen(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
+        A = patterns[state["i"] % len(patterns)]
+        state["i"] += 1
+        if A.shape[-1] != value.shape[-2]:
+            raise ValueError(f"frozen pattern has T={A.shape[-1]} but the forward pass has T={value.shape[-2]}")
+        A = A.to(device=value.device, dtype=value.dtype)
+        return torch.matmul(A, value).transpose(1, 2).contiguous(), A
+
+    handle = mb.model.gpt_neox.register_forward_pre_hook(reset, with_kwargs=True)
+    mg.eager_attention_forward = frozen
+    try:
+        yield
+    finally:
+        mg.eager_attention_forward = orig
+        handle.remove()
+
+
 def _response_function(mb: ModelBundle, input_ids: torch.Tensor, site_from: HookSite,
                        position: int, sites_to: list[HookSite], w_pos: list[int]):
     """Build ``f(delta [d]) -> Tensor[len(sites_to), T_w, d]``: run the model with
@@ -309,7 +393,8 @@ def _fd_response(f: Callable, direction: torch.Tensor, step: float) -> torch.Ten
 def linear_response_jvp(mb: ModelBundle, input_ids: torch.Tensor, site_from: HookSite,
                         position: int, direction: torch.Tensor, layers_to: list[int],
                         window: slice, method: str = "auto",
-                        fd_step_rel: float = 0.05) -> np.ndarray:
+                        fd_step_rel: float = 0.05,
+                        attention_patterns: Optional[Sequence[torch.Tensor]] = None) -> np.ndarray:
     """Exact first-order response of the residual stream to a unit perturbation.
 
     ``direction [d]`` is added at ``(site_from, position)``; the returned array
@@ -321,7 +406,14 @@ def linear_response_jvp(mb: ModelBundle, input_ids: torch.Tensor, site_from: Hoo
     ``method``: ``"jvp"`` (forward-mode AD, ``torch.func.jvp`` through the model with
     the injection hook), ``"fd"`` (central finite differences with Richardson
     extrapolation, step ``fd_step_rel * ||h_ref||``), ``"auto"`` (jvp, falling back to
-    fd if forward-mode AD fails for this model).  No tensor network is involved."""
+    fd if forward-mode AD fails for this model).  No tensor network is involved.
+
+    ``attention_patterns`` (``CacheOut.attn`` of the unperturbed run): compute the
+    *frozen-attention* linear response instead, see :func:`frozen_attention`."""
+    if attention_patterns is not None:
+        with frozen_attention(mb, attention_patterns):
+            return linear_response_jvp(mb, input_ids, site_from, position, direction, layers_to,
+                                       window, method=method, fd_step_rel=fd_step_rel)
     input_ids = input_ids.to(mb.device)
     T = int(input_ids.shape[1])
     L = mb.n_layers
@@ -359,8 +451,14 @@ def linear_response_jvp(mb: ModelBundle, input_ids: torch.Tensor, site_from: Hoo
 # 3. factorised lattice
 # --------------------------------------------------------------------------------------
 def _block_factors(mb: ModelBundle, cache: CacheOut, layer: int, w_pos: list[int],
-                   P: torch.Tensor, ln_mode: str = "frozen") -> tuple[torch.Tensor, torch.Tensor, dict]:
-    """``G [2+H, T_w, T_w]`` and ``K [2+H, T_w, r, r]`` of block ``layer`` (float32)."""
+                   P: torch.Tensor, ln_mode: str = "exact") -> tuple[torch.Tensor, torch.Tensor, dict]:
+    """``G [2+H, T_w, T_w]`` and ``K [2+H, T_w, r, r]`` of block ``layer`` (float32).
+
+    ``ln_mode="exact"``: per-position LayerNorm Jacobians for heads and MLP (default);
+    ``"frozen"``: ``diag(gamma)/sigma`` ablation (window-mean sigma for the heads, so
+    the head factors are broadcast over ``t_l``).  Same memory in both modes."""
+    if ln_mode not in LN_MODES:
+        raise ValueError(f"unknown ln_mode {ln_mode!r}; expected one of {LN_MODES}")
     key = f"L{layer}.block_input"
     if key not in cache.resid:
         raise KeyError(f"cache lacks {key}; build it with sites='all_block_inputs'")
@@ -385,15 +483,14 @@ def _block_factors(mb: ModelBundle, cache: CacheOut, layer: int, w_pos: list[int
     def ln_jacobian(gamma: torch.Tensor, sig: torch.Tensor, hh: torch.Tensor, per_pos: bool) -> torch.Tensor:
         """``J_t [T_w, d, d]`` (or broadcast ``[1, d, d]``) of the LayerNorm at the window."""
         if ln_mode == "frozen":
+            # ablation: diag(gamma)/sigma, centering and normalisation projection dropped
             if per_pos:
                 return (gamma[None, :, None] / sig[:, None, None]) * torch.eye(d)[None]
             return (gamma[:, None] / sig.mean()) * torch.eye(d)[None]
-        if ln_mode == "exact":
-            # exact LN Jacobian: gamma/sigma (I - 11^T/d - n n^T/d), n = normalised state
-            n = (hh - hh.mean(-1, keepdim=True)) / sig[:, None]
-            proj = torch.eye(d)[None] - torch.ones(d, d)[None] / d - n[:, :, None] * n[:, None, :] / d
-            return (gamma[None, :, None] / sig[:, None, None]) * proj
-        raise ValueError(f"unknown ln_mode {ln_mode}")
+        # exact LN Jacobian: gamma/sigma_t (I - 11^T/d - n_t n_t^T/d), n_t = normalised state
+        n = (hh - hh.mean(-1, keepdim=True)) / sig[:, None]
+        proj = torch.eye(d)[None] - torch.ones(d, d)[None] / d - n[:, :, None] * n[:, None, :] / d
+        return (gamma[None, :, None] / sig[:, None, None]) * proj
 
     hw = head_weights(mb, layer)
     G = torch.zeros(2 + H, T_w, T_w)
@@ -424,14 +521,15 @@ def _block_factors(mb: ModelBundle, cache: CacheOut, layer: int, w_pos: list[int
     M_mlp = torch.einsum("ri,ij,tjs->trs", P.T, W_out, inner)          # [T_w, r, r]
     G[1 + H] = eye_T
     K[1 + H] = M_mlp
-    info = dict(sigma1_mean=float(sig1.mean()), sigma2=sig2.numpy().tolist())
+    info = dict(ln_mode=ln_mode, sigma1_mean=float(sig1.mean()), sigma1=sig1.numpy().tolist(),
+                sigma2=sig2.numpy().tolist())
     return G, K, info
 
 
 def build_factorized_lattice(mb: ModelBundle, cache: CacheOut, site_from: HookSite,
                              window: slice, basis, layers: range,
                              position: Optional[int] = None, direction=None,
-                             ln_mode: str = "frozen", dtype=np.float32) -> LatticeTN:
+                             ln_mode: str = "exact", dtype=np.float32) -> LatticeTN:
     """Factorised linear-response tensor network for the blocks in ``layers``.
 
     ``cache`` must come from ``run_with_cache(mb, ids, "all_block_inputs", need_attn=True)``
@@ -446,9 +544,16 @@ def build_factorized_lattice(mb: ModelBundle, cache: CacheOut, site_from: HookSi
     ``G_l(b_l, t_{l+1}, t_l)`` and ``K_l(b_l, t_l, i_{l+1}, i_l)``.  Open indices:
     ``(t_L, i_L)`` with ``L = layers.stop`` (block output of the last block).
 
-    ``ln_mode``: ``"frozen"`` (spec: ``diag(gamma)/sigma``, window-mean sigma for the
-    heads) or ``"exact"`` (full per-position LayerNorm Jacobian incl. centering, for
-    heads and MLP; same memory)."""
+    ``ln_mode``: ``"exact"`` (default; the full per-position LayerNorm Jacobian
+    ``gamma/sigma_t (I - 11^T/d - n_t n_t^T/d)`` for heads and MLP: with ``r = d`` the
+    lattice then equals the frozen-attention linear response up to round-off) or
+    ``"frozen"`` (ablation only: ``diag(gamma)/sigma`` with the window-mean sigma for the
+    heads and the per-position sigma for the MLP, centering / normalisation projection
+    dropped; adds an error of the size of the frozen-attention term, see the module
+    docstring).  Both modes allocate the same tensors; the mode is recorded in
+    ``meta["ln_mode"]`` and ``meta["approximations"]``."""
+    if ln_mode not in LN_MODES:
+        raise ValueError(f"unknown ln_mode {ln_mode!r}; expected one of {LN_MODES}")
     layers = list(layers)
     if not layers:
         raise ValueError("layers is empty")
@@ -500,9 +605,9 @@ def build_factorized_lattice(mb: ModelBundle, cache: CacheOut, site_from: HookSi
         n_tensors=len(tensors), dtype=np.dtype(dtype).name,
         approximations=[
             "frozen attention patterns (value path only; dA/dq, dA/dk ignored)",
-            ("frozen LayerNorm: diag(gamma)/sigma, centering and normalisation projection dropped; "
-             "head sigma = window mean" if ln_mode == "frozen" else
-             "exact per-position LayerNorm Jacobian"),
+            ("frozen LayerNorm (ablation): diag(gamma)/sigma, centering and normalisation projection "
+             "dropped; head sigma = window mean" if ln_mode == "frozen" else
+             "exact per-position LayerNorm Jacobian (no LN approximation)"),
             f"residual stream truncated to r={r} of d={mb.d_model} basis directions",
             "position window restriction (exact by causality for positions >= window start)",
         ],
@@ -657,13 +762,14 @@ def cost_reference(tn: LatticeTN, max_dp_tensors: int = 40) -> dict:
 # --------------------------------------------------------------------------------------
 def factorized_response(mb: ModelBundle, cache: CacheOut, site_from: HookSite, position: int,
                         direction, window: slice, basis, layers: range,
-                        backend: str = "tnco", ln_mode: str = "frozen",
+                        backend: str = "tnco", ln_mode: str = "exact",
                         return_info: bool = False, **kw):
     """Linear response at the block output of ``layers[-1]`` (window positions, mapped
     back to the full residual dimension): ``[T_w, d] = (contract(TN)[t, :]) @ P^T``.
 
-    Builds the lattice, optimises the path with ``backend`` and contracts.  With
-    ``return_info=True`` also returns ``dict(tn, path_info)``."""
+    Builds the lattice (``ln_mode`` as in ``build_factorized_lattice``; ``"exact"`` by
+    default, ``"frozen"`` for the LN ablation), optimises the path with ``backend`` and
+    contracts.  With ``return_info=True`` also returns ``dict(tn, path_info)``."""
     tn = build_factorized_lattice(mb, cache, site_from, window, basis, layers,
                                   position=position, direction=direction, ln_mode=ln_mode)
     info = optimize_path(tn, backend=backend, **kw)

@@ -5,9 +5,10 @@ import torch
 
 from lsne.config import HookSite
 from lsne.model import run_with_cache
-from lsne.dynamics import (DamageMap, ca_complexity, ca_symbolize, damage_spreading,
-                           growth_exponent, lexicon_from_axis, logit_lens_trajectory, lz76,
-                           nonmonotonicity_index, spreading_front, update_norm_profile)
+from lsne.dynamics import (CA_MASS_FLOOR_FACTOR, DamageMap, ca_complexity, ca_marker_mass, ca_mass_floor,
+                           ca_symbolize, damage_spreading, growth_exponent, lexicon_from_axis,
+                           logit_lens_trajectory, lz76, nonmonotonicity_index, spreading_front,
+                           symbolize_masses, update_norm_profile)
 
 
 @pytest.fixture(scope="module")
@@ -163,6 +164,45 @@ def test_ca_symbolize(mb, tok, cache, direction):
     assert S3.shape == (L + 1, T)
     with pytest.raises(ValueError):
         ca_symbolize(mb, cache, dict(E=[], D=[1]))
+
+
+def test_ca_symbolize_mass_floor(mb, tok, cache):
+    """N is a real symbol: sites with negligible marker mass are N, not labelled by the
+    sign of a ~1e-4 difference (finding: floor-less rule == sign(mass_D - mass_E))."""
+    L = mb.n_layers
+    T = cache.resid[cache.sites[0].key].shape[1]
+    lex = _lexicon(tok)
+    mE, mD = ca_marker_mass(mb, cache, lex)
+    assert mE.shape == mD.shape == (L + 1, T) and (mE >= 0).all() and (mD >= 0).all() and (mE + mD <= 1 + 1e-6).all()
+    floor = ca_mass_floor("auto", len(lex["E"]) + len(lex["D"]), mb.vocab)
+    assert floor == pytest.approx(CA_MASS_FLOOR_FACTOR * 10 / mb.vocab)
+    assert ca_mass_floor(0.0, 10, mb.vocab) == 0.0 and ca_mass_floor(0.01, 10, mb.vocab) == 0.01
+    with pytest.raises(ValueError):
+        ca_mass_floor("median", 10, mb.vocab)
+    with pytest.raises(ValueError):
+        ca_mass_floor(-1.0, 10, mb.vocab)
+    # pure symbolisation rule
+    S = symbolize_masses(np.array([[1e-6, 0.2, 0.3]]), np.array([[2e-6, 0.1, 0.3]]), mass_floor=1e-3)
+    assert S.tolist() == [[0, 1, 0]]                       # negligible -> N, tie -> N
+    assert symbolize_masses(np.array([1e-6]), np.array([2e-6]), mass_floor=0.0).tolist() == [2]
+    assert symbolize_masses(np.array([0.2, 0.2]), np.array([0.1, 0.5]), thresholds=(0.5, 0.9)).shape == (2, 2)
+    with pytest.raises(ValueError):
+        symbolize_masses(np.zeros(3), np.zeros(2))
+    # on the model: the floor-less rule has (almost) no N; the default floor labels the
+    # sites of negligible marker mass N and nothing else changes
+    S0 = ca_symbolize(mb, cache, lex, mass_floor=0.0)
+    S_def = ca_symbolize(mb, cache, lex)
+    assert np.array_equal(S_def, ca_symbolize(mb, cache, lex, mass_floor="auto"))
+    tot = mE + mD
+    assert np.array_equal(S_def == 0, (tot < floor) | (S0 == 0))
+    assert (S_def[tot >= floor] == S0[tot >= floor]).all()
+    assert (S0 == 0).mean() < 0.05 and (S_def == 0).any()
+    assert (S_def[0] == 0).mean() > (S_def[-1] == 0).mean()       # embeddings carry less marker evidence
+    assert (S_def[-1] == 1).any()                                   # English text still reads E at the end
+    # a floor above every possible mass -> all N; a stricter floor never adds E/D symbols
+    assert (ca_symbolize(mb, cache, lex, mass_floor=1.5) == 0).all()
+    S_hi = ca_symbolize(mb, cache, lex, mass_floor=10 * floor)
+    assert ((S_hi != 0) <= (S_def != 0)).all() and (S_hi == 0).sum() >= (S_def == 0).sum()
 
 
 def test_lz76_and_ca_complexity():

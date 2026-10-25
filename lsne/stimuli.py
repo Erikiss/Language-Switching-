@@ -15,6 +15,27 @@ Conventions (docs/SPEC.md, docs/DESIGN.md section 2, data/stimuli/SCHEMA.md):
 * The original State 2143 context is treated as a family of ``kind="original"``: six
   switchable units (one text segment each, already carrying their whitespace and
   punctuation) plus the fixed English tail; unit texts are concatenated *directly*.
+
+Unit-level invariants versus segment-level realisation
+------------------------------------------------------
+The dossier invariants "unit 1 and unit 10 always E, unit 9 always D in mixed
+conditions" hold for the **unit-level masks** (``config.MASKS_UNIT_LEVEL``).  The C
+table of DESIGN section 2.1 is normative for how a switch at the boundary k -> k+1 is
+*realised*: C2 moves ``adj_k`` and C3 moves ``pred_k adj_k`` into the language of unit
+k+1, i.e. **inside** unit k.  Consequently, at segment level,
+
+* unit 9 is entirely German only for C1; for C2 it is ``D D E`` and for C3 ``D E E``
+  (the final D -> E switch is realised inside unit 9);
+* unit 1 is entirely English except for K = 8 (switch at 1 -> 2): C2 gives ``E E D``,
+  C3 gives ``E D D``;
+* unit 10 is entirely English in every C1/C2/C3 condition and for K = 16; for K = 28
+  (28 switches over 29 segment boundaries) unit 10 is ``D E E``.
+
+:func:`unit_composition` reports this per unit and the tests assert the full table.
+Measurement sites must therefore be defined by *language*, not by unit index:
+:func:`last_switched_position` gives the last German token of the context (the token
+right before the final D -> E switch), which is comparable across C levels; the last
+token of unit 9 is German only for C1.
 """
 from __future__ import annotations
 
@@ -279,12 +300,30 @@ def count_switches(mask: Sequence[str]) -> int:
 
 
 def unit_level_masks(K: int) -> list[str]:
-    """Dossier unit-level mask for K in {0, 2, 4, 8} as a list of 'E'/'D' per unit."""
+    """Dossier unit-level mask for K in {0, 2, 4, 8} as a list of 'E'/'D' per unit.
+
+    These masks carry the dossier invariants (unit 1 and unit 10 E, unit 9 D for K > 0,
+    last switch before unit 10).  At segment level the C2/C3 realisation moves segments of
+    a unit into the neighbouring language, see :func:`segment_masks_from_unit_mask` and
+    :func:`unit_composition`."""
     if K not in MASKS_UNIT_LEVEL:
         raise ValueError(f"no unit-level mask for K={K}; available: {sorted(MASKS_UNIT_LEVEL)}")
     m = list(MASKS_UNIT_LEVEL[K])
     assert count_switches(m) == K, (K, m)
     return m
+
+
+def unit_composition(mask: Sequence[str], n_seg: int = len(SEGMENT_NAMES)) -> list[str]:
+    """Per-unit language composition of a segment-level mask: one string of ``n_seg``
+    characters per unit (``"DDE"`` = subj and pred German, adj English).
+
+    This is the quantity the unit-level invariants have to be checked against: a unit is
+    "entirely German" only if its string is ``"D" * n_seg``."""
+    m = list(mask)
+    n_seg = int(n_seg)
+    if n_seg < 1 or len(m) % n_seg != 0:
+        raise ValueError(f"mask length {len(m)} is not a multiple of {n_seg} segments per unit")
+    return ["".join(m[i:i + n_seg]) for i in range(0, len(m), n_seg)]
 
 
 def _alternation_mask(n_segments: int, K: int) -> list[str]:
@@ -329,7 +368,13 @@ def segment_masks_from_unit_mask(unit_mask: Sequence[str], C: str = "C1") -> lis
         (switch before the adjunct; the sentence frame stays open).
     C3: for a switch at k -> k+1, ``pred_k`` and ``adj_k`` take m_{k+1}
         (switch between subject and verb, across subject-verb agreement).
-    The number of switches is preserved."""
+    The number of switches is preserved.
+
+    Note that for C2/C3 the switch is realised *inside* unit k, so the unit-level
+    invariants (unit 1 / 10 all E, unit 9 all D) do not carry over to the segment
+    level: with the dossier masks unit 9 ends in English (``D D E`` / ``D E E``) and for
+    K = 8 unit 1 ends in German (``E E D`` / ``E D D``).  Use :func:`unit_composition`
+    to inspect this and :func:`last_switched_position` for a language-defined site."""
     m = list(unit_mask)
     bad = [x for x in m if x not in LANGS]
     if bad:
@@ -356,7 +401,13 @@ def segment_masks(n_units: int = 10, K: int = 0, C: str = "C1") -> list[str]:
 
     C1/C2/C3 apply `segment_masks_from_unit_mask` to the dossier unit-level mask of K
     (`unit_level_masks`); "seg" is the segment-level alternation with K in {16, 28}
-    (see `_alternation_mask`).  The number of switches always equals K."""
+    (see `_alternation_mask`).  The number of switches always equals K.
+
+    Segment-level composition of the fixed units (see the module notes): unit 10 is
+    all English except for K = 28 (``D E E``); unit 9 is all German for C1 only
+    (C2 ``D D E``, C3 ``D E E``, K = 16 ``D D E``, K = 28 ``E D E``); unit 1 is all
+    English except for K = 8 at C2 (``E E D``) / C3 (``E D D``) and the "seg"
+    conditions (K = 16 ``E D D``, K = 28 ``E D E``)."""
     if C == "seg":
         if K not in K_LEVELS_EXTREME:
             raise ValueError(f"C='seg' is defined for K in {K_LEVELS_EXTREME}, got {K}")
@@ -665,6 +716,54 @@ def build_variants(family: Family, tokenizer, K_levels=K_LEVELS, C_levels=C_LEVE
         for K in K_LEVELS_EXTREME:
             out.append(make_variant(family, segment_masks(family.n_units, K, "seg"), K, "seg", tokenizer))
     return out
+
+
+def last_position_in_language(v: Variant, lang: str = "D", before_tail: bool = True) -> Optional[int]:
+    """Index of the last context token whose segment language is ``lang`` (``None`` if
+    there is none).  With ``before_tail`` (default) only positions before the tail
+    (``t < tail_start``) are considered; the tail is English in every variant anyway."""
+    if lang not in LANGS:
+        raise ValueError(f"lang must be 'E' or 'D', got {lang!r}")
+    langs = list(v.annot.get("lang", []))
+    stop = int(v.tail_start) if before_tail else len(langs)
+    for t in range(min(stop, len(langs)) - 1, -1, -1):
+        if langs[t] == lang:
+            return t
+    return None
+
+
+def last_switched_position(v: Variant) -> int:
+    """Language-defined measurement site: the last German token of the context.
+
+    For every mixed variant (K > 0) this is the token immediately before the final
+    D -> E switch, whatever the structure level: the end of unit 9 for C1, the end of
+    ``pred_9`` for C2, the end of ``subj_9`` for C3, and the last German segment of the
+    K = 16 / 28 conditions (for the original State 2143 family: the last German unit).
+    The site is therefore always a German token and comparable across C, unlike the
+    last token of unit 9, which is English for C2/C3 and the "seg" conditions.
+
+    For a monolingual variant (K = 0, no German token) the position-matched fallback is
+    the last token of the last switchable unit (unit 9 of a standard family, i.e. the
+    C1 site; the last unit before the tail of the original family); it is always
+    ``< tail_start``."""
+    pos = last_position_in_language(v, "D", before_tail=True)
+    if pos is not None:
+        return int(pos)
+    tail_start = int(v.tail_start)
+    units = [int(u) for u in v.annot.get("unit", [])][:tail_start]
+    if not units:
+        return max(0, tail_start - 1)
+    # standard family: unit 10 is English under every dossier mask, the last switched unit
+    # is unit 9 (= n_units - 1); original family: every unit before the tail is switchable
+    # and its K=5 mask ends in German, so the last unit before the tail is the match
+    target_unit = max(units) if _is_original_variant(v) else max(units) - 1
+    cands = [t for t, u in enumerate(units) if u == target_unit]
+    return int(cands[-1]) if cands else max(0, tail_start - 1)
+
+
+def _is_original_variant(v: Variant) -> bool:
+    """True for variants of the State 2143 family (``C == "orig"`` / ``text`` segments)."""
+    return str(getattr(v, "C", "")) == "orig" or any(s.name == "text" for s in getattr(v, "segments", []) or [])
 
 
 def reference_variant(variants: Sequence[Variant]) -> Variant:

@@ -10,7 +10,8 @@ the token position. Implemented here:
   non-monotonicity index;
 * update-norm profile between consecutive snapshots;
 * D9 cellular-automaton view: symbolisation of each site as N/E/D from logit-lens mass on
-  language-marker tokens, with entropy / activity / LZ76 complexity measures.
+  language-marker tokens (E/D only above an absolute marker-mass floor, otherwise N),
+  with entropy / activity / LZ76 complexity measures.
 
 All outputs are numpy arrays or plain floats; only the model calls use torch.
 """
@@ -29,6 +30,10 @@ _NORM_EPS = 1e-12
 _D_CLIP = 1e-12
 #: Symbols of the cellular-automaton view.
 CA_N, CA_E, CA_D = 0, 1, 2
+#: Default absolute marker-mass floor of :func:`ca_symbolize`, as a multiple of the
+#: uniform lens baseline ``n_markers / vocab``: a site is labelled E or D only if the
+#: logit lens puts at least this many times the uniform mass on the marker tokens.
+CA_MASS_FLOOR_FACTOR = 10.0
 
 
 # --------------------------------------------------------------------------------------
@@ -315,18 +320,17 @@ def lexicon_from_axis(mb: ModelBundle, lang_axis, top_k: int = 25) -> dict:
     return dict(D=order[:top_k].cpu().tolist(), E=order[-top_k:].cpu().tolist())
 
 
-def ca_symbolize(mb: ModelBundle, cache: CacheOut, lexicon_ids=None, lang_axis=None,
-                 thresholds: Sequence[float] = (0.5,)) -> np.ndarray:
-    """Symbolise every lattice site (snapshot, position) as N=0 / E=1 / D=2.
+def resolve_markers(mb: ModelBundle, lexicon_ids=None, lang_axis=None) -> dict:
+    """The marker lexicon :func:`ca_symbolize` will use: ``dict(E=[ids], D=[ids])`` from
+    ``lexicon_ids`` or, if that is unusable, derived from ``lang_axis``
+    (:func:`lexicon_from_axis`)."""
+    E, Dm = _resolve_markers(mb, lexicon_ids, lang_axis)
+    return dict(E=[int(i) for i in E.tolist()], D=[int(i) for i in Dm.tolist()])
 
-    Per site the logit-lens probability mass on the English marker ids ``lexicon_ids['E']``
-    (``mass_E``) and on the German markers ``lexicon_ids['D']`` (``mass_D``) is computed;
-    the symbol is D if ``mass_D > thr * (mass_E + mass_D)`` and ``mass_D > mass_E``, E if
-    the same holds for ``mass_E``, else N. With no usable lexicon and a ``lang_axis``
-    (Direction or vector) the markers are derived from the axis through the unembedding
-    (:func:`lexicon_from_axis`). Returns int8 ``[n_snapshots, T]`` for a single threshold
-    and ``[n_thresholds, n_snapshots, T]`` for several.
-    """
+
+def _resolve_markers(mb: ModelBundle, lexicon_ids, lang_axis) -> tuple[torch.Tensor, torch.Tensor]:
+    """English / German marker id tensors from a lexicon dict or, failing that, a language
+    axis (:func:`lexicon_from_axis`); raises if either list ends up empty."""
     # tolerate the SPEC argument order (lang_axis before lexicon_ids)
     if isinstance(lang_axis, dict) and not isinstance(lexicon_ids, dict):
         lexicon_ids, lang_axis = lang_axis, lexicon_ids
@@ -338,24 +342,93 @@ def ca_symbolize(mb: ModelBundle, cache: CacheOut, lexicon_ids=None, lang_axis=N
         E, Dm = _marker_ids(mb, lex["E"]), _marker_ids(mb, lex["D"])
     if E.numel() == 0 or Dm.numel() == 0:
         raise ValueError("ca_symbolize needs non-empty 'E' and 'D' marker id lists (or a lang_axis)")
-    thr = [float(t) for t in thresholds]
-    if not thr:
-        raise ValueError("thresholds must not be empty")
+    return E, Dm
+
+
+def ca_mass_floor(mass_floor, n_markers: int, vocab: int) -> float:
+    """Absolute marker-mass floor used by :func:`ca_symbolize`.
+
+    ``mass_floor`` is either a number (absolute probability mass, ``0`` disables the
+    floor) or ``"auto"`` = ``CA_MASS_FLOOR_FACTOR * n_markers / vocab``, i.e. a fixed
+    multiple of the mass a *uniform* lens distribution would put on the ``n_markers``
+    marker tokens (for 12 markers and the Pythia vocabulary about 2.4e-3)."""
+    if isinstance(mass_floor, str):
+        if mass_floor != "auto":
+            raise ValueError(f"mass_floor must be a number or 'auto', got {mass_floor!r}")
+        return float(CA_MASS_FLOOR_FACTOR * int(n_markers) / max(int(vocab), 1))
+    f = float(mass_floor)
+    if not np.isfinite(f) or f < 0:
+        raise ValueError(f"mass_floor must be finite and >= 0, got {mass_floor!r}")
+    return f
+
+
+def ca_marker_mass(mb: ModelBundle, cache: CacheOut, lexicon_ids=None, lang_axis=None) -> tuple[np.ndarray, np.ndarray]:
+    """Logit-lens probability mass on the English and German marker tokens at every
+    lattice site: ``(mass_E, mass_D)``, each ``[n_snapshots, T]`` float64."""
+    E, Dm = _resolve_markers(mb, lexicon_ids, lang_axis)
     keys = [s.key for s in cache.sites] if cache.sites else list(cache.resid.keys())
     T = int(cache.resid[keys[0]].shape[1])
-    S = np.zeros((len(thr), len(keys), T), dtype=np.int8)
+    mE = np.zeros((len(keys), T), dtype=np.float64)
+    mD = np.zeros((len(keys), T), dtype=np.float64)
     with torch.no_grad():
         for l, k in enumerate(keys):
             p = torch.softmax(logit_lens(mb, cache.resid[k][0]), dim=-1).cpu()   # [T, V]
-            mE = p[:, E].sum(-1).numpy()
-            mD = p[:, Dm].sum(-1).numpy()
-            tot = mE + mD
-            for i, th in enumerate(thr):
-                is_D = (mD > th * tot) & (mD > mE)
-                is_E = (mE > th * tot) & (mE > mD)
-                S[i, l][is_D] = CA_D
-                S[i, l][is_E] = CA_E
+            mE[l] = p[:, E].sum(-1).numpy()
+            mD[l] = p[:, Dm].sum(-1).numpy()
+    return mE, mD
+
+
+def symbolize_masses(mass_E: np.ndarray, mass_D: np.ndarray, thresholds: Sequence[float] = (0.5,),
+                     mass_floor: float = 0.0) -> np.ndarray:
+    """Symbol field from marker masses (pure numpy part of :func:`ca_symbolize`).
+
+    A site is D if ``mass_D > thr * (mass_E + mass_D)``, ``mass_D > mass_E`` **and**
+    ``mass_E + mass_D >= mass_floor``; E symmetrically; otherwise N.  The absolute floor
+    is what makes N a real symbol: without it the rule reduces to ``sign(mass_D -
+    mass_E)`` and sites where the lens puts negligible mass on *both* marker sets (early
+    snapshots, mid-word positions) are labelled by noise.  Returns int8 arrays shaped
+    like the inputs for one threshold, with a leading threshold axis for several."""
+    mE = np.asarray(mass_E, dtype=np.float64)
+    mD = np.asarray(mass_D, dtype=np.float64)
+    if mE.shape != mD.shape:
+        raise ValueError(f"mass arrays differ in shape: {mE.shape} vs {mD.shape}")
+    thr = [float(t) for t in thresholds]
+    if not thr:
+        raise ValueError("thresholds must not be empty")
+    floor = float(mass_floor)
+    tot = mE + mD
+    enough = tot >= floor if floor > 0 else np.ones_like(tot, dtype=bool)
+    S = np.zeros((len(thr),) + mE.shape, dtype=np.int8)
+    for i, th in enumerate(thr):
+        is_D = (mD > th * tot) & (mD > mE) & enough
+        is_E = (mE > th * tot) & (mE > mD) & enough
+        S[i][is_D] = CA_D
+        S[i][is_E] = CA_E
     return S[0] if len(thr) == 1 else S
+
+
+def ca_symbolize(mb: ModelBundle, cache: CacheOut, lexicon_ids=None, lang_axis=None,
+                 thresholds: Sequence[float] = (0.5,), mass_floor="auto") -> np.ndarray:
+    """Symbolise every lattice site (snapshot, position) as N=0 / E=1 / D=2.
+
+    Per site the logit-lens probability mass on the English marker ids ``lexicon_ids['E']``
+    (``mass_E``) and on the German markers ``lexicon_ids['D']`` (``mass_D``) is computed;
+    the symbol is D if ``mass_D > thr * (mass_E + mass_D)``, ``mass_D > mass_E`` and the
+    total marker mass reaches the absolute floor ``mass_E + mass_D >= mass_floor``; E if
+    the same holds for ``mass_E``; else N (no marker evidence).  ``mass_floor`` is an
+    absolute probability mass or ``"auto"`` (default: :data:`CA_MASS_FLOOR_FACTOR` times
+    the uniform baseline ``n_markers / vocab``, see :func:`ca_mass_floor`); ``0`` restores
+    the floor-less rule, under which N only occurs for an exact tie.  With no usable
+    lexicon and a ``lang_axis`` (Direction or vector) the markers are derived from the
+    axis through the unembedding (:func:`lexicon_from_axis`).  Returns int8
+    ``[n_snapshots, T]`` for a single threshold and ``[n_thresholds, n_snapshots, T]``
+    for several.
+    """
+    E, Dm = _resolve_markers(mb, lexicon_ids, lang_axis)
+    lex = dict(E=E.tolist(), D=Dm.tolist())
+    mE, mD = ca_marker_mass(mb, cache, lex)
+    floor = ca_mass_floor(mass_floor, E.numel() + Dm.numel(), mb.vocab)
+    return symbolize_masses(mE, mD, thresholds, floor)
 
 
 def lz76(seq: Sequence[int]) -> int:

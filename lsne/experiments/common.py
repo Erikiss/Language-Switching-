@@ -56,8 +56,18 @@ MARKER_WORDS = {
     "E": (" the", " and", " of", " is", " to", " in"),
     "D": (" der", " die", " und", " ist", " das", " nicht"),
 }
-#: Position classes evaluated by the counterfactual attribution (stage C).
-PATCH_CLASSES = ("ws", "punct", "boundary", "word_start", "word_cont", "switch_context", "tail")
+#: Position classes evaluated by the counterfactual attribution (stage C).  ``delim`` is
+#: the pre-registered union class R_ws+punct+boundary measured as ONE patch set
+#: (PREREGISTRATION.md section 3, contrast 3; DESIGN section 4.1), ``post_punct`` the
+#: tokenizer-adequate stand-in for a whitespace token (the space-carrying token after a
+#: punctuation token).  ``ws`` (whitespace-only tokens) is kept as a pre-registered
+#: per-class row although it is empty by construction for the stimulus families under the
+#: GPT-NeoX BPE (the space is attached to the following word); it is measurable on the
+#: original-2143 context (newline tokens) and flagged ``measurable=False`` elsewhere.
+PATCH_CLASSES = ("ws", "punct", "boundary", "delim", "post_punct", "word_start", "word_cont",
+                 "switch_context", "tail")
+#: The pre-registered confirmatory class of contrast 3 (R_delim - R_random).
+PREREG_PATCH_CLASS = "delim"
 #: Standard id columns of every tidy table.
 ID_COLS = ("tag", "family", "formulation", "K", "C", "kind", "n_tokens", "tail_start")
 
@@ -765,7 +775,8 @@ def pearson(x, y) -> float:
 
 
 __all__ = [
-    "PRIORITY", "CORE_CONDITIONS", "MARKER_WORDS", "PATCH_CLASSES", "ID_COLS", "Limits", "smoke_config",
+    "PRIORITY", "CORE_CONDITIONS", "MARKER_WORDS", "PATCH_CLASSES", "PREREG_PATCH_CLASS", "ID_COLS", "Limits",
+    "smoke_config",
     "get_limits", "cache_root", "cache_dir", "resolve_families_dir", "offline", "dossier_site",
     "depth_layer", "depth_site", "variant_kind", "is_original", "ids_tensor", "tail_positions",
     "unit_last_position", "variant_row", "dir_family", "progress", "select_families", "priority_rank",

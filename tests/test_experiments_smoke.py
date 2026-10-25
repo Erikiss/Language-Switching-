@@ -132,6 +132,21 @@ def test_smoke_stage_contents(smoke_run):
     assert np.isfinite(depth["lam"]).all() and (depth["n_fit_layers"] == 4).all()
     assert (dmg[dmg["inject"] == "dossier"]["n_fit_layers"] == 1).all()
     assert (dmg["D_final_tail"] > 0).all() and (dmg["audit_rel_err"] < 1e-3).all()
+    # each injection uses the directions fitted at its own site (rand shared, isotropic)
+    assert (dmg["dir_site"] == dmg["site"]).all()
+    assert set(depth["dir_site"]) == {"L2.block_input"} and set(dmg[dmg["inject"] == "dossier"]["dir_site"]) == {"L5.block_input"}
+    dbank = C.load_bank(_stage_dir(out, "D"), name="directions_depth")
+    assert dbank is not None and dbank.site == HookSite(2, "block_input") and {"ent", "lang_dom", "rand_00", "rand_01"} <= set(dbank.keys())
+    bank_b = C.load_bank(_stage_dir(out, "B"))
+    assert torch.allclose(dbank["rand_00"].vec, bank_b["rand_00"].vec)
+    assert not torch.allclose(dbank["lang_dom"].vec, bank_b["lang_dom"].vec)
+    dman = json.loads((_stage_dir(out, "D") / "manifest.json").read_text(encoding="utf-8"))
+    assert set(dman["cos_dossier_vs_depth"]) >= {"ent", "lang_dom", "rand_00"} and dman["cos_dossier_vs_depth"]["rand_00"] == pytest.approx(1.0)
+    assert dman["depth_position"].endswith("last_switched_position") and dman["gen"]["n_null"] == 4
+    # the depth injection sits on a German token for every mixed variant, on unit 9 for K=0
+    mixed = depth[depth["K"] > 0]
+    assert (mixed["inject_lang"] == "D").all() and (depth[(depth["K"] == 0) & (depth["kind"] == "standard")]["inject_unit"] == 9).all()
+    assert (depth["inject_pos"] < depth["tail_start"]).all() and (dmg[dmg["inject"] == "dossier"]["inject_pos"] == dmg[dmg["inject"] == "dossier"]["n_tokens"] - 1).all()
     phase = pd.read_csv(_stage_dir(out, "D") / "damage_phase.csv")
     assert (phase[phase["dir_family"] == "rand"]["n"] == 2).all()
     lens = pd.read_csv(_stage_dir(out, "D") / "lens.csv")
@@ -140,13 +155,21 @@ def test_smoke_stage_contents(smoke_run):
     assert summ["nmi_last"].between(0, 1).all()
     ca = pd.read_csv(_stage_dir(out, "D") / "ca.csv")
     assert np.isfinite(ca[["spatial_entropy", "temporal_entropy", "activity", "lz76"]].to_numpy()).all()
+    # D9: the N symbol exists (absolute marker-mass floor), E/D still dominate late layers
+    assert (ca["mass_floor"] > 0).all() and (ca["frac_N"] > 0).all() and (ca["frac_N"] == ca["frac_below_floor"]).all()
+    cal = pd.read_csv(_stage_dir(out, "D") / "ca_layers.csv")
+    assert (cal[cal["layer"] == 0]["frac_N"].mean() > cal[cal["layer"] == 6]["frac_N"].mean())
     hy = pd.read_csv(_stage_dir(out, "D") / "hysteresis.csv")
-    assert set(hy["direction"]) == {"ent", "lang_dom"} and np.isfinite(hy[["area", "null_area"]].to_numpy()).all()
-    assert set(hy["K"]) >= {0, 8, 28}
+    assert set(hy["direction"]) == {"ent", "lang_dom"} and np.isfinite(hy[["area", "null_area", "null_area_sd"]].to_numpy()).all()
+    assert set(hy["K"]) >= {0, 8, 28} and (hy["n_null"] == 4).all() and (hy["n_null_pairs"] == 6).all()
     curves = pd.read_csv(_stage_dir(out, "D") / "hysteresis_curves.csv")
-    assert set(curves["branch"]) == {"up", "down", "restart_a", "restart_b"}
+    assert set(curves["branch"]) == {"up", "down", "restart_a", "restart_b", "restart_c", "restart_d"}
+    rs = curves[curves["replicate"] >= 0]
+    assert rs["seed"].min() >= 10_000 and rs.groupby(["tag", "direction"])["seed"].nunique().eq(8).all()
     rx = pd.read_csv(_stage_dir(out, "D") / "relaxation.csv")
     assert (rx["eps"] == 0.5).all() and (rx["n_new"] == 8).all()
+    assert {"tau_raw", "tau_censored", "identifiable", "reason", "b_se", "r2", "f_pvalue", "b_lo", "b_hi"} <= set(rx.columns)
+    assert (rx["tau"].notna() <= rx["identifiable"].astype(bool)).all()
     su = pd.read_csv(_stage_dir(out, "D") / "susceptibility.csv")
     assert set(su["order_parameter"]) == {"fD", "proj_lang_dom"} and set(su["eps"]) == {0.0, 0.5}
     fdt = pd.read_csv(_stage_dir(out, "D") / "fdt.csv")

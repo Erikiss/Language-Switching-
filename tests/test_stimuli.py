@@ -114,6 +114,79 @@ def test_segment_masks_from_unit_mask_arbitrary():
         S.segment_masks_from_unit_mask("EED", "seg")
 
 
+#: Segment-level composition of units 1, 9 and 10 for every (K, C) condition of the
+#: bank (DESIGN section 2.1 realises a switch at k -> k+1 inside unit k).  This is the
+#: normative table the unit-level invariants have to be read against.
+UNIT_COMPOSITION_1_9_10 = {
+    (0, "C1"): ("EEE", "EEE", "EEE"),
+    (2, "C1"): ("EEE", "DDD", "EEE"), (2, "C2"): ("EEE", "DDE", "EEE"), (2, "C3"): ("EEE", "DEE", "EEE"),
+    (4, "C1"): ("EEE", "DDD", "EEE"), (4, "C2"): ("EEE", "DDE", "EEE"), (4, "C3"): ("EEE", "DEE", "EEE"),
+    (8, "C1"): ("EEE", "DDD", "EEE"), (8, "C2"): ("EED", "DDE", "EEE"), (8, "C3"): ("EDD", "DEE", "EEE"),
+    (16, "seg"): ("EDD", "DDE", "EEE"), (28, "seg"): ("EDE", "EDE", "DEE"),
+}
+
+
+def test_unit_composition_every_condition():
+    """The per-unit composition of every (K, C) condition is exactly the documented table:
+    unit 9 is entirely German only for C1, unit 1 is entirely English except for K=8 at
+    C2/C3 and the seg conditions, unit 10 is entirely English except for K=28."""
+    conds = [(0, "C1")] + [(K, C) for K in (2, 4, 8) for C in C_LEVELS] + [(K, "seg") for K in K_LEVELS_EXTREME]
+    assert set(conds) == set(UNIT_COMPOSITION_1_9_10)
+    for K, C in conds:
+        m = S.segment_masks(10, K, C)
+        comp = S.unit_composition(m)
+        assert len(comp) == 10 and all(len(c) == 3 for c in comp)
+        assert (comp[0], comp[8], comp[9]) == UNIT_COMPOSITION_1_9_10[(K, C)], (K, C, comp)
+        if C in C_LEVELS:
+            unit = S.unit_level_masks(K) if K else ["E"] * 10
+            for k in range(10):
+                switch_after = k < 9 and unit[k] != unit[k + 1]
+                if C == "C1" or not switch_after:
+                    assert comp[k] == unit[k] * 3, (K, C, k, comp[k])
+                else:          # the switch is realised inside unit k
+                    assert comp[k] != unit[k] * 3 and comp[k][0] == unit[k] and comp[k][-1] == unit[k + 1]
+    # the unit-level invariants hold for the unit masks ...
+    for K in (2, 4, 8):
+        u = S.unit_level_masks(K)
+        assert u[0] == "E" and u[8] == "D" and u[9] == "E"
+    # ... but "unit 9 entirely German" holds at segment level for C1 only
+    assert {C for K in (2, 4, 8) for C in C_LEVELS if S.unit_composition(S.segment_masks(10, K, C))[8] == "DDD"} == {"C1"}
+    with pytest.raises(ValueError):
+        S.unit_composition(["E"] * 7)
+
+
+def test_last_switched_position_is_language_defined(variants):
+    """The depth-injection site is the last German token for every mixed variant (all C,
+    both seg conditions) and the last token of unit 9 for the monolingual variant."""
+    for tag, vs in variants.items():
+        for v in vs:
+            a = v.annot
+            pos = S.last_switched_position(v)
+            assert 0 <= pos < v.tail_start
+            if v.K == 0:
+                assert S.last_position_in_language(v, "D") is None
+                assert a["lang"][pos] == "E" and a["unit"][pos] == 9
+                assert a["unit"][pos + 1] == 10
+            else:
+                assert a["lang"][pos] == "D", (v.tag, pos)
+                assert all(x == "E" for x in a["lang"][pos + 1:]), v.tag        # last German token
+                assert pos == S.last_position_in_language(v, "D")
+                # token right before the final D -> E boundary token
+                assert a["klass"][pos + 1] == "boundary" and a["boundary_positions"][-1] == pos + 1
+                expected_unit = {"C1": 9, "C2": 9, "C3": 9, "seg": 9 if v.K == 16 else 10}[v.C]
+                assert a["unit"][pos] == expected_unit, (v.tag, a["unit"][pos])
+            assert S.last_position_in_language(v, "E", before_tail=False) == v.n_tokens - 1
+            assert S.last_position_in_language(v, "E") == v.tail_start - 1       # unit 10 ends in E everywhere
+    # C1 vs C2/C3 of the same K differ in where the last German token sits within unit 9
+    vs = variants["DEV01A"]
+    by = {(v.K, v.C): v for v in vs}
+    for K in (2, 4, 8):
+        segs = {C: by[(K, C)].annot["seg"][S.last_switched_position(by[(K, C)])] % 3 for C in C_LEVELS}
+        assert segs == {"C1": 2, "C2": 1, "C3": 0}          # adj_9 / pred_9 / subj_9
+    with pytest.raises(ValueError):
+        S.last_position_in_language(vs[0], "X")
+
+
 def test_segment_masks_errors():
     with pytest.raises(ValueError):
         S.segment_masks(10, 15, "seg")           # odd
@@ -370,7 +443,17 @@ def test_original_family_reproduces_anchor(anchor, tok):
         expected_switches = v.K + (1 if v.mask[-1] == "D" else 0)     # D->E at the tail boundary
         assert v.annot["n_switches"] == expected_switches
         assert v.annot["F100"] == pytest.approx(100.0 * v.K / (v.annot["n_words"] - 1))
+        # language-defined site: last German token, or the last token of unit 6 for K=0
+        pos = S.last_switched_position(v)
+        assert pos < v.tail_start
+        if v.K == 0:
+            assert pos == v.tail_start - 1 and v.annot["unit"][pos] == 6
+        else:
+            assert v.annot["lang"][pos] == "D" and all(x == "E" for x in v.annot["lang"][pos + 1:])
+            last_D_unit = max(i + 1 for i, m in enumerate(v.mask) if m == "D")
+            assert v.annot["unit"][pos] == last_D_unit
     assert vs[3].annot["klass"][vs[3].tail_start] == "boundary"       # K=5 ends in D
+    assert S.last_switched_position(vs[3]) == vs[3].tail_start - 1
 
 
 def render_original_all_E(fam):

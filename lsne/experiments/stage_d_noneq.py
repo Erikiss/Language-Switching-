@@ -13,19 +13,38 @@ D1 damage          ``damage``          per (variant, injection, direction, eps):
                                        (K, C, injection, dir_family, eps)
    Injections: (a) ``dossier`` = block input of the last block at the last token (the
    State-2143 site; position front), (b) ``depth`` = block input of block ``n_layers//3``
-   at the last token of unit 9 (depth growth exponent).
+   at the language-defined site :func:`lsne.stimuli.last_switched_position` (the last
+   German token of the context, i.e. the token before the final D -> E switch; for K=0
+   the position-matched last token of unit 9).  The last token of unit 9 is German only
+   for C1 (C2/C3/seg realise the final switch inside unit 9), so a unit-defined site
+   would confound the K x C phase diagram; the language, unit and token of the injected
+   position are recorded (``inject_lang``, ``inject_unit``, ``inject_token``).
+   Each injection uses the directions fitted **at its own site**: the ``dossier`` bank
+   (stage B, block input of the last block) and a second bank built at the depth site
+   (``directions_depth.npz``; ``lang_dom`` / ``ent`` are layer-specific, DESIGN section 3
+   "pro Layer"); the isotropic random directions are shared.  ``dir_site`` names the
+   direction's site in every row, the manifest records the cosine between the two
+   versions of each shared direction.
 D2 lens            ``lens``            logit-lens KL to the final prediction per snapshot
                                        (last position + tail mean), target rank / logp
                    ``lens_summary``    non-monotonicity indices per variant
                    ``update_norms``    relative update norm between snapshots
-D9 CA              ``ca``              symbol-field complexity (full field and tail columns)
-                   ``ca_layers``       symbol fractions per snapshot
+D9 CA              ``ca``              symbol-field complexity (full field and tail columns);
+                                       sites below the absolute marker-mass floor of
+                                       :func:`lsne.dynamics.ca_symbolize` are N
+                   ``ca_layers``       symbol fractions and marker mass per snapshot
 
 Generation diagnostics (core subset K=0, K=8/C1, K=28/seg; directions ``lang_dom`` and
 ``ent``; the dossier site):
 
-D3 hysteresis      ``hysteresis``, ``hysteresis_curves``
-D4 relaxation      ``relaxation``, ``relaxation_curves``
+D3 hysteresis      ``hysteresis``, ``hysteresis_curves``   null model = ``n_null`` independent
+                                      restarts per level with their own seeds (disjoint from
+                                      the ramp seed); ``null_area_sd`` / ``area_z`` summarise
+                                      the null distribution of the area
+D4 relaxation      ``relaxation``, ``relaxation_curves``   ``tau`` only when identifiable
+                                      (``identifiable``, ``reason``), raw value in ``tau_raw``,
+                                      ``tau_censored`` for bound-saturated fits, ``b``, ``b_se``,
+                                      ``r2``, ``f_pvalue`` and the bootstrap CI of ``b``
 D5 switch stats    ``switch_stats``   (on the hysteresis and relaxation samples)
 D6 susceptibility  ``susceptibility`` (constant-dose runs at 0 + ``cfg.doses_steer``)
 D7 FDT             ``fdt``            T_eff = Var_0(m) / chi for m = f_D and for the
@@ -41,9 +60,12 @@ import numpy as np
 import pandas as pd
 import torch
 
+from .. import stimuli
 from ..config import RunConfig, HookSite
-from ..dynamics import (ca_complexity, ca_symbolize, damage_spreading, growth_exponent, logit_lens_trajectory,
-                        nonmonotonicity_index, spreading_front, update_norm_profile)
+from ..directions import Direction, cosine
+from ..dynamics import (ca_complexity, ca_marker_mass, ca_mass_floor, damage_spreading, growth_exponent,
+                        logit_lens_trajectory, nonmonotonicity_index, resolve_markers, spreading_front,
+                        symbolize_masses, update_norm_profile)
 from ..generation import (block_fraction, fdt_ratio, hysteresis, language_trajectory, relaxation, schedule_const,
                           susceptibility, switch_interval_stats)
 from ..model import ModelBundle, generate_steered, run_with_cache
@@ -52,21 +74,86 @@ from . import common as C
 LATTICE_FAMILIES = ("lang_dom", "ent", "rand", "sae")
 GEN_FAMILIES = ("lang_dom", "ent")
 FRONT_THRESHOLDS = (0.01, 0.1)
+#: Independent restart replicates of the D3 null model (``Limits.gen_n_null`` overrides).
+HYST_N_NULL = 4
+#: Marker-mass floor of the D9 symbolisation (``"auto"`` = CA_MASS_FLOOR_FACTOR x uniform).
+CA_MASS_FLOOR = "auto"
 
 
 # --------------------------------------------------------------------------------------
 # D1 damage spreading
 # --------------------------------------------------------------------------------------
+def depth_injection_position(v) -> int:
+    """Position of the ``depth`` injection: the last German token of the context
+    (:func:`lsne.stimuli.last_switched_position`), which is comparable across C levels;
+    for K=0 the last token of unit 9 (the C1 site)."""
+    return int(stimuli.last_switched_position(v))
+
+
+def position_info(v, pos: int) -> dict:
+    """Language, unit, token and class of context position ``pos`` (tidy-row columns)."""
+    a = v.annot
+    pos = int(pos)
+    return dict(inject_lang=str(a["lang"][pos]), inject_unit=int(a["unit"][pos]),
+                inject_token=str(a["tokens"][pos]) if "tokens" in a else "",
+                inject_klass=str(a["klass"][pos]) if "klass" in a else "")
+
+
 def injections(mb: ModelBundle, v) -> list[tuple[str, HookSite, int]]:
+    """``(name, site, position)`` of the two D1 injections of a variant (see module notes)."""
     return [("dossier", C.dossier_site(mb), int(v.n_tokens) - 1),
-            ("depth", C.depth_site(mb), C.unit_last_position(v))]
+            ("depth", C.depth_site(mb), depth_injection_position(v))]
 
 
-def damage_tables(mb: ModelBundle, variants, bank: C.DirectionBank, dir_names, doses, enabled=True,
+def bank_for_site(banks, site: HookSite) -> C.DirectionBank:
+    """``banks`` is one :class:`~lsne.experiments.common.DirectionBank` (used at every
+    site) or a mapping ``site.key -> DirectionBank``; returns the bank of ``site``."""
+    if isinstance(banks, C.DirectionBank):
+        return banks
+    try:
+        return banks[site.key]
+    except KeyError as e:
+        raise KeyError(f"no direction bank for injection site {site.key}; available: {sorted(banks)}") from e
+
+
+def depth_bank(cfg: RunConfig, mb: ModelBundle, variants, site: HookSite, base: C.DirectionBank,
+               ctx=None, limits: C.Limits | None = None, original=None) -> C.DirectionBank:
+    """Direction bank fitted at the depth-injection ``site`` (``ent``, ``lang_dom``,
+    ``lang_probe``, ``freq``; SAE features only when ``limits.use_sae`` and a published SAE
+    exists for that site).  The random directions are isotropic and are shared with the
+    ``base`` bank (same vectors, marked ``shared_from`` in their meta).  Cached in
+    ``ctx['bank_depth']`` under :func:`~lsne.experiments.common.bank_signature`; if
+    ``base`` already sits at ``site`` it is returned unchanged."""
+    limits = limits or C.Limits()
+    variants = list(variants)
+    sig = C.bank_signature(variants, site, cfg, limits, original)
+    if ctx is not None and isinstance(ctx.get("bank_depth"), C.DirectionBank) and ctx.get("bank_depth_signature") == sig:
+        return ctx["bank_depth"]
+    if base.site == site:
+        bank = base
+    else:
+        bank = C.direction_bank(cfg, mb, variants, site, original=original, limits=limits, sae=None)
+        for n in base.rand_names:
+            bank.dirs[n] = Direction(n, base[n].vec.clone(), site, dict(base[n].meta, shared_from=base.site.key))
+        bank.meta["source"] = "built"
+        bank.meta["shared_from_base"] = dict(site=base.site.key, names=list(base.rand_names))
+        bank.meta["cos_vs_base"] = {n: cosine(base[n].vec, bank[n].vec) for n in bank if n in base}
+    if ctx is not None:
+        ctx["bank_depth"], ctx["bank_depth_signature"] = bank, sig
+    return bank
+
+
+def damage_tables(mb: ModelBundle, variants, banks, dir_names, doses, enabled=True,
                   ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    """Returns (damage, damage_profile, caches) where caches maps tag -> reference cache."""
+    """Returns (damage, damage_profile, caches) where caches maps tag -> reference cache.
+
+    ``banks`` is a single bank or a mapping ``site.key -> DirectionBank`` (see
+    :func:`bank_for_site`): every injection is made with the direction fitted at its own
+    site, recorded as ``dir_site``.  A direction missing from a site's bank is skipped
+    for that injection (one warning per name and site)."""
     rows, prof = [], []
     caches: dict = {}
+    missing: set = set()
     for v in C.progress(variants, "D1 damage", enabled=enabled):
         ids = C.ids_tensor(mb, v)
         T = int(v.n_tokens)
@@ -74,17 +161,26 @@ def damage_tables(mb: ModelBundle, variants, bank: C.DirectionBank, dir_names, d
         caches[v.tag] = ref
         tail = C.tail_positions(v)
         for inj_name, site, pos in injections(mb, v):
+            bank = bank_for_site(banks, site)
+            info = position_info(v, pos)
             positions = [p for p in tail if p >= pos] or [T - 1]
             for name in dir_names:
-                vec = bank[name].vec
+                if name not in bank:
+                    if (name, site.key) not in missing:
+                        warnings.warn(f"direction {name!r} has no version at {site.key}; skipped for the {inj_name} injection")
+                        missing.add((name, site.key))
+                    continue
+                d = bank[name]
+                vec = d.vec
                 for eps in doses:
                     dm = damage_spreading(mb, ids, site, pos, vec, float(eps), ref_cache=ref, target_id=int(v.target_id))
                     ge = growth_exponent(dm, positions)
                     fronts = {thr: spreading_front(dm, thr) for thr in FRONT_THRESHOLDS}
                     D_tail = dm.D[:, positions].mean(axis=1)                      # [L+1]
                     after = list(range(pos, T))
-                    rows.append(dict(C.variant_row(v), inject=inj_name, site=site.key, inject_layer=int(dm.inject_layer),
-                                     inject_pos=int(pos), direction=name, dir_family=C.dir_family(name), eps=float(eps),
+                    rows.append(dict(C.variant_row(v), inject=inj_name, site=site.key, dir_site=d.site.key,
+                                     inject_layer=int(dm.inject_layer), inject_pos=int(pos), **info,
+                                     direction=name, dir_family=C.dir_family(name), eps=float(eps),
                                      lam=float(ge["lam"]), intercept=float(ge["intercept"]), r2=float(ge["r2"]),
                                      n_fit_layers=int(len(ge["layers"])),
                                      D_final_tail=float(D_tail[-1]), D_final_last=float(dm.D[-1, T - 1]),
@@ -103,7 +199,8 @@ def damage_tables(mb: ModelBundle, variants, bank: C.DirectionBank, dir_names, d
                                          layer=l, snapshot=key, D_tail=float(D_tail[l]), D_last=float(dm.D[l, T - 1]),
                                          D_after_mean=float(dm.D[l, after].mean()),
                                          front01=int(fronts[0.01][l]), front1=int(fronts[0.1][l])))
-    dcols = list(C.ID_COLS) + ["inject", "site", "inject_layer", "inject_pos", "direction", "dir_family", "eps", "lam",
+    dcols = list(C.ID_COLS) + ["inject", "site", "dir_site", "inject_layer", "inject_pos", "inject_lang", "inject_unit",
+                               "inject_token", "inject_klass", "direction", "dir_family", "eps", "lam",
                                "intercept", "r2", "n_fit_layers", "D_final_tail", "D_final_last", "D_max", "cos_final_last",
                                "front01_final", "front1_final", "front01_max", "front1_max", "n_spread01_final",
                                "n_spread1_final", "n_after", "logp_target_ref", "logp_target_pert", "B", "delta_norm",
@@ -135,8 +232,12 @@ def phase_table(damage: pd.DataFrame) -> pd.DataFrame:
 # D2 logit lens, D9 cellular automaton
 # --------------------------------------------------------------------------------------
 def lens_tables(mb: ModelBundle, variants, caches: dict, lexicon: dict, lang_axis, threshold: float,
-                enabled=True) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+                enabled=True, mass_floor=CA_MASS_FLOOR) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """D2 lens tables and the D9 symbol field.  ``mass_floor`` is the absolute marker-mass
+    floor of :func:`lsne.dynamics.ca_symbolize` (``"auto"`` or a probability mass)."""
     lens_rows, summ_rows, upd_rows, ca_rows, cal_rows = [], [], [], [], []
+    markers = resolve_markers(mb, lexicon, lang_axis)
+    floor = ca_mass_floor(mass_floor, len(markers["E"]) + len(markers["D"]), mb.vocab)
     for v in C.progress(variants, "D2/D9 lens + CA", enabled=enabled):
         T = int(v.n_tokens)
         ref = caches.get(v.tag) or run_with_cache(mb, C.ids_tensor(mb, v), "all_block_inputs")
@@ -164,21 +265,26 @@ def lens_tables(mb: ModelBundle, variants, caches: dict, lexicon: dict, lang_axi
                               first_layer_target_top10=int(np.argmax(last["target_rank"][:, 0] < 10))
                               if (last["target_rank"][:, 0] < 10).any() else -1,
                               update_tail_mean=float(upd[:, tail].mean()) if tail else float("nan")))
-        # D9
-        S = ca_symbolize(mb, ref, lexicon, lang_axis=lang_axis, thresholds=(threshold,))
+        # D9: symbol field from the marker masses with the absolute floor (sites below -> N)
+        mE, mD = ca_marker_mass(mb, ref, markers)
+        tot = mE + mD
+        S = symbolize_masses(mE, mD, (threshold,), floor)
         full = ca_complexity(S)
         tl = ca_complexity(S[:, tail]) if len(tail) >= 2 else {k: float("nan") for k in full}
         ca_rows.append(dict(C.variant_row(v), **{k: float(val) for k, val in full.items()},
                             **{f"{k}_tail": float(val) for k, val in tl.items()},
                             frac_N=float((S == 0).mean()), frac_E=float((S == 1).mean()), frac_D=float((S == 2).mean()),
                             frac_D_tail=float((S[:, tail] == 2).mean()) if tail else float("nan"),
-                            frac_D_final=float((S[-1] == 2).mean()), frac_D_final_tail=float((S[-1, tail] == 2).mean()) if tail else float("nan")))
+                            frac_D_final=float((S[-1] == 2).mean()), frac_D_final_tail=float((S[-1, tail] == 2).mean()) if tail else float("nan"),
+                            mass_floor=float(floor), frac_below_floor=float((tot < floor).mean()),
+                            marker_mass_median=float(np.median(tot))))
         for l in range(S.shape[0]):
             cal_rows.append(dict(tag=v.tag, family=v.family_id, formulation=v.formulation, K=int(v.K), C=str(v.C), layer=l,
                                  frac_N=float((S[l] == 0).mean()), frac_E=float((S[l] == 1).mean()),
                                  frac_D=float((S[l] == 2).mean()),
                                  frac_D_tail=float((S[l, tail] == 2).mean()) if tail else float("nan"),
-                                 activity=float((S[l] != S[l - 1]).mean()) if l > 0 else float("nan")))
+                                 activity=float((S[l] != S[l - 1]).mean()) if l > 0 else float("nan"),
+                                 marker_mass_median=float(np.median(tot[l])), frac_below_floor=float((tot[l] < floor).mean())))
     return (pd.DataFrame(lens_rows), pd.DataFrame(summ_rows), pd.DataFrame(upd_rows), pd.DataFrame(ca_rows),
             pd.DataFrame(cal_rows))
 
@@ -208,17 +314,20 @@ def generation_tables(mb: ModelBundle, variants, bank: C.DirectionBank, dir_name
     steer = [float(e) for e in cfg.doses_steer]
     lang_axis = bank["lang_dom"].vec if "lang_dom" in bank else None
     todo = [(v, n) for v in variants for n in dir_names]
+    n_null = int(getattr(limits, "gen_n_null", HYST_N_NULL))
     for v, name in C.progress(todo, "D3-D7 generation", enabled=enabled):
         ids = C.ids_tensor(mb, v)
         vec = bank[name].vec
         idc = dict(C.variant_row(v), direction=name)
-        # D3
+        # D3 (null: n_null independent restarts per level with their own seeds)
         h = hysteresis(mb, ids, site, vec, eps_max, n_steps=limits.gen_n_steps, tokens_per_step=limits.gen_tokens_per_step,
-                       n_samples=cfg.gen_n_samples, seed=cfg.seed, temperature=cfg.gen_temperature)
+                       n_samples=cfg.gen_n_samples, seed=cfg.seed, temperature=cfg.gen_temperature, n_null=n_null)
         hy.append(dict(idc, eps_max=eps_max, n_steps=limits.gen_n_steps, tokens_per_step=limits.gen_tokens_per_step,
                        area=float(h["area"]), null_area=float(h["null_area"]), area_minus_null=float(h["area"] - h["null_area"]),
+                       null_area_sd=float(h["null_area_sd"]), area_z=float(h["area_z"]), n_null=int(h["n_null"]),
+                       n_null_pairs=int(len(h["null_areas"])),
                        up_mean=float(np.nanmean(h["up"])), down_mean=float(np.nanmean(h["down"])),
-                       restart_mean=float(np.nanmean(h["restart"])), fD_total=float(block_fraction(h["labels"])[0]),
+                       restart_mean=float(np.nanmean(h["restarts"])), fD_total=float(block_fraction(h["labels"])[0]),
                        n_switches_total=int(sum(len(s) for s in language_trajectory(mb.tokenizer, h["tokens"])["switches"]))))
         cur = h["curves"].copy()
         for k, val in idc.items():
@@ -232,11 +341,17 @@ def generation_tables(mb: ModelBundle, variants, bank: C.DirectionBank, dir_name
                            seed=cfg.seed, temperature=cfg.gen_temperature, n_boot=limits.n_boot_tau)
             pre = r["fD_t"][: limits.gen_t_on]
             post = r["fD_t"][limits.gen_t_on:]
+            fit = r["fit"]
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=RuntimeWarning)
                 rx.append(dict(idc, eps=eps, t_on=limits.gen_t_on, n_new=cfg.gen_n_new, tau=float(r["tau"]),
                                tau_lo=float(r["tau_ci"][0]), tau_hi=float(r["tau_ci"][1]),
-                               a=float(r["fit"]["a"]), b=float(r["fit"]["b"]),
+                               tau_raw=float(fit["tau_raw"]), tau_censored=bool(fit["tau_censored"]),
+                               identifiable=bool(fit["identifiable"]), reason=str(fit["reason"]),
+                               a=float(fit["a"]), b=float(fit["b"]), b_se=float(fit["b_se"]), r2=float(fit["r2"]),
+                               f_pvalue=float(fit["f_pvalue"]), n_fit=int(fit["n"]), n_eff=float(fit["n_eff"]),
+                               b_lo=float(r["b_ci"][0]), b_hi=float(r["b_ci"][1]),
+                               b_ci_excludes_zero=bool(r["b_ci_excludes_zero"]),
                                fD_pre=float(np.nanmean(pre)) if pre.size else float("nan"),
                                fD_post=float(np.nanmean(post)) if post.size else float("nan"),
                                fD_final=float(r["fD_t"][-1]), entropy_pre=float(r["entropy_t"][: limits.gen_t_on].mean()) if limits.gen_t_on > 0 else float("nan"),
@@ -292,17 +407,23 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     original = C.get_original(cfg, mb, ctx, limits)
     allv = C.all_variants(variants, original)
     site = C.dossier_site(mb)
+    dsite = C.depth_site(mb)
     bank = C.get_bank(cfg, mb, variants, site, ctx, limits, original=original, sae=kw.get("sae"))
+    dbank = depth_bank(cfg, mb, variants, dsite, bank, ctx=ctx, limits=limits, original=original)
+    banks = {site.key: bank, dsite.key: dbank}
+    if dbank is not bank:
+        C.save_bank(dbank, run_dir, name="directions_depth")
 
     lattice_dirs = bank.names(LATTICE_FAMILIES)
     if limits.limited:
         rand = bank.rand_names[:8]
         lattice_dirs = [n for n in lattice_dirs if C.dir_family(n) != "rand"] + rand
     doses = tuple(float(e) for e in limits.damage_doses) + tuple(float(e) for e in cfg.doses_steer)
-    damage, profile, caches = damage_tables(mb, allv, bank, lattice_dirs, doses, enabled=limits.progress)
+    damage, profile, caches = damage_tables(mb, allv, banks, lattice_dirs, doses, enabled=limits.progress)
     lexicon = C.marker_lexicon(mb.tokenizer)
     lens, lens_summary, upd, ca, ca_layers = lens_tables(mb, allv, caches, lexicon, bank.get("lang_dom"),
-                                                         limits.ca_threshold, enabled=limits.progress)
+                                                         limits.ca_threshold, enabled=limits.progress,
+                                                         mass_floor=CA_MASS_FLOOR)
     del caches
 
     gen_dirs = bank.names(("lang_dom",) if limits.limited else GEN_FAMILIES)
@@ -312,10 +433,19 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     tables = {"damage": damage, "damage_profile": profile, "damage_phase": phase_table(damage),
               "lens": lens, "lens_summary": lens_summary, "update_norms": upd, "ca": ca, "ca_layers": ca_layers}
     tables.update(gen)
-    return C.finish_stage(run_dir, "D", cfg, mb, tables, limits=limits, t0=t0, site=site, depth_site=C.depth_site(mb),
-                          bank_source=bank.meta.get("source", ""),
+    markers = resolve_markers(mb, lexicon, bank.get("lang_dom"))
+    return C.finish_stage(run_dir, "D", cfg, mb, tables, limits=limits, t0=t0, site=site, depth_site=dsite,
+                          depth_position="lsne.stimuli.last_switched_position",
+                          bank_source=bank.meta.get("source", ""), depth_bank_source=dbank.meta.get("source", ""),
+                          depth_directions=[n for n in lattice_dirs if n in dbank],
+                          depth_directions_missing=[n for n in lattice_dirs if n not in dbank],
+                          cos_dossier_vs_depth={n: cosine(bank[n].vec, dbank[n].vec) for n in lattice_dirs if n in dbank},
                           lattice_directions=lattice_dirs, generation_directions=gen_dirs, doses=list(doses),
-                          marker_lexicon=lexicon, n_variants=len(variants), n_core=len(core),
+                          marker_lexicon=lexicon,
+                          ca=dict(threshold=float(limits.ca_threshold), mass_floor=CA_MASS_FLOOR,
+                                  mass_floor_value=ca_mass_floor(CA_MASS_FLOOR, len(markers["E"]) + len(markers["D"]), mb.vocab)),
+                          n_variants=len(variants), n_core=len(core),
                           gen=dict(n_new=cfg.gen_n_new, n_samples=cfg.gen_n_samples, n_steps=limits.gen_n_steps,
                                    tokens_per_step=limits.gen_tokens_per_step, t_on=limits.gen_t_on,
+                                   n_null=int(getattr(limits, "gen_n_null", HYST_N_NULL)),
                                    doses_steer=list(cfg.doses_steer)))

@@ -312,9 +312,20 @@ def hysteresis_area(up, down, eps_levels) -> float:
     return trapezoid(np.asarray(down, dtype=np.float64) - np.asarray(up, dtype=np.float64), eps_levels)
 
 
+NULL_SEED_STRIDE = 10_000
+
+
+def restart_seed(seed: int, replicate: int, level: int, stride: int = NULL_SEED_STRIDE) -> int:
+    """Seed of the independent restart ``replicate`` (0-based) at dose ``level`` of the
+    hysteresis null model: ``seed + stride * (replicate + 1) + level``.  All restart seeds
+    are distinct from each other and from the ramp seed ``seed`` (for ``level < stride``),
+    so no restart shares the random stream of the ramp or of another level."""
+    return int(seed) + int(stride) * (int(replicate) + 1) + int(level)
+
+
 def hysteresis(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, direction, eps_max: float,
                n_steps: int = 8, tokens_per_step: int = 8, n_samples: int = 8, seed: int = 0,
-               temperature: float = 1.0, window: int = WINDOW) -> dict:
+               temperature: float = 1.0, window: int = WINDOW, n_null: int = 4) -> dict:
     """D3: German fraction under a dose ramp 0 -> eps_max -> 0 (ascending vs. descending).
 
     One steered generation of ``2*n_steps*tokens_per_step`` tokens follows
@@ -323,25 +334,38 @@ def hysteresis(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, directi
     ``down[s]`` the same on the descending branch at the same dose level
     ``eps_levels[s]``.  ``area = sum_s (down - up) d eps`` (trapezoid).
 
-    Null model (independent restarts, no memory): for each level an independent
+    Null model (independent restarts, no memory): ``n_null`` (>= 2) replicates, each a
     generation of ``tokens_per_step`` tokens from the prompt at constant dose
-    (:func:`schedule_const`) is run twice (seeds ``seed`` and ``seed + 1000``);
-    ``restart`` holds the first run's fractions, ``restart_b`` the second's, and
-    ``null_area`` is the same area formula applied to ``(restart_b - restart)``.  Note
-    that the ramp run and the first restart run share ``seed``, so ``up[0]`` and
-    ``restart[0]`` are measured on the same first tokens.
+    (:func:`schedule_const`) for every level.  Every (replicate, level) uses its own seed
+    :func:`restart_seed` (``seed + 10_000 * (replicate + 1) + level``), disjoint from the
+    ramp seed and from each other, so restarts are independent of the ramp and do not
+    share common random numbers across levels (both would make ``restart[0] == up[0]``
+    and correlate the null terms across levels).  ``restarts[r, l]`` holds the pooled
+    fractions; ``null_areas`` the signed areas ``hysteresis_area(restarts[a],
+    restarts[b])`` of every pair ``a < b`` (``n_null * (n_null - 1) / 2`` draws from the
+    no-memory null of the area statistic, which is symmetric around 0); ``null_area`` is
+    their mean (kept for the pre-registered contrast ``area - null_area``; it is ~0 by
+    construction), ``null_area_sd`` the root-mean-square of the null draws (the standard
+    deviation of the sign-symmetric null; defined already for one pair) and
+    ``area_z = area / null_area_sd`` (NaN if the null scale is 0).  ``restart`` /
+    ``restart_b`` alias replicates 0 and 1.
 
     Returns
     -------
-    dict(up, down, eps_levels, area, null_area, restart, restart_b, curves, tokens,
-    labels, fD_window, entropies, eps, n_steps, tokens_per_step, eps_max, site).
+    dict(up, down, eps_levels, area, null_area, null_areas, null_area_sd, area_z, n_null,
+    restarts, restart_seeds, restart, restart_b, curves, tokens, labels, fD_window,
+    entropies, eps, n_steps, tokens_per_step, eps_max, site, n_samples, seed).
     ``curves`` is a long DataFrame with one row per (branch, step): columns
-    ``branch`` ('up', 'down', 'restart_a', 'restart_b'), ``step``, ``level``, ``eps``,
-    ``k_start``, ``k_end``, ``fD`` (pooled fraction), ``fD_window`` (mean running
-    fraction), ``entropy`` (mean next-token entropy), ``n_ED`` (E/D tokens pooled).
+    ``branch`` ('up', 'down', 'restart_a', 'restart_b', 'restart_c', ...), ``replicate``
+    (-1 for the ramp branches), ``seed``, ``step``, ``level``, ``eps``, ``k_start``,
+    ``k_end``, ``fD`` (pooled fraction), ``fD_window`` (mean running fraction),
+    ``entropy`` (mean next-token entropy), ``n_ED`` (E/D tokens pooled).
     """
     vec = _as_vector(direction, mb)
     n_steps, tokens_per_step = int(n_steps), int(tokens_per_step)
+    n_null = int(n_null)
+    if n_null < 2:
+        raise ValueError("n_null must be >= 2 (at least one independent restart pair)")
     sched = schedule_ramp(eps_max, n_steps, tokens_per_step)
     n_new = sched.n_new
     res = generate_steered(mb, input_ids, site, vec, sched, n_new=n_new, n_samples=n_samples,
@@ -360,33 +384,41 @@ def hysteresis(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, directi
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             fw = float(np.nanmean(fDw[:, sl])) if fDw[:, sl].size else np.nan
-        rows.append(dict(branch=branch, step=step, level=level, eps=float(levels[level]),
-                         k_start=sl.start, k_end=sl.stop, fD=f, fD_window=fw,
+        rows.append(dict(branch=branch, replicate=-1, seed=int(seed), step=step, level=level,
+                         eps=float(levels[level]), k_start=sl.start, k_end=sl.stop, fD=f, fD_window=fw,
                          entropy=float(ent[:, sl].mean()), n_ED=n_ed))
 
-    # null model: independent restarts at every level (two independent runs)
-    restart_a = np.full(n_steps, np.nan)
-    restart_b = np.full(n_steps, np.nan)
-    for level, eps in enumerate(levels):
-        for tag, s, store in (("restart_a", int(seed), restart_a), ("restart_b", int(seed) + 1000, restart_b)):
+    # null model: n_null independent restarts at every level, each with its own seed
+    restarts = np.full((n_null, n_steps), np.nan)
+    seeds = np.zeros((n_null, n_steps), dtype=np.int64)
+    for rep in range(n_null):
+        tag = f"restart_{chr(ord('a') + rep)}" if rep < 26 else f"restart_{rep}"
+        for level, eps in enumerate(levels):
+            s = restart_seed(seed, rep, level)
+            seeds[rep, level] = s
             r = generate_steered(mb, input_ids, site, vec, schedule_const(float(eps)), n_new=tokens_per_step,
                                  n_samples=n_samples, temperature=temperature, seed=s)
             t = language_trajectory(mb.tokenizer, r["tokens"], window=window)
             f, n_ed = block_fraction(t["labels"])
-            store[level] = f
+            restarts[rep, level] = f
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=RuntimeWarning)
                 fw = float(np.nanmean(t["fD_window"])) if t["fD_window"].size else np.nan
-            rows.append(dict(branch=tag, step=level, level=level, eps=float(eps), k_start=0,
-                             k_end=tokens_per_step, fD=f, fD_window=fw,
+            rows.append(dict(branch=tag, replicate=rep, seed=s, step=level, level=level, eps=float(eps),
+                             k_start=0, k_end=tokens_per_step, fD=f, fD_window=fw,
                              entropy=float(r["entropies"].numpy().mean()), n_ED=n_ed))
 
     area = hysteresis_area(up, down, levels)
-    null_area = hysteresis_area(restart_a, restart_b, levels)
-    curves = pd.DataFrame(rows, columns=["branch", "step", "level", "eps", "k_start", "k_end",
-                                         "fD", "fD_window", "entropy", "n_ED"])
-    return dict(up=up, down=down, eps_levels=levels, area=area, null_area=null_area,
-                restart=restart_a, restart_b=restart_b, curves=curves,
+    null_areas = np.array([hysteresis_area(restarts[a], restarts[b], levels)
+                           for a in range(n_null) for b in range(a + 1, n_null)], dtype=np.float64)
+    null_area = float(np.mean(null_areas))
+    null_area_sd = float(np.sqrt(np.mean(null_areas ** 2)))      # RMS: sd of the sign-symmetric null
+    area_z = float(area / null_area_sd) if null_area_sd > 0 else float("nan")
+    curves = pd.DataFrame(rows, columns=["branch", "replicate", "seed", "step", "level", "eps", "k_start",
+                                         "k_end", "fD", "fD_window", "entropy", "n_ED"])
+    return dict(up=up, down=down, eps_levels=levels, area=area, null_area=null_area, null_areas=null_areas,
+                null_area_sd=null_area_sd, area_z=area_z, n_null=n_null, restarts=restarts,
+                restart_seeds=seeds, restart=restarts[0], restart_b=restarts[1], curves=curves,
                 tokens=res["tokens"].numpy(), labels=labels, fD_window=fDw, entropies=ent,
                 eps=res["eps"].numpy(), n_steps=n_steps, tokens_per_step=tokens_per_step,
                 eps_max=float(eps_max), site=site.key, n_samples=int(n_samples), seed=int(seed))
@@ -396,24 +428,63 @@ def hysteresis(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, directi
 # D4 relaxation after a dose quench
 # ======================================================================================
 TAU_BOUNDS = (0.5, 1000.0)
+#: Minimum response amplitude |b| (in units of the German fraction) for an identifiable tau.
+B_MIN = 0.05
+#: Significance level of the F-test "exponential response vs. constant" for an identifiable tau.
+FIT_ALPHA = 0.05
+_FIT_KEYS = ("a", "b", "tau", "tau_raw", "b_se", "r2", "rss", "rss_const", "f_stat", "f_pvalue", "n", "n_eff",
+             "tau_censored", "identifiable", "reason")
 
 
 def _relax_model(t, a, b, tau, t_on):
     return a + b * (1.0 - np.exp(-(t - t_on) / tau))
 
 
-def fit_relaxation(fD_t: np.ndarray, t_on: int, t: Optional[np.ndarray] = None) -> dict:
+def _fit_result(**kw) -> dict:
+    out = dict(a=np.nan, b=np.nan, tau=np.nan, tau_raw=np.nan, b_se=np.nan, r2=np.nan, rss=np.nan,
+               rss_const=np.nan, f_stat=np.nan, f_pvalue=np.nan, n=0, n_eff=0.0, tau_censored=False,
+               identifiable=False, reason="")
+    out.update(kw)
+    return out
+
+
+def fit_relaxation(fD_t: np.ndarray, t_on: int, t: Optional[np.ndarray] = None, b_min: float = B_MIN,
+                   alpha: float = FIT_ALPHA, window: int = 1) -> dict:
     """Fit ``fD_t[t >= t_on]`` to ``a + b * (1 - exp(-(t - t_on)/tau))`` with
     :func:`scipy.optimize.curve_fit` (``tau`` bounded to ``TAU_BOUNDS``).  NaN entries are
-    ignored.  Returns ``dict(a, b, tau)`` with ``tau = nan`` (and ``a``, ``b`` = nan) if the
+    ignored.
+
+    ``tau`` is reported only when the response is *identifiable*; otherwise ``tau`` is NaN
+    and the raw fitted value is kept in ``tau_raw`` (a 3-parameter fit of a flat, noisy
+    series always returns some finite, often bound-saturated time constant, which would
+    fake "critical slowing down" in a tau(eps) phase diagram).  Identifiable means
+
+    * the amplitude is not negligible: ``|b| >= b_min`` (default :data:`B_MIN`), and
+    * the fit improves on the constant model ``y = mean(y)``: F-test of the two extra
+      parameters with ``f_pvalue <= alpha`` (default :data:`FIT_ALPHA`).  The residual
+      degrees of freedom use the effective sample size ``n_eff = n / window`` because a
+      running-window fraction (``window`` = the label window of :func:`relaxation`) is
+      autocorrelated over ``window`` steps; ``window=1`` is the plain iid test.
+
+    ``tau_censored`` flags a fit at either bound of ``TAU_BOUNDS`` (upper bound: no
+    relaxation within the window, lower bound: a step within one token); such a ``tau``
+    is kept but should be masked in phase diagrams.  ``b_se`` is the standard error of
+    ``b`` from the fit covariance (NaN when the covariance is singular), ``r2`` the
+    coefficient of determination, ``rss`` / ``rss_const`` the residual sums of squares of
+    the fit and of the constant model, ``reason`` why ``tau`` is NaN (empty if it is not).
+
+    Returns ``dict(a, b, tau, tau_raw, b_se, r2, rss, rss_const, f_stat, f_pvalue, n,
+    n_eff, tau_censored, identifiable, reason)`` with ``a``, ``b``, ``tau`` NaN if the
     series is constant, has fewer than four finite points, or the fit fails."""
     y = np.asarray(fD_t, dtype=np.float64)
     tt = np.arange(y.shape[0], dtype=np.float64) if t is None else np.asarray(t, dtype=np.float64)
     m = (tt >= t_on) & np.isfinite(y)
     y, tt = y[m], tt[m]
-    nan = dict(a=np.nan, b=np.nan, tau=np.nan)
-    if y.shape[0] < 4 or not np.isfinite(y).all() or np.ptp(y) == 0.0:
-        return nan
+    n = int(y.shape[0])
+    if n < 4:
+        return _fit_result(n=n, reason="fewer than four finite points")
+    if np.ptp(y) == 0.0:
+        return _fit_result(a=float(y[0]), b=0.0, n=n, reason="constant series")
     tau0 = float(np.clip(max(1.0, (tt[-1] - tt[0]) / 4.0), *TAU_BOUNDS))
     p0 = [float(y[0]), float(y[-1] - y[0]), tau0]
     lo = [-np.inf, -np.inf, TAU_BOUNDS[0]]
@@ -421,31 +492,66 @@ def fit_relaxation(fD_t: np.ndarray, t_on: int, t: Optional[np.ndarray] = None) 
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            popt, _ = optimize.curve_fit(lambda x, a, b, tau: _relax_model(x, a, b, tau, t_on),
-                                         tt, y, p0=p0, bounds=(lo, hi), maxfev=2000)
+            popt, pcov = optimize.curve_fit(lambda x, a, b, tau: _relax_model(x, a, b, tau, t_on),
+                                            tt, y, p0=p0, bounds=(lo, hi), maxfev=2000)
     except (RuntimeError, ValueError, TypeError, optimize.OptimizeWarning):
-        return nan
+        return _fit_result(n=n, reason="fit failed")
     a, b, tau = (float(v) for v in popt)
-    if not np.isfinite(tau):
-        return nan
-    return dict(a=a, b=b, tau=tau)
+    if not (np.isfinite(tau) and np.isfinite(a) and np.isfinite(b)):
+        return _fit_result(n=n, reason="fit failed")
+    resid = y - _relax_model(tt, a, b, tau, t_on)
+    rss = float(np.sum(resid ** 2))
+    rss_const = float(np.sum((y - y.mean()) ** 2))
+    r2 = float(1.0 - rss / rss_const) if rss_const > 0 else 1.0
+    b_se = float(np.sqrt(pcov[1, 1])) if (np.ndim(pcov) == 2 and np.isfinite(pcov[1, 1]) and pcov[1, 1] >= 0) else np.nan
+    window = max(1, int(window))
+    n_eff = float(n) / window
+    df_resid = n_eff - 3.0
+    if df_resid > 0 and rss_const > 0:
+        if rss <= 0.0:
+            f_stat, f_p = float("inf"), 0.0
+        else:
+            f_stat = float(((rss_const - rss) / 2.0) / (rss / df_resid))
+            f_p = float(sps.f.sf(f_stat, 2, df_resid)) if f_stat > 0 else 1.0
+    else:
+        f_stat, f_p = np.nan, np.nan
+    lo_t, hi_t = TAU_BOUNDS
+    censored = bool(tau <= lo_t * (1.0 + 1e-6) or tau >= hi_t * (1.0 - 1e-6))
+    reasons = []
+    if abs(b) < float(b_min):
+        reasons.append(f"|b|={abs(b):.3g} < b_min={float(b_min):.3g}")
+    if not (np.isfinite(f_p) and f_p <= float(alpha)):
+        reasons.append(f"F-test p={f_p:.3g} > alpha={float(alpha):.3g}" if np.isfinite(f_p)
+                       else "F-test undefined (too few effective points)")
+    identifiable = not reasons
+    return _fit_result(a=a, b=b, tau=(tau if identifiable else np.nan), tau_raw=tau, b_se=b_se, r2=r2, rss=rss,
+                       rss_const=rss_const, f_stat=f_stat, f_pvalue=f_p, n=n, n_eff=n_eff, tau_censored=censored,
+                       identifiable=identifiable, reason="; ".join(reasons))
 
 
 def relaxation(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, direction, eps: float,
                t_on: int = 16, n_new: int = 64, n_samples: int = 8, seed: int = 0,
-               temperature: float = 1.0, window: int = WINDOW, n_boot: int = 20) -> dict:
+               temperature: float = 1.0, window: int = WINDOW, n_boot: int = 20,
+               b_min: float = B_MIN, alpha: float = FIT_ALPHA) -> dict:
     """D4: response of the German fraction to a dose quench 0 -> eps at generated token
     ``t_on`` (:func:`schedule_quench`).
 
     ``fD_t[t]`` is the mean over samples of the running German fraction (trailing
     window) at generated position ``t`` (NaN-aware); ``entropy_t`` the mean next-token
     entropy.  ``tau`` is the time constant of an exponential fit of ``fD_t[t_on:]`` to
-    ``a + b (1 - exp(-(t - t_on)/tau))`` (NaN if the fit fails or the series is constant);
+    ``a + b (1 - exp(-(t - t_on)/tau))`` by :func:`fit_relaxation` (with the label
+    ``window`` as autocorrelation length): NaN unless the response is identifiable
+    (``|b| >= b_min`` and the fit beats the constant model), the raw value stays in
+    ``fit['tau_raw']`` and ``fit['tau_censored']`` flags a bound-saturated fit.
     ``tau_ci`` is a (2.5, 97.5) percentile interval from ``n_boot`` bootstrap resamples
-    of the samples (NaN pair if fewer than two resamples yield a finite tau).
+    of the samples (identifiable taus only; NaN pair if fewer than two resamples yield
+    one); ``b_ci`` the same interval for the raw amplitude ``b`` of the resamples and
+    ``b_ci_excludes_zero`` whether it excludes 0 (NaN/False with fewer than two finite
+    resamples).
 
-    Returns dict(fD_t, entropy_t, tau, tau_ci, tau_boot, fit (a, b, tau), t, t_on, eps,
-    tokens, labels, fD_window, entropies, eps_t, site).
+    Returns dict(fD_t, entropy_t, tau, tau_ci, tau_boot, b_boot, b_ci, b_ci_excludes_zero,
+    fit (see :func:`fit_relaxation`), t, t_on, eps, tokens, labels, fD_window, entropies,
+    eps_t, site, n_samples, seed).
     """
     vec = _as_vector(direction, mb)
     n_new, t_on = int(n_new), int(t_on)
@@ -460,20 +566,27 @@ def relaxation(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, directi
         fD_t = np.nanmean(fDw, axis=0)
     entropy_t = ent.mean(axis=0)
     t = np.arange(n_new)
-    fit = fit_relaxation(fD_t, t_on, t)
+    fit = fit_relaxation(fD_t, t_on, t, b_min=b_min, alpha=alpha, window=window)
     rng = np.random.default_rng(int(seed))
     B = fDw.shape[0]
     taus = np.full(int(n_boot), np.nan)
+    bs = np.full(int(n_boot), np.nan)
     for i in range(int(n_boot)):
         idx = rng.integers(0, B, size=B)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
             fb = np.nanmean(fDw[idx], axis=0)
-        taus[i] = fit_relaxation(fb, t_on, t)["tau"]
+        fb_fit = fit_relaxation(fb, t_on, t, b_min=b_min, alpha=alpha, window=window)
+        taus[i], bs[i] = fb_fit["tau"], fb_fit["b"]
     finite = taus[np.isfinite(taus)]
     tau_ci = (float(np.percentile(finite, 2.5)), float(np.percentile(finite, 97.5))) if finite.size >= 2 \
         else (np.nan, np.nan)
-    return dict(fD_t=fD_t, entropy_t=entropy_t, tau=fit["tau"], tau_ci=tau_ci, tau_boot=taus, fit=fit,
+    b_fin = bs[np.isfinite(bs)]
+    b_ci = (float(np.percentile(b_fin, 2.5)), float(np.percentile(b_fin, 97.5))) if b_fin.size >= 2 \
+        else (np.nan, np.nan)
+    b_excl = bool(np.isfinite(b_ci).all() and (b_ci[0] > 0 or b_ci[1] < 0))
+    return dict(fD_t=fD_t, entropy_t=entropy_t, tau=fit["tau"], tau_ci=tau_ci, tau_boot=taus, b_boot=bs,
+                b_ci=b_ci, b_ci_excludes_zero=b_excl, fit=fit,
                 t=t, t_on=t_on, eps=float(eps), tokens=res["tokens"].numpy(), labels=traj["labels"],
                 fD_window=fDw, entropies=ent, eps_t=res["eps"].numpy(), site=site.key,
                 n_samples=int(n_samples), seed=int(seed))
