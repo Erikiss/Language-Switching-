@@ -279,6 +279,58 @@ entscheidende Validitätstest für die gesamte Steering-Skalierung: fällt er ne
 werden Dosis-Phasendiagramme (§4.2) nur noch als Eingriffs-, nicht als
 Sprachwechselbefunde interpretiert.
 
+### 4.6 λ-Dynamik: Eingriffe zwischen Trennschärfe und Mimikry (Biggio et al.)
+
+Biggio et al. (2013/2017, *Evasion attacks against machine learning at test time*,
+arXiv:1708.06131) beschreiben den Gradientenabstieg gegen eine Diskriminante g(x) mit
+einem Dichte-Term („Mimikry“), gewichtet durch λ:
+
+F(x) = ĝ(x) − (λ/n) Σ_{i: y_i = Zielklasse} k((x − x_i)/h),  s. t. d(x, x⁰) ≤ d_max  (Alg. 1).
+
+λ = 0: der Pfad überquert die Entscheidungsgrenze schnellstmöglich, endet aber in
+Regionen ohne Datenstützung (p(x) ≈ 0); das Ergebnis ist „trennscharf“, aber unecht.
+λ > 0: der Pfad wird langsamer und länger, endet aber in der dicht besetzten Region der
+Zielklasse. Neuronale Netze haben flache Regionen (∇g ≈ 0), in denen reiner Abstieg stehen
+bleibt; dort ist der Mimikry-Term entscheidend. Eine engere **Umschließung** (enclosure)
+der legitimen Klasse zwingt zur Mimikry — das ist dieselbe Geometrie wie die Kontraktion
+in §4.4: enge lokale Nachbarschaften erzwingen hohes λ.
+
+**Übertragung auf dieses Projekt.** Alle bisherigen Eingriffe (Dossier: ein Schritt der
+Größe ε entlang ∂H/∂h; hier: Sprachachse, SAE-Feature) sind λ = 0-Eingriffe mit einem
+einzigen Schritt. Die λ-Dynamik verallgemeinert sie zu einem Pfad im Aktivierungsraum
+(Modul `lsne.lambda_dynamics`):
+
+| Element | Umsetzung |
+|---|---|
+| Punkt x | Residualvektor h an (Layer, Position) der Eingriffsstelle |
+| Diskriminante ĝ | (a) lineare Sprach-Probe E↔D (scharf, SVM-Analogon); (b) −log p(Ziel) bzw. −H der nächsten Tokenverteilung (Modell-eigen, mit flachen Regionen); (c) −Aktivierung eines SAE-Features |
+| Zielklassen-Dichte p̂ | KDE über **echte** Aktivierungen der Zielbedingung an derselben Stelle (z. B. Zustände der K>0-Varianten oder deutscher Segmente); Metrik ℓ₂ oder Mahalanobis (gewhitet mit der Layer-Kovarianz aus §4.4) |
+| λ-Sweep | λ_rel ∈ {0, 0.1, 0.3, 1, 3, 10, 30}, skaliert so, dass λ/(n·h) mit dem Wertebereich von ĝ vergleichbar ist (Paper §3.2) |
+| Pfad | Alg. 1: Einheitsschritt entlang ∇F, Projektion auf d(h, h⁰) ≤ d_max, Abbruch bei ΔF < ε |
+
+Pro λ wird der Pfad aufgezeichnet und an jedem Schritt gemessen:
+1. **Monosemantische Repräsentation:** TopK-SAE-Features (aktive Indizes, Aktivierungen)
+   und SAE-Rekonstruktionsfehler (FVU) als Indikator für „unbesetzte Region“.
+2. **Geometrie des Pfads** (hier die operationalisierte „Geometrie der Kette“, da
+   Pythia-Basismodelle keine explizite Chain-of-Thought erzeugen): Pfadlänge,
+   Nettoverschiebung, Tortuosität, mittlerer Drehwinkel, Schritte bis zur Grenzüberquerung
+   (g < 0), Mahalanobis-Abstand zur Zielwolke, k-NN-Abstand zu echten Zuständen,
+   lokales Log-Volumen (§4.4) am Endpunkt; zusätzlich die Tiefen-Trajektorie des Endpunkts
+   durch die restlichen Layer (Lens-KL, Störungsausbreitung D1).
+3. **Wirkung:** log p(Ziel), Entropie, p_freq nach Einsetzen des Endpunkts; für State 2143
+   damit B(x) als Funktion von λ — bleibt der 98k/99k-Nutzen bestehen, wenn der Eingriff
+   auf die Datenmannigfaltigkeit gezwungen wird?
+
+**Was gesucht wird:** diejenigen SAE-Features und diejenigen Pfadgrößen, deren Werte am
+Endpunkt monoton mit λ korrelieren (Spearman über den Sweep, Familien-Bootstrap), getrennt
+für die drei Diskriminanten. Erwartung aus dem Paper: Bei (b) stehen λ = 0-Pfade in
+flachen Regionen still (Schritte bis Grenzüberquerung → ∞), bei λ > 0 nicht; Features,
+die nur auf λ > 0-Pfaden aktiv werden, sind Kandidaten für die „echte“ Repräsentation
+eines Sprachwechselzustands, Features nur auf λ = 0-Pfaden Kandidaten für Artefakte.
+Sprachwechsel bleibt das Mittel: Die Zielklassen-Dichte stammt aus echten
+Sprachwechselzuständen, und K, C modulieren deren Umschließung (§4.4), also das λ, das
+nötig ist, um sie zu erreichen.
+
 ### 4.3 Dossier-Kernkontraste (Frage 2 und Replikation)
 
 T(K, C), B(x) pro Richtung, I(K, C). Wechselwirkung K × C, Transfer `ent` von
@@ -354,6 +406,7 @@ Shard schreibt eigene Ergebnisdateien, `lsne.cli merge` fügt zusammen.
 | C Grid + Counterfactual | T, B, I über K × C; Positions-Patching | `02_switching_grid` | Primärkontrast T(K) auf Testfamilien, Familien-Bootstrap |
 | D Nicht-Gleichgewicht | D1–D9, Phasendiagramme | `03_nonequilibrium` | Primärer Endpunkt λ (Präregistrierung) |
 | G Geometrie + Trajektorie | G0–G3 (lokale Geometrie unter Sprachwechsel), T1–T5 (Trajektorie) | `06_geometry_trajectory` | G0 muss bestehen, sonst keine Interpretation; T3 entscheidet über die Steering-Lesart |
+| H λ-Dynamik | Alg. 1 im Aktivierungsraum, λ-Sweep, SAE-Features und Pfadgeometrie vs. λ, B(x)(λ) | `07_lambda_dynamics` | Korrelationen mit λ auf Entwicklungsfamilien gefunden, auf Testfamilien bestätigt |
 | E Tensornetz | lineare Antwort, TNCO vs. opt_einsum, Nichtlinearität | `04_tn_linear_response` | Berichtet Kosten/Laufzeit/Fehler; kein Hypothesentest |
 | F Skala & Verlauf | 410M/1B/1.4B, Checkpoint-Sweep; BF16-Vergleich | `05_scale_and_checkpoints` | Shards, Drive-Export |
 

@@ -243,6 +243,39 @@ Tests: synthetic tables for depth_trajectory (breathing index of a monotone seri
 of an alternating series equals n-2 sign changes); steering_tracks_switching on pythia-14m
 with two tiny hand-made groups returns cosines in [-1,1] with random controls.
 
+## `lsne/lambda_dynamics.py`  (Biggio et al. Alg. 1 in activation space, DESIGN §4.6)
+
+```python
+@dataclass Discriminant: name:str, kind:str, fn: Callable[[Tensor[d]], Tensor[()]], grad: Callable[[Tensor[d]], Tensor[d]], meta: dict
+def partial_forward(mb, input_ids:[1,T], site: HookSite, position:int) -> Callable[[Tensor[d]], Tensor[V]]
+    # returns f(h) = last-position logits when the residual at (site, position) is REPLACED by h (Injector replace with a leaf tensor); differentiable wrt h
+def make_discriminant(mb, kind:str, site, input_ids=None, position=None, w=None, b=0.0, target_id=None, sae=None, feature=None) -> Discriminant
+    # kind "probe": g(h) = w·h + b (w from directions.probe_axis; positive = source class); "target_logit": g(h) = -logp(target | h) ; "entropy": g(h) = -H(next-token) ; "sae_feature": g(h) = -relu(pre-activation of feature) 
+class KDEMimicry:
+    def __init__(self, H_target: Tensor[n,d], bandwidth: float|str="median", metric: str="l2", U_r=None, lam_r=None, k_nearest: int|None=50)
+    # metric "mahalanobis": whiten with z = lam_r^-1/2 U_r^T h (r-dim) and run the KDE in z; "l2": raw space. bandwidth "median" = median pairwise distance of H_target (in the metric). k_nearest: use only the k nearest reference points (paper used 50).
+    def density(self, h) -> float            # (1/n) sum_i exp(-d(h,h_i)^2 / bw)   (RBF as in the paper; also "laplacian" via kernel="l1" option)
+    def grad(self, h) -> Tensor[d]          # closed form (paper §3.2), mapped back to h-space for the Mahalanobis metric
+def lambda_scale(g_values_range: float, n: int, bw: float) -> float    # lambda such that lambda/(n*bw) is comparable to the range of g (paper §3.2)
+@dataclass Trajectory: points: Tensor[m+1,d], g: ndarray[m+1], density: ndarray[m+1], F: ndarray[m+1], dist_from_start: ndarray[m+1], lam: float, converged: bool, steps_to_cross: int|None
+def evasion_trajectory(h0: Tensor[d], g: Discriminant, kde: KDEMimicry|None, lam: float, step: float, d_max: float, n_steps: int=200, eps_stop: float=1e-5, metric: str="l2") -> Trajectory
+    # Alg. 1: direction = unit(∇g(h) - lam * ∇p̂(h)); h <- h - step*direction; if d(h,h0) > d_max project onto the ball boundary (l2); stop when F(h_m) - F(h_{m-1}) > -eps_stop (no decrease) or n_steps
+def lambda_sweep(h0, g, kde, lambdas: Sequence[float], **kw) -> dict[float, Trajectory]
+def trajectory_geometry(traj) -> dict(path_length, net_displacement, tortuosity, mean_turning_angle_deg, n_steps, steps_to_cross, final_g, final_density, final_F, dist_from_start)
+def manifold_stats(points: Tensor[m,d], X_ref: Tensor[N,d], U_r=None, lam_r=None, sae=None, k: int=5) -> DataFrame per point: mahal_to_ref_mean, knn_mean_dist, local_log_volume (cloud of the k nearest ref points + the point; lsne.geometry.log_volume), sae_fvu, n_shared_features_with_ref (overlap of the point's top-k SAE features with the union of the k nearest refs' features)
+def endpoint_effects(mb, input_ids, site, position, endpoints: dict[float, Tensor[d]], target_id, freq_ids=None) -> DataFrame(lam, logp_target, entropy, p_freq, B = logp_target - logp_target_unperturbed)
+def feature_lambda_correlation(endpoints: dict[float, Tensor[d]], sae) -> DataFrame(feature, rho, pvalue, act_at_min_lambda, act_at_max_lambda, active_only_lambda0, active_only_lambda_pos)
+def geometry_lambda_correlation(rows: DataFrame with column lam and numeric columns) -> DataFrame(quantity, rho, pvalue, n)
+```
+Tests (pythia-14m): probe discriminant gradient equals w; partial_forward reproduces the
+model logits when h is the unperturbed residual; "entropy" discriminant gradient matches
+lsne.model.entropy_gradient at the same site/position (allclose); KDE density is maximal at
+a reference point and its gradient matches finite differences; evasion_trajectory with
+lam=0 decreases g monotonically and respects d_max; with a large lam the endpoint is closer
+(Mahalanobis / knn) to the target cloud than with lam=0 on a synthetic 2-cluster problem;
+lambda_sweep returns one Trajectory per lambda; feature_lambda_correlation on a synthetic
+SAE (TopKSAE.from_tensors) returns finite rho; endpoint_effects B=0 for the unperturbed state.
+
 ## `lsne/stats.py`
 
 `cluster_bootstrap(df, value_col, cluster_col, n_boot=10000, seed=0, stat=np.mean) -> dict(mean, ci_low, ci_high, n_clusters)`;

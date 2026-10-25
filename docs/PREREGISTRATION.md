@@ -50,6 +50,16 @@ Mindesteffektgrenze nicht ausschließt, gilt als „offen“, nicht als Nullbefu
    und mean(K=8) − mean(K=0) pro Layer, gegen 32 Zufallsrichtungen; Mindesteffekt
    cos ≥ 0,3 im Layer mit maximaler diskreter Verschiebung.
 
+10. λ-Dynamik (Stufe H), Diskriminante (b) −log p(Ziel) an der Dossier-Stelle,
+    Zielklassen-Dichte aus K=8/C1-Zuständen: Spearman-ρ zwischen λ und (i) dem
+    SAE-Rekonstruktionsfehler am Endpunkt (Erwartung ρ < 0: Mimikry-Endpunkte sind
+    besser rekonstruierbar), (ii) der Zahl der Schritte bis zur Grenzüberquerung,
+    (iii) dem Mahalanobis-Abstand zur Zielwolke (Erwartung ρ < 0). Features mit
+    |ρ| ≥ 0,7 über den Sweep auf Entwicklungsfamilien werden als Kandidaten eingefroren
+    und auf Testfamilien geprüft.
+11. B(x)(λ) für State 2143 bei 98k/99k: Vorzeichen des Nutzens bei λ_rel = 3 gegenüber
+    λ = 0 (zweiseitig; Erwartung offen).
+
 ## 4. Ausschlussregeln (vor Sichtung der Modellwerte)
 
 - Variante ausgeschlossen, wenn Ziel-ID oder Tail-Token-IDs vom K=0-Fall abweichen
