@@ -308,68 +308,6 @@ def steer_at_head(mb, input_ids, layer: int, head: int, direction: Tensor[d], ep
 ```
 Tests (pythia-14m): head_contributions sum (+ dense bias) equals the attention module output (atol 1e-4); ablating all heads equals replacing the attention output by its bias (zero mode); head_direct_logit_effect returns H finite values; ablate_heads context restores the model afterwards; steer_at_head changes only the last-position logits; worst_head picks the head with the largest planted difference on a synthetic effects table.
 
-## `lsne/pile_domains.py`  (empirical difficulty ranking of Pile sub-areas, DESIGN §4.8b)
-
-```python
-def sample_pile_sequences(n: int, seed: int, cache_dir=None) -> list[np.ndarray]     # via lsne.pile_fetch.fetch_sequence on uniformly random indices (cached per (n, seed))
-def classify_sequence(tokenizer, ids: np.ndarray, domains: dict, markers: dict|None=None) -> dict(domain: str, scores: dict[str,float], n_words: int)
-    # keyword-profile classification on decoded text: per-domain count of lexicon hits (E lists + D lists) per 1000 words; `markers` adds regex markers for sub-corpora (pubmed: 'et al', 'patients', 'in vitro', 'mg/kg', 'expression'; code: 'def ', '{', 'import'; legal: 'plaintiff', 'pursuant'); domain = argmax score if max score >= min_hits else 'unclassified'
-def sequence_nll(mb, ids: np.ndarray, max_len: int=512) -> dict(mean_nll, n_tokens, nll_per_token: ndarray)   # teacher-forced NLL under the model, truncated to max_len
-def domain_difficulty_table(mb, tokenizer, sequences: list[np.ndarray], domains: dict, markers=None, max_len=512, n_boot=1000, seed=0) -> DataFrame(domain, n_sequences, n_tokens, mean_nll, ci_low, ci_high, rank)
-    # bootstrap CI over sequences; rank 1 = hardest (highest NLL)
-def misfolding_rank_check(table: DataFrame, domain: str="protein_misfolding") -> dict(rank, n_domains, in_hardest_third: bool)
-```
-Tests: classify_sequence on hand-written texts (legal, protein, everyday) returns the expected domains; sequence_nll finite and consistent with lsne.model.forward_logits; domain_difficulty_table on 6 synthetic sequences (ids from the tokenizer) returns one row per classified domain with CI containing the mean; sampling test marked network (n=3).
-
-## `lsne/sharing.py`  (representational sharing and network activity, DESIGN §4.8c)
-
-```python
-def active_feature_sets(sae, acts: Tensor[N,d]) -> list[set[int]]            # TopK indices per row (lsne.sae.TopKSAE.encode)
-def feature_frequency(sets: list[set[int]], n_latents: int) -> ndarray[F]      # fraction of rows in which each feature is active
-def sharing_index(freq_a: ndarray, freq_b: ndarray, top_m: int=200, min_freq: float=0.01) -> dict(jaccard_topm, jaccard_active, weighted_overlap)
-    # jaccard_topm over the m most frequent features of each side; jaccard_active over features with freq >= min_freq; weighted_overlap = sum min(freq_a, freq_b) / sum max(freq_a, freq_b)
-def pairwise_sharing(freqs: dict[str, ndarray], **kw) -> DataFrame(cond_a, cond_b, jaccard_topm, jaccard_active, weighted_overlap)
-def network_activity(sae, acts: Tensor[N,d], min_freq: float=0.01) -> dict(frac_features_active, mean_mass, participation_ratio_of_mass, n_rows)
-    # frac_features_active = share of latents with freq >= min_freq; mean_mass = mean sum of top-k activations per row; participation ratio of the per-feature total activation mass
-def head_profile(mb, input_ids, layer: int) -> ndarray[H]                      # per-head mean contribution norm at the last position (lsne.heads.head_contributions)
-def head_profile_similarity(profiles: dict[str, ndarray]) -> DataFrame(cond_a, cond_b, cosine)
-def sharing_table(mb, sae, groups: dict[str, list[variants]], site: HookSite, readout: str="last") -> DataFrame   # one row per (cond pair) with sharing metrics and one row per cond with activity metrics (column 'kind' in {'sharing','activity'})
-```
-Tests: synthetic TopKSAE (from_tensors) and random activations: jaccard in [0,1], identical conditions give jaccard 1 and weighted_overlap 1, disjoint feature sets give 0; network_activity fields finite; head_profile length H on pythia-14m.
-
-## `lsne/rdx.py`  (representational difference explanation, DESIGN §4.8a)
-
-```python
-def difference_vector(acts_a: Tensor[Na,d], acts_b: Tensor[Nb,d]) -> Tensor[d]      # mean(A) - mean(B)
-def explained_fraction(delta: Tensor[d], basis: Tensor[k,d]) -> float                 # ||P_B delta||^2 / ||delta||^2 with P_B the orthogonal projector onto span(basis) (orthonormalise via QR; drop near-zero columns)
-def random_bases(d: int, k: int, n: int, seed: int) -> Tensor[n,k,d]
-def rdx_score(delta, basis, n_random: int=32, seed: int=0) -> dict(explained, random_mean, random_sd, z, k)
-def basis_attribution(delta, basis, names: list[str]) -> DataFrame(name, coef, abs_share)    # least-squares coefficients of delta on the (non-orthogonalised) basis vectors; abs_share = |coef|*||b_i|| / sum
-def rdx_table(mb, contrasts: dict[str, tuple[list[variants], list[variants]]], bases: dict[str, tuple[Tensor[k,d], list[str]]], sites: list[HookSite], readout: str="last", n_random=32, seed=0) -> DataFrame(contrast, site, basis, k, explained, random_mean, random_sd, z, top_component, top_share)
-    # pooled last-token / mean-pooled states per variant list (lsne.geometry.pool_states); bases given per site key or shared
-def family_stability(mb, contrast_by_family: dict[str, tuple[list,list]], basis, site, n_boot: int=200, seed: int=0) -> dict(explained_mean, ci_low, ci_high, per_family: DataFrame)
-def bases_from_directions(dirs: list[Direction]) -> tuple[Tensor[k,d], list[str]]
-def bases_from_sae(sae, feature_ids: list[int]) -> tuple[Tensor[k,d], list[str]]
-def bases_from_heads(mb, input_ids, layer: int) -> tuple[Tensor[H,d], list[str]]     # unit head-contribution directions at the last position
-```
-Tests: explained_fraction is 1 when delta lies in the span, 0 when orthogonal, in [0,1] otherwise; rdx_score z large for an in-span delta; basis_attribution recovers planted coefficients; rdx_table on pythia-14m with two tiny variant groups and a random basis returns finite rows; family_stability CI contains the mean.
-
-## `lsne/ttt.py`  (test-time training arm, DESIGN §4.8d)
-
-```python
-@dataclass TTTConfig: lr: float=1e-5, steps: int=50, batch_size: int=4, seq_len: int=256, grad_clip: float=1.0, weight_decay: float=0.0, warmup_steps: int=0, seed: int=0, eval_every: int=5, dtype: str="float32"
-def load_corpus(dir_or_file: str, tokenizer, seq_len: int) -> list[list[int]]          # .txt files (utf-8) -> token chunks of seq_len (+1 for targets); returns [] if missing
-def placeholder_corpus(tokenizer, seq_len: int, n_chunks: int=8) -> list[list[int]]   # from data/ttt/placeholder/*.txt (small, clearly synthetic neutral text written by us — NO fabricated historical documents)
-def matched_controls(corpus_chunks, kind: str, tokenizer=None, seed: int=0, pile_sampler=None) -> list[list[int]]   # kind in {'neutral' (pile samples of equal count/length via lsne.pile_domains.sample_pile_sequences if a sampler is given, else placeholder), 'permuted' (token-permuted copies of the corpus chunks), 'shuffled_sentences' (sentence-order shuffled)}
-class WeightSnapshot: save(mb) / restore(mb)   # CPU copies of all parameters; context manager `with WeightSnapshot(mb): ...` restores on exit
-def ttt_train(mb, chunks: list[list[int]], cfg: TTTConfig, probe_chunks: list[list[int]]|None=None, eval_fn: Callable[[int], dict]|None=None) -> dict(history: DataFrame(step, train_loss, probe_nll_mean, probe_nll_per_chunk (json)), eval: list[dict])
-    # AdamW on all parameters (requires_grad switched on inside, off again after), FP32 master weights, grad clipping, deterministic batching; probe_nll measured every eval_every steps on probe_chunks with no_grad
-def memorization_speed(history: DataFrame, threshold_nll: float, chunk_index: int|None=None) -> dict(steps_to_threshold: int|None, nll_start, nll_end, auc_drop)
-def ttt_arms(mb, corpus_chunks, cfg, arms: tuple=("injection","neutral","permuted","shuffled_sentences"), measure_fn: Callable[[ModelBundle], dict]|None=None, tokenizer=None, pile_sampler=None) -> DataFrame(arm, step, train_loss, probe_nll_mean, measures...)
-    # each arm restores the snapshot first; measure_fn is called before training and at the end of each arm (e.g. sharing index, T/B on a few variants)
-```
-Tests (pythia-14m, cfg.steps=6, batch_size=2, seq_len=32): ttt_train lowers the probe NLL on the trained chunks; WeightSnapshot restores parameters exactly (max abs diff 0); parameters have requires_grad False after training; memorization_speed finds steps_to_threshold on a decreasing synthetic history and None on a flat one; matched_controls 'permuted' keeps the token multiset; ttt_arms returns one block per arm and the restored model gives the same logits as before the arms (allclose).
-
 ## `lsne/pile_domains.py`  (empirical difficulty ranking of Pile subfields, DESIGN §4.8b)
 
 ```python
