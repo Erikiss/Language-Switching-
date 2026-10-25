@@ -30,7 +30,7 @@
      "D": {"subj": "Sie", "pred": "vermerkt eine Frage", "adj": "auf einem Zettel"}},
     {"id": 9,
      "E": {"subj": "The conversation", "pred": "gets back to the story", "adj": "after a short break"},
-     "D": {"subj": "Das Gespräch", "pred": "gelangt wieder zur Geschichte", "adj": "nach einer kurzen Pause"}},
+     "D": {"subj": "Das Gespräch", "pred": "kommt erneut auf die Geschichte", "adj": "nach einer kurzen Pause"}},
     {"id": 10,
      "E": {"subj": "The excerpt", "pred": "closes", "adj": "at this point"},
      "D": {"subj": "Der Auszug", "pred": "schließt", "adj": "an dieser Stelle"}}

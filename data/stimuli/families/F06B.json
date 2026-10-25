@@ -9,7 +9,7 @@
      "D": {"subj": "Paul", "pred": "eröffnet seinen neuen Brotladen", "adj": "früh an einem Montag"}},
     {"id": 2,
      "E": {"subj": "He", "pred": "makes the first dough", "adj": "at five o'clock"},
-     "D": {"subj": "Er", "pred": "macht den ersten Teig", "adj": "um fünf Uhr früh"}},
+     "D": {"subj": "Er", "pred": "macht den ersten Teig", "adj": "um fünf Uhr"}},
     {"id": 3,
      "E": {"subj": "The lights", "pred": "shine", "adj": "in the empty store"},
      "D": {"subj": "Die Lichter", "pred": "leuchten", "adj": "im leeren Geschäft"}},

@@ -13,7 +13,7 @@
      "D": {"subj": "Ihre Großmutter", "pred": "wünscht sich eine traditionelle Zeremonie", "adj": "im Dorf"}},
     {"id": 3,
      "E": {"subj": "Leyla", "pred": "retains her own family name", "adj": "after the wedding"},
-     "D": {"subj": "Leyla", "pred": "bewahrt ihren eigenen Familiennamen", "adj": "nach der Hochzeit"}},
+     "D": {"subj": "Leyla", "pred": "führt weiterhin ihren eigenen Familiennamen", "adj": "nach der Hochzeit"}},
     {"id": 4,
      "E": {"subj": "Her father", "pred": "objects to this decision", "adj": "at dinner"},
      "D": {"subj": "Ihr Vater", "pred": "widerspricht dieser Entscheidung", "adj": "beim Abendessen"}},
