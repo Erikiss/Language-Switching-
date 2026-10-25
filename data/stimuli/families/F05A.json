@@ -23,11 +23,11 @@
      "E": {"subj": "Ida", "pred": "measures the crack", "adj": "with a ruler"},
      "D": {"subj": "Ida", "pred": "misst den Riss", "adj": "mit einem Lineal"}},
     {"id": 7,
-     "E": {"subj": "The cars", "pred": "wait in a long line", "adj": "at the barrier"},
-     "D": {"subj": "Die Autos", "pred": "warten in einer langen Schlange", "adj": "an der Absperrung"}},
+     "E": {"subj": "The cars", "pred": "form a long line", "adj": "at the barrier"},
+     "D": {"subj": "Die Autos", "pred": "bilden eine lange Schlange", "adj": "an der Absperrung"}},
     {"id": 8,
-     "E": {"subj": "A driver", "pred": "asks about the delay", "adj": "through the open window"},
-     "D": {"subj": "Ein Fahrer", "pred": "fragt nach der Verzögerung", "adj": "durch das offene Fenster"}},
+     "E": {"subj": "A driver", "pred": "asks about the delay", "adj": "through his window"},
+     "D": {"subj": "Ein Fahrer", "pred": "fragt nach der Verzögerung", "adj": "durch sein Fenster"}},
     {"id": 9,
      "E": {"subj": "The engineer", "pred": "explains the problem", "adj": "in a calm voice"},
      "D": {"subj": "Die Ingenieurin", "pred": "erklärt das Problem", "adj": "mit ruhiger Stimme"}},
@@ -35,9 +35,9 @@
      "E": {"subj": "The inspection", "pred": "ends", "adj": "shortly before noon"},
      "D": {"subj": "Die Inspektion", "pred": "endet", "adj": "kurz vor Mittag"}}
   ],
-  "tail_E": "Under the peeling paint the old iron bolts are red with",
-  "target": " rust",
-  "target_note": "'rust' is the natural completion of 'old iron bolts are red with' in a bridge-inspection context (steel beams, concrete, crack); the word does not occur in the units or the tail, nor does its German equivalent 'Rost'. ' rust' is a single Pythia token (id 20035).",
+  "tail_E": "Until the crack is repaired the bridge stays closed to all",
+  "target": " traffic",
+  "target_note": "'traffic' is the natural completion of 'the bridge stays closed to all' and is supported by the context (a road bridge, trucks, cars at a barrier, the crack of units 5-6 named in the tail); the word does not occur in the units or the tail, nor does its German equivalent 'Verkehr'. ' traffic' is a single Pythia token (id 7137). Pilot check with pythia-160m (not a result, only tail selection): p(' traffic') = 0.80 on the all-English rendering, rank 1.",
   "author": "LS-NEQ stimulus bank, family F05 (engineer Ida / bridge)",
   "notes": "Ten units: Ida inspects the bridge; she walks across it; the steel beams carry trucks; a worker lowers a camera; the screen shows a crack; Ida measures it; cars wait at the barrier; a driver asks; the engineer explains; the inspection ends. Subjects alternate between the protagonist (Ida / she / the engineer), other people (a worker, a driver) and plural objects (the steel beams, the cars), so that C3 switches cross singular and plural subject-verb agreement. No German separable verbs are used; every German adjunct sits after the object in the middle field, which is the unmarked position for a single time/place/manner adjunct. Present tense and positive polarity throughout."
 }
