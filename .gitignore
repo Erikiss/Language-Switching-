@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+# model / data caches and run outputs (never commit)
+runs/
+outputs/
+cache/
+*.safetensors
+*.bin
+*.npz
+!data/**/*.npz
+# the State 2143 token sequence is fetched at runtime, never committed
+data/state2143/sequence_tokens.json
+data/state2143/*.bin
+.env

@@ -1,0 +1,14 @@
+numpy>=1.26
+torch>=2.2
+transformers>=4.45
+huggingface_hub>=0.24
+safetensors>=0.4
+tokenizers>=0.19
+scipy>=1.11
+pandas>=2.0
+opt_einsum>=3.3
+tqdm>=4.66
+requests>=2.31
+nbformat>=5.9
+matplotlib>=3.8
+pytest>=7.4

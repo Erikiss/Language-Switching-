@@ -1,0 +1,25 @@
+{
+  "family_id": "ORIG2143",
+  "title": "State 2143 original context as a 7-unit case study",
+  "source": "EleutherAI/pile-standard-pythia-preshuffled sequence 5025183, first 208 tokens (fetched at runtime, not committed)",
+  "note": "Token bounds are half-open [start, end) indices into the 208 context tokens of the verified anchor. Unit 7 is the fixed English tail; it starts with the token 'For' (the preceding token '.—', id 25277, belongs to unit 6). German units reproduce the leading whitespace/newlines and the trailing punctuation of the English units exactly so that the tail tokenisation is unchanged. Target stays 'bey' (22905), appended directly after 'Fewkoom'.",
+  "unit_token_bounds": [0, 36, 60, 92, 155, 165, 186, 208],
+  "tail_unit": 7,
+  "target_id": 22905,
+  "target_text": "bey",
+  "units_D": {
+    "1": " wollte dies in Berichten und Parabeln vermitteln, zu denen die Reflexionen schlicht Parerga und Paralipomena sind—in der Tat eine höchst eigentümliche Art derselben.",
+    "2": "\n\n3)Kraft weist die Charakterisierung der psychoanalytischen Kafka-Deutung als \"natürlich\" zurück.",
+    "3": " Er möchte diese Bezeichnung einem anderen Ansatz vorbehalten sehen, der der Darstellung der sozialen Bedingtheit von Kafkas Welt näher steht—zu bedenken.",
+    "4": "\n\n4)Wichtige Anmerkung zu den Tiergeschichten, von Kraft: \"Für mich sind seine Tiergeschichten in den meisten Fällen einfach ein technisches Mittel, um die unschätzbaren Aspekte empirisch-metaphysischer Beziehungen darzustellen, z. B. in _Josefine_ oder in den Aufzeichnungen eines Hundes.",
+    "5": " In beiden Fällen ist 'das Volk' dargestellt.\"",
+    "6": " Das ist richtig: es muss gezeigt werden, wie dies mit meiner Deutung der Tierwelt bei Kafka zusammenhängt.—"
+  },
+  "masks_6_units": {
+    "0": "EEEEEE",
+    "2": "EEDDDE",
+    "4": "EDDEDE",
+    "5": "EDEDED"
+  },
+  "masks_note": "Six switchable units (1-6) followed by the fixed English tail (unit 7). K=5 ends in D so the last switch D->E is at the 6|7 boundary; K=2 and K=4 keep unit 6 English so the tail boundary is not itself a switch. Both conventions are reported separately."
+}

@@ -1,0 +1,23 @@
+{
+  "model": "EleutherAI/pythia-160m",
+  "dataset_repo": "EleutherAI/pile-standard-pythia-preshuffled",
+  "sequence_index": 5025183,
+  "batch_index0": 4907,
+  "position_in_batch": 415,
+  "batch_size": 1024,
+  "seq_len": 2049,
+  "context_len": 208,
+  "target_id": 22905,
+  "target_text": "bey",
+  "sha256_sequence": "bdd4bbdd2b8138437e052b2f0e3aeb212a563c25fe447c920b0e9c6ee76f55d4",
+  "sha256_context": "84c8f1b6a7a933f53f3b21e353c0c3af219d3ccfbcb7092584a9c6ad1035a750",
+  "byte_offset_in_concatenated_stream": 20593199934,
+  "shard": "document-00000-of-00020.bin",
+  "byte_range_in_shard": [20593199934, 20593204031],
+  "verified_on": "2026-10-25",
+  "verification_method": "HTTP range request (4098 bytes) + SHA256 over little-endian uint16 bytes; target id and both hashes match the dossier (D1).",
+  "last_5_context_tokens": ["ream", " of", " Few", "k", "oom"],
+  "context_whitespace_only_tokens": 4,
+  "context_tokens_with_leading_space": 135,
+  "note": "The token sequence itself is fetched at runtime by lsne.anchor.load_anchor and is not committed."
+}
