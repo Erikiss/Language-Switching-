@@ -25,7 +25,10 @@ from lsne.experiments.stage_f_scale import parse_pairs, plan_triples
 from lsne.sae import TopKSAE
 
 REPO = Path(__file__).resolve().parent.parent
-SMOKE_BUDGET_S = 240.0
+# Wall-clock budget for the whole --smoke run on a shared 4-core CPU box. The run takes
+# ~4 min unloaded but up to ~12 min when other processes compete for the cores (observed
+# 730 s at load average 7), so the budget guards against runaway runs, not against load.
+SMOKE_BUDGET_S = 1200.0
 
 
 # --------------------------------------------------------------------------------------
