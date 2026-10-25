@@ -355,6 +355,31 @@ def ttt_memorisation_table(mb, corpus, controls: dict[str, list], checkpoints: l
 ```
 Tests: pile_domains.classify_sequence on hand-written protein/law/code strings; difficulty_ranking orders a synthetic NLL table; rdx.explained_fraction is 1 when delta lies in the basis span and ~0 for an orthogonal basis; rdx_score z is high for a planted-in-basis delta; sharing_index Jaccard of identical sets is 1 and of disjoint sets 0; network_activity on a synthetic SAE; ttt.memorisation_speed on pythia-14m with one short snippet LOWERS its NLL over a few steps and restores the original weights afterwards (the passed bundle's logits are unchanged); test_time_train(copy) leaves the original model's logits unchanged; load_corpus returns the placeholder when the path is missing. Mark any test that trains for more than a few steps or needs a real corpus as slow.
 
+## `lsne/transplant.py`  (cross-model activation transplant, DESIGN §4.9)
+
+```python
+class SourceModel(Protocol):            # pluggable source adapter
+    name: str; d_model: int; n_layers: int
+    def encode(self, item) -> Tensor[1,T]
+    def residuals(self, ids: Tensor[1,T], layers: list[int]|None=None) -> dict[int, Tensor[T,d_S]]   # block inputs per layer (plus n_layers = last block output)
+class HFSourceModel(SourceModel): def __init__(self, spec: ModelSpec)   # wraps lsne.model.load_model/run_with_cache; works for any GPT-NeoX/HF causal LM with hidden_states
+class TraceSourceStub(SourceModel): def __init__(self, d_model, n_layers, vocab, seed)   # deterministic random-weight stand-in for a BlockGPT-like trace model (documents the interface; NOT a trained model)
+@dataclass Alignment: W: Tensor[d_S,d_T], b: Tensor[d_T], method: str, rank: int|None, layer_src: int, layer_tgt: int, r2_train: float, r2_holdout: float, r2_permuted: float, n_pairs: int
+def fit_alignment(acts_src: Tensor[N,d_S], acts_tgt: Tensor[N,d_T], method: str="ridge", rank: int|None=None, alpha: float=1.0, holdout: float=0.2, seed: int=0) -> Alignment
+    # ridge: closed form on centered data; procrustes: PCA to rank r on both sides then orthogonal Procrustes; r2_permuted from a seeded permutation of the pairs
+def layer_matching(src: SourceModel, mb_tgt, pairs: list[tuple[item_src, str]], layers_src=None, layers_tgt=None, readout: str="mean", **fit_kw) -> DataFrame(layer_src, layer_tgt, r2_holdout, r2_permuted, gap)
+def transfer_direction(align: Alignment, v_src: Tensor[d_S]) -> Tensor[d_T]      # W^T v (unit-normalised), no bias
+def transfer_states(align: Alignment, H_src: Tensor[n,d_S]) -> Tensor[n,d_T]      # H W + b
+def substitute_residual(mb, input_ids, site: HookSite, positions: list[int], H_new: Tensor[len,d_T]) -> Tensor[V]   # last-position logits with Injector(mode="replace"); returns logits and (via return_info) the audit
+def plant_kv_prefix(mb, input_ids: Tensor[1,T], H_by_layer: dict[int, Tensor[n,d_T]], placeholder_id: int=0, layers: list[int]|None=None) -> dict(logits_last: Tensor[V], logits: Tensor[T,V], n_prefix: int)
+    # runs [placeholder*n] + input_ids with Injector(mode="replace") on the block_input of every layer in H_by_layer (default all L) at prefix positions 0..n-1; the prefix's keys/values are thus computed from the transplanted states; returns logits of the real tokens only (positions n..n+T-1)
+def plant_kv_cache(mb, input_ids, H_by_layer, **kw) -> dict   # same effect implemented through transformers' cache API (DynamicCache prefill with a hooked prefix forward, then the real tokens with past_key_values); must agree with plant_kv_prefix (test)
+def transplant_experiment(mb, src: SourceModel, align: Alignment, v_src: Tensor[d_S], prompts: list[str], site: HookSite, eps: float, n_prefix: int=8, modes=("residual","kv","both"), controls=("random","identity","permuted_alignment"), gen_kw=None) -> DataFrame
+    # per prompt × mode × control: logp_target (if target given), entropy, language fraction of a short steered continuation (lsne.generation.language_trajectory), cosine of the transferred direction with the native lang axis if provided
+def functional_transfer_test(mb_tgt, src: SourceModel, texts_E: list[str], texts_D: list[str], site_src: int, site_tgt: HookSite, native_axis: Tensor[d_T]|None=None, n_gen: int=16, n_samples: int=4, seed: int=0) -> dict(cos_transferred_vs_native, delta_fD_transferred, delta_fD_native, sign_agreement: bool, r2_holdout, r2_permuted)
+```
+Tests (CPU): HFSourceModel on pythia-70m (download ~160 MB once; mark slow+network) and pythia-14m as target: fit_alignment r2_holdout > r2_permuted on paired states of ~40 short sentences; procrustes W has orthonormal columns in the PCA bases; transfer_states shape; substitute_residual with the target's own states reproduces its logits (identity control, atol 1e-4); plant_kv_prefix with n=0 equals the plain forward; plant_kv_prefix and plant_kv_cache agree (atol 1e-3); TraceSourceStub implements the protocol and layer_matching returns a table; functional_transfer_test with pythia-14m as BOTH source and target (same model, d_S = d_T: alignment is near-identity, r2 ~ 1) yields sign_agreement True and cos > 0.9 — this is the self-consistency test; a cross-size test (pythia-70m → pythia-14m) is marked slow and only asserts r2_holdout > r2_permuted and that the outputs are finite.
+
 ## `lsne/stats.py`
 
 `cluster_bootstrap(df, value_col, cluster_col, n_boot=10000, seed=0, stat=np.mean) -> dict(mean, ci_low, ci_high, n_clusters)`;

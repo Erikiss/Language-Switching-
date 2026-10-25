@@ -437,6 +437,54 @@ Fehlfaltung ohne Messung der schwierigste Pile-Teil ist. TTT verändert Gewichte
 gelten alle Befunde am eingefrorenen Modell danach nicht automatisch weiter — jede Größe
 wird nach dem Training neu gemessen.
 
+### 4.9 Cross-Modell-Transplantation: BlockGPT → Pythia (KV-Cache und Residualstrom)
+
+Präzisierung des Auftraggebers (25.10.2026, sechste Rückmeldung): Die Blockchain-Idee war
+nicht als Textkorpus gemeint, sondern als **Quellmodell**: BlockGPT (Gai, Zhou, Qin, Song,
+Gervais 2023, arXiv:2304.12749) ist auf Ethereum trainiert; dort soll die Eigenschaft
+„Teilen“ extrahiert und in Pythia übertragen werden, entweder in den **KV-Cache**
+(Einpflanzen) oder in den **Residualstrom**, dort nicht als Addition, sondern als
+**Aktivierungs-Substitution** (Austausch), am besten beides, da beide Orte unterschiedlich
+zu behandeln sind. Erwartung: starkes Signal, Transfer sollte gelingen.
+
+**Fakten zu BlockGPT, die den Aufbau bestimmen.** Eingabe sind baumkodierte
+EVM-Ausführungsspuren (Call-, State-, Log-Trace als „ITR“), eigene Tokenisierung mit
+100k-Vokabular (93 233 Adressen, 6 759 Funktionssignaturen), 8 Transformer-Layer,
+Kontext 512, Training per Causal-LM auf 68 M Transaktionen der Blöcke 5 470 817 bis
+15 000 000 (**19.04.2018 bis 21.06.2022**). Der DAO-Fork 2016 liegt also außerhalb der
+Trainingsdaten. Es gibt **keine offiziellen Gewichte**; eine inoffizielle Grob-
+Reimplementierung (dm4sec/BlockGPT: ITR-Builder, Trainer, Detector) setzt einen
+Ethereum-Archive-Node voraus. Konsequenz: Der Transfer wird als **modellagnostische
+Maschinerie mit steckbarem Quelladapter** gebaut und sofort mit einem Stand-in-Quellmodell
+verifiziert; ein echtes Spurenmodell (selbst trainiert über dm4sec/BlockGPT oder vom
+Auftraggeber bereitgestellt) wird dann nur noch als Adapter eingehängt.
+
+**Maschinerie (Modul `lsne.transplant`):**
+
+| Schritt | Umsetzung |
+|---|---|
+| Quelladapter | `SourceModel`-Schnittstelle: `encode(item) → ids`, `residual(ids, layer) → [T, d_S]`, `d_model`, `n_layers`; Adapter für HF-Causal-LMs (Stand-in: Pythia-70M/160M, Code-Modelle) und ein Trace-Adapter-Stub für BlockGPT-artige Modelle |
+| Paarung | Alignment braucht **gepaarte** Eingaben: dieselbe Transaktion als Spur (Quelle) und als Textserialisierung (Pythia); beim Stand-in derselbe Text in beiden Modellen |
+| Alignment | lineare Abbildung W: R^{d_S} → R^{d_T} per Ridge-Regression oder orthogonalem Procrustes nach PCA (Rang r); Gütemaß R² auf Hold-out-Paaren, Null = permutierte Paare; Layer-Zuordnung über die beste R²-Kombination (Layer-Matching) |
+| Quellmerkmal „Teilen“ | im Quellmodell als Richtung oder Zustandsmenge: Difference-of-Means zwischen Eingaben mit hohem und niedrigem Teilen (bei Spuren: viele-zu-viele Transfers, viele unterschiedliche Gegenparteien, Fork-Ära vs. Normalbetrieb; beim Stand-in: ein bekanntes Merkmal wie die Sprachachse, damit der Transfer funktional prüfbar ist) oder als SAE-Feature des Quellmodells |
+| Transfer | v_T = W v_S bzw. H_T = W H_S; Qualität: Kosinus zwischen transferierter Richtung und der nativ in Pythia bestimmten Richtung desselben Merkmals (wo vorhanden) |
+| Injektion A: Residual-Substitution | `Injector(mode="replace")` an (Layer, Positionen) mit H_T; keine Addition; Soll/Ist-Audit |
+| Injektion B: KV-Cache-Pflanzung | virtuelles Präfix aus n Platzhaltertokens, dessen Block-Eingänge auf **allen** Layern durch H_T ersetzt werden; die Keys/Values dieser Positionen entstehen damit aus den transplantierten Zuständen (inklusive Rotary an den Präfixpositionen), die echten Tokens sehen sie per Attention, ihr eigener Residualstrom bleibt unangetastet; Variante: nur ausgewählte Layer |
+| Injektion C: beides | A auf den echten Positionen plus B im Präfix |
+| Kontrollen | permutierte Paare im Alignment, Zufallsrichtungen gleicher Norm, Substitution mit Zuständen des Zielmodells selbst (Identitätskontrolle), virtuelles Präfix aus echten Zielmodell-Zuständen |
+
+**Messungen:** T und B der Sprachwechselaufgabe, Sprachanteil in generiertem Text,
+Sharing-Index und Netzwerkaktivität (§4.8c), Domänenprofil (§4.7), Störungsausbreitung
+(§4.2) — jeweils für A, B, C gegen die Kontrollen. Funktionaler Transfertest beim
+Stand-in: Die im Quellmodell bestimmte Sprachachse muss nach Transfer in Pythia den
+Sprachanteil der Fortsetzungen in dieselbe Richtung verschieben wie die native Achse
+(Vorzeichen und Mindestkorrelation), sonst ist die Maschinerie nicht validiert.
+
+**Was hier nicht behauptet wird:** dass BlockGPT ein Merkmal „Teilen“ enthält, bevor es
+im Quellmodell operationalisiert und gemessen wurde; dass ein 2018–2022-Modell den
+Fork 2016 kennt; dass eine Transplantation ohne Alignment-Güte über der Permutationsnull
+interpretierbar ist.
+
 ### 4.3 Dossier-Kernkontraste (Frage 2 und Replikation)
 
 T(K, C), B(x) pro Richtung, I(K, C). Wechselwirkung K × C, Transfer `ent` von
@@ -516,6 +564,7 @@ Shard schreibt eigene Ergebnisdateien, `lsne.cli merge` fügt zusammen.
 | I Kompass + Heads | Domänenprofile (Atlas-Proxy/-Import), Domänenachsen mit Gegensteuern, Head-Attribution, Steering am schlechtesten Head | `08_compass_heads` | Domänenprofil von `ent` dokumentiert; Richtung × Domäne-Interaktion auf Entwicklungsfamilien |
 | J RDX + Sharing | Differenzerklärung gegen Zufallsbasen, empirische Schwierigkeitsrangfolge der Pile-Teilgebiete, Sharing-Index und Netzwerkaktivität | `09_rdx_sharing` | Gegenpol wird durch die NLL-Rangfolge bestimmt, nicht gesetzt |
 | K Test-Time-Training | Kontrastkorpus-Training, Memorisationsgeschwindigkeit über Checkpoints, Vorher/Nachher auf allen Kenngrößen, drei Kontrollarme | `10_ttt_injection` | Effekt nur gültig, wenn er über allen drei Kontrollarmen liegt |
+| L Transplantation | Quelladapter, Alignment mit Permutationsnull, Residual-Substitution, KV-Cache-Pflanzung, Stand-in-Validierung | `11_transplant` | Funktionaler Transfertest mit dem Stand-in muss bestehen, bevor ein Spurenmodell eingehängt wird |
 | E Tensornetz | lineare Antwort, TNCO vs. opt_einsum, Nichtlinearität | `04_tn_linear_response` | Berichtet Kosten/Laufzeit/Fehler; kein Hypothesentest |
 | F Skala & Verlauf | 410M/1B/1.4B, Checkpoint-Sweep; BF16-Vergleich | `05_scale_and_checkpoints` | Shards, Drive-Export |
 

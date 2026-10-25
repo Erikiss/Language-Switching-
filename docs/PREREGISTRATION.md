@@ -85,6 +85,14 @@ Mindesteffektgrenze nicht ausschließt, gilt als „offen“, nicht als Nullbefu
     Entwicklungsfamilien explorativ, Bestätigung auf Testfamilien mit eingefrorener
     Schrittzahl und Lernrate.
 
+18. Transplantation (Stufe L), Stand-in-Validierung: Alignment-R² auf Hold-out-Paaren
+    gegen permutierte Paare (Mindestabstand 0,2); Kosinus zwischen transferierter und
+    nativer Sprachachse in Pythia ≥ 0,3 im besten Layer; Vorzeichengleichheit der
+    Verschiebung des Sprachanteils in generiertem Text für Residual-Substitution und
+    KV-Pflanzung gegenüber der nativen Achse. Erst nach bestandener Validierung wird ein
+    Spurenmodell als Quelle gewertet; dessen „Teilen“-Merkmal wird vorab im Quellmodell
+    definiert und eingefroren.
+
 ## 4. Ausschlussregeln (vor Sichtung der Modellwerte)
 
 - Variante ausgeschlossen, wenn Ziel-ID oder Tail-Token-IDs vom K=0-Fall abweichen
