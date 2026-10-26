@@ -4204,7 +4204,8 @@ def build_notebook(stem: str) -> nbformat.NotebookNode:
     nb.metadata = {
         "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
         "language_info": {"name": "python"},
-        "colab": {"name": f"{stem}.ipynb", "provenance": []},
+        "colab": {"name": f"{stem}.ipynb", "provenance": [], "gpuType": "A100"},
+        "accelerator": "GPU",
         "lsne": {"generator": "scripts/build_notebooks.py", "stage": stage, "title": title,
                  "git_url": GIT_URL, "git_branch": GIT_BRANCH},
     }
