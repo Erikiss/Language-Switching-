@@ -152,6 +152,28 @@ def transplant_tables(mb: ModelBundle, src, aligns: dict, v_src: torch.Tensor, n
     return df, pd.DataFrame(rows)
 
 
+def contrast18_verdict(tt_summary: pd.DataFrame, tp_summary: pd.DataFrame, source_kind: str) -> pd.DataFrame:
+    """Pre-registration item 18 as one row: the functional transfer criteria at the best layer
+    AND sign agreement with the native axis for residual substitution and KV planting.
+    Sources that are the target itself (``self``) or an isometry of it (``rotated_self``) meet
+    the R2 and cosine criteria by construction; they are plumbing checks and give no verdict."""
+    if tt_summary is None or tt_summary.empty:
+        return pd.DataFrame()
+    t = tt_summary.iloc[0]
+    signs = {}
+    for mode in ("residual", "kv"):
+        m = tp_summary[tp_summary["mode"] == mode] if tp_summary is not None and len(tp_summary) else pd.DataFrame()
+        signs[mode] = bool(m["sign_agrees_with_native"].iloc[0]) if len(m) else False
+    self_consistency = source_kind in ("self", "rotated_self")
+    transfer_ok = bool(t["r2_gap_ok"] and t["cos_ok"] and t["sign_agreement"])
+    validated = bool(transfer_ok and signs["residual"] and signs["kv"])
+    return pd.DataFrame([dict(source_kind=source_kind, self_consistency=self_consistency, best_layer=int(t["best_layer"]),
+                              r2_gap_ok=bool(t["r2_gap_ok"]), cos_ok=bool(t["cos_ok"]), sign_agreement_steering=bool(t["sign_agreement"]),
+                              readout_alive=bool(t["readout_alive"]), sign_residual=signs["residual"], sign_kv=signs["kv"],
+                              transfer_ok=transfer_ok, validated=(np.nan if self_consistency else validated),
+                              counts_for_prereg=not self_consistency)])
+
+
 # --------------------------------------------------------------------------------------
 # run
 # --------------------------------------------------------------------------------------
@@ -173,17 +195,25 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     k0 = C.k_subset(variants, 0)[: int(limits.l_n_prompts)]
     prompts = [v.text for v in k0] or ["Yesterday we went to the market and"]
     grid = list(C.prereg_layer_grid(mb.n_layers))
-    site = HookSite(mb.n_layers // 2, "block_input")
 
     tt, tt_summary, results = sub.run("functional_transfer", lambda: transfer_tables(mb, src, texts_E, texts_D, texts_N, grid, prompts, cfg,
                                                                                     limits, enabled=limits.progress), (empty, empty, {}))
+    # The transplant is run at a layer of the pre-registered grid: the best validated layer of the
+    # functional transfer test (else the grid layer nearest the middle). v_src, the native axis and
+    # the native sign reference are then taken at exactly this injection site.
+    if len(tt_summary) and np.isfinite(tt_summary["best_layer"].iloc[0]):
+        site_layer = int(tt_summary["best_layer"].iloc[0])
+    else:
+        site_layer = int(min(grid, key=lambda l: abs(l - mb.n_layers // 2))) if grid else mb.n_layers // 2
+    site = HookSite(site_layer, "block_input")
+    self_consistency = source_kind in ("self", "rotated_self")
     pairs = [(t, t) for t in texts_E + texts_D + texts_N]
     lm, al = sub.run("alignments", lambda: alignment_tables(src, mb, pairs, list(range(mb.n_layers + 1))), (empty, dict(aligns={}, table=empty)))
 
     def _transplant():
         if not al["aligns"]:
             raise RuntimeError("no alignments")
-        key = site.layer if site.layer in results else (max(results) if results else None)
+        key = site.layer if site.layer in results else None
         if key is not None:
             v_src, native, d_nat = results[key]["v_src"], results[key]["v_native"], float(results[key]["delta_fD_native"])
         else:
@@ -194,14 +224,17 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
         return transplant_tables(mb, src, al["aligns"], v_src, native, [(v.text, int(v.target_id)) for v in k0] or prompts, site, cfg, limits, d_nat)
     tp, tp_summary = sub.run("transplant", _transplant, (empty, empty))
 
+    verdict = contrast18_verdict(tt_summary, tp_summary, source_kind)
     tables = {"transfer_test": tt, "transfer_summary": tt_summary, "layer_matching": lm, "alignments": al["table"], "transplant": tp,
-              "transplant_summary": tp_summary}
+              "transplant_summary": tp_summary, "verdict": verdict}
     sub.write_tracebacks(run_dir)
     return C.finish_stage(run_dir, "L", cfg, mb, tables, limits=limits, t0=t0, site=site, source=dict(kind=source_kind, name=getattr(src, "name", ""),
                                                                                                      d_model=int(src.d_model), n_layers=int(src.n_layers)),
                           n_texts=dict(E=len(texts_E), D=len(texts_D), neutral=len(texts_N)), prompts=prompts, layer_grid=grid,
-                          validated=(bool(tt_summary["validated"].iloc[0]) if len(tt_summary) else None),
+                          validated=(None if verdict.empty or self_consistency else bool(verdict["validated"].iloc[0])),
+                          self_consistency=self_consistency,
                           transplant=dict(eps=limits.l_eps, n_prefix=limits.l_n_prefix, n_gen=cfg.gen_n_new, n_samples=cfg.gen_n_samples),
                           substages=sub.report(),
-                          prereg=dict(contrast_18="transfer_summary: r2_gap_ok, cos_ok, sign_agreement, validated; "
-                                                  "transplant_summary: sign_agrees_with_native per mode"))
+                          prereg=dict(contrast_18="verdict.validated = transfer_summary (r2_gap_ok, cos_ok, sign_agreement at the best layer) "
+                                                  "AND transplant_summary.sign_agrees_with_native for modes residual and kv; "
+                                                  "no verdict for self-consistency sources (self, rotated_self)"))

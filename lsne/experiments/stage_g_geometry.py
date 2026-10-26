@@ -188,14 +188,19 @@ def g0_tables(mb: ModelBundle, groups: dict, mono_D: dict, sites: Sequence[HookS
     cols = ["site", "layer", "category", "n_pairs", "mean_mahal", "sd_mahal", "mean_cosine", "sd_cosine",
             "core_order_ok", "r_eff", "n_states", "degenerate"]
     gate_cols = ["n_layers", "n_ok", "frac_ok", "pass_all", "n_middle", "n_ok_middle", "frac_ok_middle",
-                 "pass_middle", "degenerate", "n_states", "n_families", "k", "r"]
+                 "pass_middle", "degenerate", "n_states", "n_families", "k", "r", "r_requested"]
     if len(items) < 3:
         return pd.DataFrame(columns=cols), pd.DataFrame([dict(n_layers=0, n_ok=0, frac_ok=np.nan, pass_all=False,
                                                            n_middle=0, n_ok_middle=0, frac_ok_middle=np.nan,
                                                            pass_middle=False, degenerate=True, n_states=len(items),
-                                                           n_families=0, k=k, r=r)], columns=gate_cols)
+                                                           n_families=0, k=k, r=r, r_requested=r)], columns=gate_cols)
     tmp = {("g0", i): [it[3]] for i, it in enumerate(items)}
     states = pooled_states(mb, tmp, sites, ("mean_prefix",))
+    # A whitened (Mahalanobis) metric with rank r close to N-1 maps N points onto a regular
+    # simplex: all pairwise distances become equal and any ordering is a floating-point accident.
+    # The gate therefore caps the rank at (N-1)//4 (pre-registration item 7, sample-size note).
+    r_requested = int(r)
+    r = int(max(1, min(r_requested, (len(items) - 1) // 4)))
     labels = pd.DataFrame([dict(family=it[0], formulation=it[1], lang=it[2]) for it in items])
     rows: list[dict] = []
     oks: list[tuple[int, bool]] = []
@@ -222,10 +227,13 @@ def g0_tables(mb: ModelBundle, groups: dict, mono_D: dict, sites: Sequence[HookS
     lo, hi = n // 3, max(n // 3 + 1, (2 * n + 2) // 3)
     middle = layers[lo:hi] if n >= 3 else layers
     n_ok_m = sum(1 for _, ok in middle if ok)
-    gate = dict(n_layers=n, n_ok=n_ok, frac_ok=(n_ok / n) if n else np.nan, pass_all=bool(n and n_ok / n >= 0.5),
+    # a degenerate metric makes the gate uninformative: no pass/fail verdict (None), never True
+    pass_all = None if degenerate else bool(n and n_ok / n >= 0.5)
+    pass_middle = None if degenerate else bool(middle and n_ok_m / len(middle) >= 0.5)
+    gate = dict(n_layers=n, n_ok=n_ok, frac_ok=(n_ok / n) if n else np.nan, pass_all=pass_all,
                 n_middle=len(middle), n_ok_middle=n_ok_m, frac_ok_middle=(n_ok_m / len(middle)) if middle else np.nan,
-                pass_middle=bool(middle and n_ok_m / len(middle) >= 0.5), degenerate=degenerate,
-                n_states=len(items), n_families=int(labels["family"].nunique()), k=int(k), r=int(r))
+                pass_middle=pass_middle, degenerate=degenerate,
+                n_states=len(items), n_families=int(labels["family"].nunique()), k=int(k), r=int(r), r_requested=r_requested)
     return pd.DataFrame(rows, columns=cols), pd.DataFrame([gate], columns=gate_cols)
 
 

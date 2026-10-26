@@ -44,6 +44,9 @@ Mindesteffektgrenze nicht ausschließt, gilt als „offen“, nicht als Nullbefu
 7. Geometrie-Gate G0 (kein Hypothesentest, Voraussetzung): unter trunkierter
    Mahalanobis-Distanz, Mean-Pool, Deflation k=5, mittlere Layer: d(A_E, A_D) <
    d(A_E, B_E) < d(Fremdfamilie) in ≥ 50 % der Layer; sonst werden 8–9 nicht interpretiert.
+   Stichprobenhinweis: Bei N gepoolten Zuständen wird der Mahalanobis-Rang auf
+   min(128, (N−1)//4) begrenzt; bei einer entarteten Metrik (r ≥ N−1) gibt das Gate kein
+   Urteil ab.
 8. Kontraktion unter Sprachwechsel G1: Δ log-Vol(K=8, C1) − Δ log-Vol(K=0) (Mean-Pool,
    k=5) und dasselbe für PR (Last-Token); zweiseitig, Vorzeichen offen.
 9. Steering-Validität T3: Kosinus zwischen der Steuerverschiebung (`lang_dom`, ε = 0,05)
@@ -53,7 +56,8 @@ Mindesteffektgrenze nicht ausschließt, gilt als „offen“, nicht als Nullbefu
 10. λ-Dynamik (Stufe H), Diskriminante (b) −log p(Ziel) an der Dossier-Stelle,
     Zielklassen-Dichte aus K=8/C1-Zuständen: Spearman-ρ zwischen λ und (i) dem
     SAE-Rekonstruktionsfehler am Endpunkt (Erwartung ρ < 0: Mimikry-Endpunkte sind
-    besser rekonstruierbar), (ii) der Zahl der Schritte bis zur Grenzüberquerung,
+    besser rekonstruierbar), (ii) der Zahl der Schritte bis zur Grenzüberquerung (nie querende Pfade
+    werden bei n_steps+1 zensiert, nicht verworfen),
     (iii) dem Mahalanobis-Abstand zur Zielwolke (Erwartung ρ < 0). Features mit
     |ρ| ≥ 0,7 über den Sweep auf Entwicklungsfamilien werden als Kandidaten eingefroren
     und auf Testfamilien geprüft.
@@ -70,6 +74,8 @@ Mindesteffektgrenze nicht ausschließt, gilt als „offen“, nicht als Nullbefu
     Kultur/Politik-Familien, Familien-Bootstrap, Mindesteffekt 0,05 nats.
 14. Head-Arm: B bei Steering am schlechtesten Head (Auswahl auf Entwicklungsfamilien
     eingefroren) vs. am Residualstrom bei gleicher relativer Dosis; zweiseitig.
+    Ohne eingefrorene Vorgabe wird der Head auf einer Hälfte der Familien jeder
+    Domänengruppe ausgewählt und auf der disjunkten anderen Hälfte getestet.
 
 15. RDX-Anteil (Stufe J): Bruchteil von ‖Δ‖² der Differenz Kultur/Politik ↔
     Proteinfehlfaltung, der durch die Domänenachsen erklärt wird, gegen 32 Zufallsbasen
@@ -89,7 +95,9 @@ Mindesteffektgrenze nicht ausschließt, gilt als „offen“, nicht als Nullbefu
     gegen permutierte Paare (Mindestabstand 0,2); Kosinus zwischen transferierter und
     nativer Sprachachse in Pythia ≥ 0,3 im besten Layer; Vorzeichengleichheit der
     Verschiebung des Sprachanteils in generiertem Text für Residual-Substitution und
-    KV-Pflanzung gegenüber der nativen Achse. Erst nach bestandener Validierung wird ein
+    KV-Pflanzung gegenüber der nativen Achse. Die Validierung verwendet ein vom Ziel verschiedenes Quellmodell
+    (Standard Pythia-70M); das Zielmodell selbst oder eine Isometrie davon zählt nur als
+    Funktionsprobe. Erst nach bestandener Validierung wird ein
     Spurenmodell als Quelle gewertet; dessen „Teilen“-Merkmal wird vorab im Quellmodell
     definiert und eingefroren.
 

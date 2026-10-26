@@ -93,7 +93,7 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     sub_limits = limits.as_limited()
     pairs = kw.get("pairs")
     if pairs is None:
-        pairs = default_pairs(cfg) if not limits.smoke else [(cfg.model.name, cfg.model.revision)]
+        pairs = default_pairs(cfg) if not limits.is_smoke else [(cfg.model.name, cfg.model.revision)]
     pairs = [(str(m), str(r)) for m, r in pairs]
     stages = tuple(kw.get("f_stages") or limits.f_stages)
     shard_index, shard_count = int(kw.get("shard_index", 0)), int(kw.get("shard_count", 1))

@@ -268,6 +268,32 @@ def head_tables(mb: ModelBundle, variants, grid: Sequence[int], enabled: bool = 
     return eff, direct
 
 
+def split_selection_families(families: Sequence[str]) -> tuple[list[str], list[str]]:
+    """Disjoint selection / evaluation families for the worst-head arm (pre-registration 14:
+    the selection is frozen before the head is tested). Within every domain group the sorted
+    family ids alternate: even positions select, odd positions evaluate."""
+    by_group: dict[str, list[str]] = {}
+    for f in sorted({str(x) for x in families}):
+        by_group.setdefault(C.family_domain(f), []).append(f)
+    sel, ev = [], []
+    for fs in by_group.values():
+        sel += fs[0::2]
+        ev += fs[1::2]
+    return sel, ev
+
+
+def parse_frozen_head(spec) -> Optional[tuple[int, int]]:
+    """``"L:H"`` (or a (layer, head) pair / dict) -> (layer, head); None if not given."""
+    if spec is None or spec == "":
+        return None
+    if isinstance(spec, dict):
+        return int(spec["layer"]), int(spec["head"])
+    if isinstance(spec, (tuple, list)):
+        return int(spec[0]), int(spec[1])
+    a, _, b = str(spec).partition(":")
+    return int(a), int(b)
+
+
 def select_worst_head(eff: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     e = eff.rename(columns={"family": "family_id"})
     fams = sorted(set(e["family_id"].astype(str)))
@@ -375,12 +401,27 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
 
     grid = C.prereg_layer_grid(mb.n_layers)
     eff, direct = sub.run("heads", lambda: head_tables(mb, std, grid, enabled=limits.progress), (empty, empty))
-    wh_table, wh = sub.run("worst_head", lambda: select_worst_head(eff) if len(eff) else (empty, {}), (empty, {}))
+    # Worst head: frozen input if given (limits.i_frozen_head / kw worst_head), else selected on a
+    # disjoint half of the families and tested on the other half (pre-registration 14).
+    frozen = parse_frozen_head(kw.get("worst_head") or limits.i_frozen_head)
+    sel_fams, eval_fams = split_selection_families([v.family_id for v in std])
+    overlap = False
+    if frozen is not None:
+        wh_table, wh = empty, dict(layer=frozen[0], head=frozen[1], selection="frozen_input", score=np.nan, loss=np.nan)
+        eval_variants = std
+    else:
+        if not eval_fams:                      # a single family (smoke runs): no disjoint split possible
+            eval_fams, overlap = list(sel_fams), True
+        eff_sel = eff[eff["family"].astype(str).isin(sel_fams)] if len(eff) else eff
+        wh_table, wh = sub.run("worst_head", lambda: select_worst_head(eff_sel) if len(eff_sel) else (empty, {}), (empty, {}))
+        eval_variants = [v for v in std if str(v.family_id) in set(eval_fams)]
+    wh = dict(wh, selection_families=sel_fams if frozen is None else [], evaluation_families=sorted({str(v.family_id) for v in eval_variants}),
+              selection_evaluation_overlap=overlap)
     if ctx is not None:
         ctx["worst_head"] = wh
     steer_dirs = {n: d for n, d in (("lang_dom", bank.get("lang_dom")), ("dom_culture_politics", axes.get("dom_culture_politics"))) if d is not None}
-    hs, hs_boot = sub.run("head_steering", lambda: head_steering_tables(mb, std, wh, steer_dirs, limits.i_head_eps, limits.n_boot, cfg.seed,
-                                                                        enabled=limits.progress), (empty, empty))
+    hs, hs_boot = sub.run("head_steering", lambda: head_steering_tables(mb, eval_variants, wh, steer_dirs, limits.i_head_eps, limits.n_boot,
+                                                                        cfg.seed, enabled=limits.progress), (empty, empty))
 
     tables = {"compass": comp, "compass_summary": comp_summary, "atlas_overlap": atlas, "domain_axes": axes_tab,
               "direction_domain": dd, "direction_domain_T": dd_T, "direction_domain_boot": dd_boot, "head_effects": eff,
@@ -394,4 +435,5 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
                           n_variants=len(std), substages=sub.report(),
                           prereg=dict(contrast_12="compass_summary: direction=ent, lang=E -> law_is_top / law_rank",
                                       contrast_13="direction_domain_boot quantity=B_cs_minus_lang_dom, family_domain=culture_politics, K=8/C1",
-                                      contrast_14="head_steering_boot quantity=B_head_minus_residual"))
+                                      contrast_14="head_steering_boot quantity=B_head_minus_residual (evaluation families only; "
+                                                  "worst_head.selection_families disjoint unless selection_evaluation_overlap)"))

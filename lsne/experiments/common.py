@@ -104,11 +104,13 @@ SMOKE_GL: dict = dict(
 class Limits:
     """Run-size parameters outside :class:`~lsne.config.RunConfig`.
 
-    ``smoke`` marks the < 3 min CPU preset (see :meth:`smoke`), ``limited`` the reduced
+    ``is_smoke`` marks the < 3 min CPU preset (built by :meth:`smoke`; the field must not share
+    the classmethod's name, or the bound method shadows the default and is truthy in every
+    run), ``limited`` the reduced
     stages C/D of the scale sweep (stage F): fewer random directions in D1, no random
     directions in the grid, generation diagnostics for ``lang_dom`` only.
     """
-    smoke: bool = False
+    is_smoke: bool = False
     limited: bool = False
     progress: bool = True
     # stage B
@@ -159,6 +161,7 @@ class Limits:
     i_max_words: Optional[int] = None     # domain words per side (None = all)
     i_head_eps: tuple = (0.1, 0.5)        # relative doses of the head arm
     i_n_random_profile: int = 32          # random directions of the domain-profile z (PREREG 12: 32)
+    i_frozen_head: Optional[str] = None   # "L:H" frozen worst head from a development run (PREREG 14); None = select on a family half
     # stage J (RDX / pile / sharing)
     j_n_pile: int = 2000                  # Pile sequences of the difficulty ranking (PREREG 16: >= 2000)
     j_pile_max_len: int = 512
@@ -180,7 +183,9 @@ class Limits:
     k_checkpoints: Optional[tuple] = None # extra revisions of the memorisation table (None = current only)
     k_eps: float = 0.05                   # dose of the before/after B(x)
     # stage L (transplant)
-    l_source: str = "rotated_self"        # "rotated_self" | "self" | "model@revision" (HF causal LM)
+    # Source model of stage L. Full runs use a genuinely different model (pre-registration 18:
+    # "Stand-in-Validierung"); "self" / "rotated_self" are plumbing checks without a verdict.
+    l_source: str = "EleutherAI/pythia-70m@step143000"   # "model@revision" | "rotated_self" | "self"
     l_n_texts: int = 48                   # paired E/D unit sentences per language
     l_n_prompts: int = 3                  # prompts of the transplant experiment
     l_n_prefix: int = 8                   # virtual KV prefix length
@@ -194,7 +199,7 @@ class Limits:
     @classmethod
     def smoke(cls, **kw) -> "Limits":
         """Preset for the CPU smoke run (pythia-14m, one family, three variants)."""
-        base = dict(smoke=True, n_unigram=5, n_random_patch=2, n_boot=200, damage_doses=(0.01, 0.1),
+        base = dict(is_smoke=True, n_unigram=5, n_random_patch=2, n_boot=200, damage_doses=(0.01, 0.1),
                     gen_n_steps=2, gen_tokens_per_step=2, gen_t_on=2, n_boot_tau=5,
                     n_families_tn=1, tn_doses=(0.01, 0.1), tn_n_steps=50, tn_n_runs=1,
                     use_sae=False)
@@ -499,7 +504,7 @@ def load_original(cfg: RunConfig, mb: ModelBundle, limits: Optional[Limits] = No
     except Exception as e:  # noqa: BLE001
         warnings.warn(f"original-context variants could not be built ({e!r})")
         return None
-    if limits is not None and limits.smoke:
+    if limits is not None and limits.is_smoke:
         vs = core_subset(vs)
     return Original(anchor=a, family=fam, variants=vs)
 

@@ -649,10 +649,21 @@ def test_marker_lexicon_and_sites(mb, tok):
 # --------------------------------------------------------------------------------------
 # stages G-L: shared helpers
 # --------------------------------------------------------------------------------------
+def test_limits_full_run_is_not_smoke():
+    """Regression: a dataclass field named like the ``smoke`` classmethod was shadowed by
+    the bound method and evaluated truthy in every full run (trimming the original-2143
+    variants and collapsing the scale sweep of stage F to one model)."""
+    from dataclasses import asdict
+    full = C.Limits()
+    assert full.is_smoke is False and asdict(full)["is_smoke"] is False
+    assert not any(callable(v) for v in asdict(full).values())
+    assert C.Limits.smoke().is_smoke is True
+
+
 def test_limits_smoke_preset_covers_stages_g_to_l():
     full, smoke = C.Limits(), C.Limits.smoke()
     assert full.g_k_levels == (0, 2, 4, 8) and full.j_n_pile == 2000 and full.h_n_steps == 100 and not full.synthetic_sae_if_missing
-    assert smoke.smoke and smoke.g_k_levels == (0, 8) and smoke.g_max_masks == 3 and smoke.j_n_pile == 3 and smoke.synthetic_sae_if_missing
+    assert smoke.is_smoke and smoke.g_k_levels == (0, 8) and smoke.g_max_masks == 3 and smoke.j_n_pile == 3 and smoke.synthetic_sae_if_missing
     assert set(C.SMOKE_GL) <= {f.name for f in C.Limits.__dataclass_fields__.values()}
     assert C.Limits.smoke(h_n_steps=2).h_n_steps == 2 and C.Limits.smoke().n_unigram == 5
 

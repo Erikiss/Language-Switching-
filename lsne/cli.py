@@ -85,6 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--transplant-source", default=None,
                    help="stage L: rotated_self (default) | self | model@revision (HF causal LM, e.g. EleutherAI/pythia-70m@step143000)")
     r.add_argument("--atlas-dir", default=None, help="stage I: directory with the stored atlas extraction (default data/atlas)")
+    r.add_argument("--worst-head", default=None, help="stage I: frozen worst head 'L:H' from a development run (pre-registration 14)")
     r.add_argument("--no-progress", action="store_true")
 
     m = sub.add_parser("merge", help="merge csv tables of several run directories")
@@ -184,7 +185,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     cfg, limits = make_config(args)
     stages = parse_stages(args.stage)
     kw = dict(axis_npz=args.axis_npz, shard_index=int(args.shard_index), shard_count=int(args.shard_count),
-              ttt_corpus=args.ttt_corpus, transplant_source=args.transplant_source, atlas_dir=args.atlas_dir,
+              ttt_corpus=args.ttt_corpus, transplant_source=args.transplant_source, atlas_dir=args.atlas_dir, worst_head=args.worst_head,
               ttt_checkpoints=([s.strip() for s in args.ttt_checkpoints.split(",") if s.strip()] if args.ttt_checkpoints else None))
     if args.pairs:
         kw["pairs"] = parse_pairs(args.pairs, cfg)
@@ -192,7 +193,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         kw["pairs"] = [(cfg.model.name, cfg.model.revision)]
     kw["f_stages"] = list(limits.f_stages)
     print(f"[lsne] model {cfg.model.tag()} device={cfg.model.device} stages={''.join(stages)} out={cfg.out_root}"
-          f"{' SMOKE' if limits.smoke else ''}", flush=True)
+          f"{' SMOKE' if limits.is_smoke else ''}", flush=True)
     report = run_stages(cfg, limits, stages, **kw)
     summary_path = Path(cfg.out_root) / f"run_report_{cfg.model.tag().replace(':', '_').replace('@', '_')}.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)

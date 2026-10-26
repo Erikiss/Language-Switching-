@@ -74,7 +74,9 @@ from . import common as C
 from .stage_g_geometry import realization_clouds
 
 PREREG_DISCRIMINANT = "target_logit"
-PREREG_QUANTITIES = {"sae_fvu": -1, "steps_to_cross": 0, "mahal_to_ref_mean": -1}   # expected sign of rho (0 = open)
+# expected sign of rho (0 = open). Contrast 10(ii) uses the censored step count: uncrossed paths
+# are set to n_steps+1 rather than dropped (the raw column 'steps_to_cross' is kept as secondary).
+PREREG_QUANTITIES = {"sae_fvu": -1, "steps_to_cross_censored": 0, "mahal_to_ref_mean": -1}
 PREREG_CANDIDATE_RHO = 0.7
 PREREG_LAMBDA_REL_B = 3.0
 N_RANGE_POINTS = 16
@@ -223,6 +225,9 @@ def sweep_start(mb: ModelBundle, v, site: HookSite, kinds: Sequence[str], bank, 
                        kde_bandwidth=float(kde.bandwidth), kde_n_eff=int(kde.n_eff), n_target=int(H_target.shape[0]),
                        **{k: (np.nan if val is None else val) for k, val in geo.items() if k != "lam"},
                        crossed=bool(tr.steps_to_cross is not None),
+                       # censored at n_steps+1: a path that never crosses (the lambda=0 'stands still'
+                       # signature, DESIGN 4.6) ranks after every crossing path instead of being dropped
+                       steps_to_cross_censored=float(tr.steps_to_cross if tr.steps_to_cross is not None else int(limits.h_n_steps) + 1),
                        logp_target=float(e["logp_target"]), p_target=float(e["p_target"]), entropy=float(e["entropy"]),
                        p_freq=float(e["p_freq"]), B=float(e["B"]), kl_from_base=kl_from_base,
                        logp_target_unperturbed=float(eff.attrs.get("logp_target_unperturbed", np.nan)))
@@ -243,13 +248,14 @@ def sweep_start(mb: ModelBundle, v, site: HookSite, kinds: Sequence[str], bank, 
 
 PATH_COLS = ["context", "tag", "family", "formulation", "K", "C", "site", "position", "n_tokens", "target_id", "norm_h0",
              "sae_source", "discriminant", "lam_rel", "lam", "lambda_unit", "g_range", "kde_bandwidth", "kde_n_eff", "n_target",
-             "path_length", "net_displacement", "tortuosity", "mean_turning_angle_deg", "n_steps", "steps_to_cross", "final_g",
-             "final_density", "final_F", "dist_from_start", "converged", "reason", "initial_g", "g_drop", "crossed",
+             "path_length", "net_displacement", "tortuosity", "mean_turning_angle_deg", "n_steps", "steps_to_cross", "steps_to_cross_censored",
+             "final_g", "final_density", "final_F", "dist_from_start", "converged", "reason", "initial_g", "g_drop", "crossed",
              "logp_target", "p_target", "entropy", "p_freq", "B", "kl_from_base", "logp_target_unperturbed",
              "mahal_to_ref_mean", "euclid_to_ref_mean", "knn_mean_dist", "knn_mean_mahal", "local_log_volume", "sae_fvu",
              "n_shared_features_with_ref", "n_active_features"]
 STEP_COLS = ["context", "tag", "family", "formulation", "discriminant", "lam_rel", "step", "g", "density", "F", "dist_from_start"]
 CORR_QUANTITIES = ["path_length", "net_displacement", "tortuosity", "mean_turning_angle_deg", "n_steps", "steps_to_cross",
+                   "steps_to_cross_censored",
                    "final_g", "final_density", "dist_from_start", "crossed", "logp_target", "entropy", "p_freq", "B",
                    "kl_from_base", "mahal_to_ref_mean", "euclid_to_ref_mean", "knn_mean_dist", "knn_mean_mahal",
                    "local_log_volume", "sae_fvu", "n_shared_features_with_ref", "n_active_features"]
@@ -413,5 +419,6 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
                                     cross_nats=limits.h_cross_nats, ball_metric="l2"),
                           original=(original.info() if original is not None else None), substages=sub.report(),
                           prereg=dict(contrast_10="lambda_boot rows with preregistered=True (discriminant target_logit; "
-                                                  "sae_fvu, steps_to_cross, mahal_to_ref_mean); lambda_features candidate=|rho|>=0.7",
+                                                  "sae_fvu, steps_to_cross_censored (uncrossed paths at n_steps+1; raw steps_to_cross secondary), mahal_to_ref_mean); "
+                                                  "lambda_features candidate=|rho|>=0.7",
                                       contrast_11="lambda_original: B_lambda0 vs B_lambda3, same_sign"))
