@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
-# End-to-end validation run of the trace source model on REAL 2016 Ethereum data at CPU
-# scale (docs/TRACE_SOURCE.md, section "Befehle").  A plumbing validation, not the
-# scientific result: a 'small' GPT-NeoX trained for ~35 min on a sampled slice.
+# End-to-end run of the trace source model on REAL 2016 Ethereum data (docs/TRACE_SOURCE.md).
+# Defaults = the CPU-scale validation run of 26.10.2026: every 25th chunk of blocks
+# 1 428 000-2 100 000 plus the full drain (1 718 000-1 719 999) and fork (1 920 000-1 921 999)
+# chunks, a 'small' GPT-NeoX trained for 200 steps x 8 x 512 tokens (~30 min on 4 shared
+# CPU cores).  A plumbing validation, not the scientific result.
 #
-#   scripts/trace_e2e.sh                 # all steps in order
-#   scripts/trace_e2e.sh vocab bench     # selected steps
+#   scripts/trace_e2e.sh                          # all steps in order
+#   scripts/trace_e2e.sh vocab bench              # selected steps (also: vocab_report)
+#   SIZE=blockgpt STEPS=20000 BATCH=32 LR=3e-4 WARMUP=200 DEVICE=auto scripts/trace_e2e.sh train
+#   BLOCK_FROM=778000 BLOCK_TO=2913000 EVERY=1 EXTRA_RANGES="" scripts/trace_e2e.sh download serialize
 #
 # Steps: download serialize vocab bench baseline train evaluate untrained probe pair align
 #        profile2016 report
 # Every step is resumable / idempotent (cached chunks and existing shards are skipped,
 # training resumes from its newest checkpoint); a failing step is logged with its exit
-# code and the script continues with the next one.  Logs: $OUT/logs/<step>.log.
+# code and the script continues with the next one.  Logs: $OUT/logs/<step>.log, results:
+# $OUT/{bench.csv,baselines.json,eval.json,probe_report.json,layer_matching.csv,summary.json}.
+# Every setting below can be overridden from the environment.
 # Data: ethPandaOps Xatu (https://ethpandaops.io/posts/xatu-execution-layer/), CC BY 4.0.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -18,6 +24,13 @@ cd "$(dirname "$0")/.."
 PY=${PY:-python}
 OUT=${OUT:-runs/trace_e2e}
 CACHE=${CACHE:-cache/xatu}
+BLOCK_FROM=${BLOCK_FROM:-1428000}       # corpus range [BLOCK_FROM, BLOCK_TO), every EVERY-th chunk
+BLOCK_TO=${BLOCK_TO:-2100000}
+EVERY=${EVERY:-25}
+EXTRA_RANGES=${EXTRA_RANGES-"1718000-1720000 1920000-1922000"}   # fully downloaded sub-ranges (drain, fork)
+WORKERS=${WORKERS:-4}
+DEVICE=${DEVICE:-cpu}
+N_ADDRESSES=${N_ADDRESSES:-20000}
 ITR=${ITR:-$OUT/itr}                    # all serialised transactions (train + validation split)
 ITR_TRAIN=${ITR_TRAIN:-$OUT/itr_train}        # train split only (tokens), the vocabulary is built from it
 VOCAB=${VOCAB:-$OUT/vocab}
@@ -39,7 +52,7 @@ TARGET=${TARGET:-EleutherAI/pythia-14m}
 TARGET_REV=${TARGET_REV:-step98000}
 LOG=$OUT/logs
 mkdir -p "$LOG"
-export OUT CACHE ITR ITR_TRAIN VOCAB MODEL UNTRAINED VAL_FRAC SIZE TARGET TARGET_REV EVAL_BLOCKS PROBE_CONFIGS
+export OUT CACHE ITR ITR_TRAIN VOCAB MODEL UNTRAINED VAL_FRAC SIZE TARGET TARGET_REV EVAL_BLOCKS PROBE_CONFIGS DEVICE
 
 STATUS=0
 timed() {   # timed <log name> <command…>: run, tee the log, append exit code and wall time
@@ -55,24 +68,27 @@ timed() {   # timed <log name> <command…>: run, tee the log, append exit code 
 }
 
 # --------------------------------------------------------------------------------------
-# 1. download: every 25th chunk 1 428 000–2 100 000 + full chunks of the drain and the fork
+# 1. download: every EVERY-th chunk of [BLOCK_FROM, BLOCK_TO) + the EXTRA_RANGES in full
+#    (default: every 25th chunk 1 428 000-2 100 000 + the drain and fork chunks)
 # --------------------------------------------------------------------------------------
 step_download() {
-    timed 01_download_sampled $PY -m lsne.chain.cli download --from 1428000 --to 2100000 --every 25 \
-        --cache "$CACHE" --workers 4
+    timed 01_download_sampled $PY -m lsne.chain.cli download --from "$BLOCK_FROM" --to "$BLOCK_TO" --every "$EVERY" \
+        --cache "$CACHE" --workers "$WORKERS"
     cp "$CACHE/download_log.csv" "$LOG/download_log_sampled.csv"
-    timed 01_download_drain $PY -m lsne.chain.cli download --from 1718000 --to 1720000 --cache "$CACHE" --workers 4
-    cp "$CACHE/download_log.csv" "$LOG/download_log_drain.csv"
-    timed 01_download_fork $PY -m lsne.chain.cli download --from 1920000 --to 1922000 --cache "$CACHE" --workers 4
-    cp "$CACHE/download_log.csv" "$LOG/download_log_fork.csv"
+    local r
+    for r in $EXTRA_RANGES; do
+        timed "01_download_${r}" $PY -m lsne.chain.cli download --from "${r%-*}" --to "${r#*-}" --cache "$CACHE" \
+            --workers "$WORKERS"
+        cp "$CACHE/download_log.csv" "$LOG/download_log_${r}.csv"
+    done
 }
 
 # --------------------------------------------------------------------------------------
 # 2. serialise every cached chunk in [1 428 000, 2 100 000) -> ITR shards
 # --------------------------------------------------------------------------------------
 step_serialize() {
-    timed 02_serialize $PY -m lsne.chain.cli serialize --cache "$CACHE" --from 1428000 --to 2100000 \
-        --out "$ITR" --workers 4
+    timed 02_serialize $PY -m lsne.chain.cli serialize --cache "$CACHE" --from "$BLOCK_FROM" --to "$BLOCK_TO" \
+        --out "$ITR" --workers "$WORKERS"
 }
 
 # --------------------------------------------------------------------------------------
@@ -103,7 +119,7 @@ for fn in list_shards(src):
     os.replace(tmp, out)
 print(f"split: {n[0]} train tx -> {dst}, {n[1]} held-out tx (val_frac {frac})")
 PY
-    timed 03b_vocab $PY -m lsne.chain.cli vocab --in "$ITR_TRAIN" --out "$VOCAB"
+    timed 03b_vocab $PY -m lsne.chain.cli vocab --in "$ITR_TRAIN" --out "$VOCAB" --n-addresses "$N_ADDRESSES"
     step_vocab_report
 }
 
@@ -263,7 +279,7 @@ PY
 step_train() {
     timed 06_train $PY -m lsne.chain.cli train --in "$ITR" --vocab "$VOCAB" --size "$SIZE" --out "$MODEL" \
         --steps "$STEPS" --batch-size "$BATCH" --lr "$LR" --warmup "$WARMUP" --val-frac "$VAL_FRAC" \
-        --eval-every "$EVAL_EVERY" --eval-blocks "$EVAL_BLOCKS" --save-every "$SAVE_EVERY" --device cpu
+        --eval-every "$EVAL_EVERY" --eval-blocks "$EVAL_BLOCKS" --save-every "$SAVE_EVERY" --device "$DEVICE"
 }
 
 # --------------------------------------------------------------------------------------
@@ -297,15 +313,17 @@ names = sorted({cls(t) for t in v.tokens})
 cid = np.asarray([names.index(cls(t)) for t in v.tokens])
 
 # --- model: per-position cross-entropy over ALL validation blocks
-model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32).eval()
+dev = torch.device("cuda" if os.environ["DEVICE"] == "auto" and torch.cuda.is_available() else
+                   ("cpu" if os.environ["DEVICE"] == "auto" else os.environ["DEVICE"]))
+model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32).eval().to(dev)
 ce_m = np.zeros(len(names)); n_c = np.zeros(len(names))
 with torch.no_grad():
     for i in range(0, len(va), 16):
-        x = torch.from_numpy(va[i:i + 16])
+        x = torch.from_numpy(va[i:i + 16]).to(dev)
         lp = torch.log_softmax(model(input_ids=x, use_cache=False).logits[:, :-1].float(), -1)
         y = x[:, 1:]
-        nll = -lp.gather(-1, y[..., None])[..., 0].numpy().reshape(-1)
-        c = cid[y.numpy().reshape(-1)]
+        nll = -lp.gather(-1, y[..., None])[..., 0].cpu().numpy().reshape(-1)
+        c = cid[y.cpu().numpy().reshape(-1)]
         np.add.at(ce_m, c, nll); np.add.at(n_c, c, 1)
 # --- unigram / bigram (same smoothing and lambda as step 'baseline')
 with open(os.path.join(OUT, "baselines.json"), encoding="utf-8") as fh:
@@ -366,7 +384,7 @@ step_probe() {
     for cfg in $PROBE_CONFIGS; do
         kind=${cfg%:*}; bins=${cfg#*:}
         timed 09_probe_${kind}_g$bins $PY -m lsne.chain.cli probe --model "$MODEL" --in "$ITR" --kind $kind --layer all \
-            --n "$N_PROBE" --gas-bins $bins --out "$OUT/probe_${kind}_g$bins" --device cpu
+            --n "$N_PROBE" --gas-bins $bins --out "$OUT/probe_${kind}_g$bins" --device "$DEVICE"
     done
     timed 09_probe_report $PY - <<'PY'
 import json, os
@@ -380,7 +398,7 @@ OUT, ITR, MODEL, UNTRAINED = (os.environ[k] for k in ("OUT", "ITR", "MODEL", "UN
 frac = float(os.environ["VAL_FRAC"])
 feats = _features_frame(ITR, None)
 ff = feats.set_index("tx_hash")
-src, src0 = TraceLMSource(MODEL, device="cpu"), TraceLMSource(UNTRAINED, device="cpu")
+src, src0 = TraceLMSource(MODEL, device=os.environ["DEVICE"]), TraceLMSource(UNTRAINED, device=os.environ["DEVICE"])
 layers = list(range(src.n_layers + 1))
 
 def auc(p, q):
@@ -501,10 +519,10 @@ from lsne.model import load_model
 from lsne.transplant import fit_alignment, layer_matching, paired_states
 OUT, MODEL, UNTRAINED = os.environ["OUT"], os.environ["MODEL"], os.environ["UNTRAINED"]
 pairs = load_pairs(os.path.join(OUT, "pairs.jsonl"))
-mb = load_model(ModelSpec(name=os.environ["TARGET"], revision=os.environ["TARGET_REV"], device="cpu"))
+mb = load_model(ModelSpec(name=os.environ["TARGET"], revision=os.environ["TARGET_REV"], device=os.environ["DEVICE"]))
 frames = []
 for tag, path in (("trained", MODEL), ("untrained", UNTRAINED)):
-    src = TraceLMSource(path, device="cpu")
+    src = TraceLMSource(path, device=os.environ["DEVICE"])
     for alpha in (1.0, 100.0, 10000.0):   # 1.0 = fit_alignment default; larger = stronger ridge (sensitivity)
         df = layer_matching(src, mb, pairs, readout="mean", method="ridge", alpha=alpha, holdout=0.2, seed=0)
         frames.append(df.assign(source=tag, alpha=alpha))
@@ -648,10 +666,13 @@ PY
 }
 
 ALL="download serialize vocab bench baseline train evaluate untrained probe pair align profile2016 report"
-for s in ${@:-$ALL}; do
-    case " $ALL vocab_report " in
-        *" $s "*) echo "=== step $s ==="; "step_$s" ;;
-        *) echo "unknown step $s (steps: $ALL)" >&2; exit 64 ;;
-    esac
-done
-exit $STATUS
+run_steps() {
+    local s
+    for s in ${@:-$ALL}; do
+        case " $ALL vocab_report " in
+            *" $s "*) echo "=== step $s ==="; "step_$s" ;;
+            *) echo "unknown step $s (steps: $ALL)" >&2; return 64 ;;
+        esac
+    done
+}
+run_steps "$@"; rc=$?; [ "$rc" -eq 0 ] || exit "$rc"; exit "$STATUS"
