@@ -29,8 +29,9 @@ REPO = Path(__file__).resolve().parent.parent
 # Wall-clock budget for the whole --smoke run (A-L) on a shared 4-core CPU box. The run
 # takes ~2 min unloaded but several times longer when other processes compete for the
 # cores (observed 730 s for A-F alone at load average 7), so the budget guards against
-# runaway runs, not against load.
-SMOKE_BUDGET_S = 1200.0
+# runaway runs, not against load. It is applied to the process CPU time summed over threads
+# (OpenMP spin-waiting under contention still inflates it, hence the generous value).
+SMOKE_BUDGET_S = 3600.0
 
 
 # --------------------------------------------------------------------------------------
@@ -58,17 +59,20 @@ def _assert_run_dir(d: Path):
 @pytest.fixture(scope="module")
 def smoke_run(tmp_path_factory):
     out = tmp_path_factory.mktemp("smoke")
-    t0 = time.perf_counter()
+    t0, c0 = time.perf_counter(), time.process_time()
     rc = main(["run", "--stage", "all", "--model", "EleutherAI/pythia-14m", "--revision", "step98000",
                "--dtype", "float32", "--device", "cpu", "--families", "DEV01", "--out", str(out), "--smoke",
                "--no-progress"])
-    return dict(out=out, rc=rc, seconds=time.perf_counter() - t0)
+    return dict(out=out, rc=rc, seconds=time.perf_counter() - t0, cpu_seconds=time.process_time() - c0)
 
 
 def test_smoke_all_stages_produce_tables(smoke_run):
     out, rc = smoke_run["out"], smoke_run["rc"]
     assert rc == 0
-    assert smoke_run["seconds"] < SMOKE_BUDGET_S, f"smoke run took {smoke_run['seconds']:.0f} s"
+    # CPU time (all threads of this process), not wall-clock time: on a shared box other jobs
+    # stretch the wall clock several-fold (observed 1 843 s wall while a model trained alongside)
+    assert smoke_run["cpu_seconds"] < SMOKE_BUDGET_S, (f"smoke run used {smoke_run['cpu_seconds']:.0f} CPU-s "
+                                                       f"({smoke_run['seconds']:.0f} s wall)")
     assert tuple(STAGE_ORDER) == tuple("ABCDEFGHIJKL") and set(STAGE_TITLES) == set(STAGE_ORDER)
     for stage in STAGE_ORDER:
         _csvs, m = _assert_run_dir(_stage_dir(out, stage))
@@ -322,7 +326,11 @@ def test_smoke_stage_g_geometry(smoke_run):
     boot = _csv(out, "G", "contraction_boot")
     bp = boot[boot["preregistered"]]
     assert sorted(set(zip(bp["quantity"], bp["readout"]))) == [("d_log_volume", "mean"), ("d_participation_ratio", "last")]
-    assert len(bp) == 14 and (bp["n_clusters"] == 1).all()
+    # one family -> one cluster per row; the participation ratio is undefined (0/0) where all pooled
+    # states coincide (block-0 last token = the identical tail-token embedding): NaN, no cluster
+    undefined = bp["mean"].isna()
+    assert len(bp) == 14 and (bp.loc[~undefined, "n_clusters"] == 1).all() and (bp.loc[undefined, "n_clusters"] == 0).all()
+    assert set(bp.loc[undefined, "site"]) <= {"L0.block_input"} and (bp.loc[undefined, "readout"] == "last").all()
     pos = _csv(out, "G", "position_traj")
     assert set(pos["region"]) == {"tail", "prefix_bin", "from_switch"} and set(pos["site"]) == {"L5.block_input", "L3.block_input"}
     assert set(pos["group"]) == {"DEV01|K0|C1", "DEV01|K8|C1"}
