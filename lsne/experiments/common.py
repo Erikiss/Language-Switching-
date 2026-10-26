@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import time
 import traceback
 import warnings
@@ -70,6 +71,14 @@ PATCH_CLASSES = ("ws", "punct", "boundary", "delim", "post_punct", "word_start",
 PREREG_PATCH_CLASS = "delim"
 #: Standard id columns of every tidy table.
 ID_COLS = ("tag", "family", "formulation", "K", "C", "kind", "n_tokens", "tail_start")
+#: D3-D7 generation core per (K, C) cell in the limited stage D of the scale sweep (stage F):
+#: the full core (~96 formulations x 3 conditions x 2 directions of generation runs) takes
+#: 1-2 A100-hours per checkpoint; a seeded subset of 24 formulations, each with all its core
+#: conditions (so at most 24 variants per cell; the original-context variants always kept),
+#: bounds it (:func:`limited_core`).  Full runs (not limited) use every core variant.
+LIMITED_GEN_MAX_CORE = 24
+#: Variants per checkpoint chunk of the resumable stage C / D substages (:class:`Resume`).
+RESUME_CHUNK = 50
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -120,6 +129,7 @@ class Limits:
     # stage C
     n_random_patch: int = 10        # random position draws per (site, class)
     n_boot: int = 2000              # cluster-bootstrap resamples
+    grid_batch_size: int = 64       # grid rows (direction x sign x dose) per batched forward
     # stage D
     damage_doses: tuple = (0.01, 0.05, 0.1)
     damage_batch_size: int = 64     # D1 rows per forward incl. the reference (lsne.dynamics.DAMAGE_BATCH_SIZE)
@@ -127,6 +137,7 @@ class Limits:
     gen_tokens_per_step: int = 8    # D3 tokens per plateau
     gen_t_on: int = 16              # D4 quench time
     n_boot_tau: int = 200           # D4 between-sample bootstrap resamples (gate on b, CI of tau)
+    gen_max_core: Optional[int] = None  # D3-D7 core formulations when limited, i.e. <= n per (K, C) cell (None = all; as_limited: 24)
     ca_threshold: float = 0.5
     # stage E
     n_families_tn: int = 2          # family ids used in stage E
@@ -209,8 +220,11 @@ class Limits:
         return cls(**base)
 
     def as_limited(self) -> "Limits":
-        """Copy with the reduced-stage flag of the scale sweep set."""
-        return replace(self, limited=True, n_random_patch=min(self.n_random_patch, 5))
+        """Copy with the reduced-stage flag of the scale sweep set (also caps the D3-D7
+        generation core at :data:`LIMITED_GEN_MAX_CORE` variants per (K, C) cell unless
+        ``gen_max_core`` is already set)."""
+        return replace(self, limited=True, n_random_patch=min(self.n_random_patch, 5),
+                       gen_max_core=(self.gen_max_core if self.gen_max_core is not None else LIMITED_GEN_MAX_CORE))
 
 
 def smoke_config(cfg: RunConfig) -> RunConfig:
@@ -576,16 +590,29 @@ def bank_signature(variants: Sequence, site: HookSite, cfg: RunConfig, limits: L
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-def unigram_counts(mb: ModelBundle, n_sequences: int, seed: int, variants: Sequence = ()) -> tuple[np.ndarray, dict]:
+class UnigramFetchError(RuntimeError):
+    """The Pile unigram counts of a full run could not be fetched (no silent fallback)."""
+
+
+def unigram_counts(mb: ModelBundle, n_sequences: int, seed: int, variants: Sequence = (),
+                   strict: bool = False) -> tuple[np.ndarray, dict]:
     """Unigram counts for the ``freq`` axis: ``n_sequences`` Pile sequences by range request
     (cached under ``cache/unigram``), or - offline / on failure - the token counts of the
-    stimulus bank with add-one smoothing (``source`` says which)."""
+    stimulus bank with add-one smoothing (``source`` says which).
+
+    ``strict`` (full runs; :func:`direction_bank` passes ``not limits.is_smoke``): a failed
+    fetch raises :class:`UnigramFetchError` instead of falling back.  The stimulus-bank top
+    100 contains German function words, which would make ``p_freq`` and the ``freq`` axis
+    language-confounded; ``LSNE_OFFLINE=1`` selects the stimulus-bank counts explicitly."""
     if not offline():
         try:
             from ..pile_fetch import sample_unigram_counts
             counts = sample_unigram_counts(int(n_sequences), int(seed), vocab=mb.vocab, cache_dir=cache_dir("unigram"))
             return np.asarray(counts, dtype=np.int64), dict(source="pile", n_sequences=int(n_sequences), seed=int(seed))
         except Exception as e:  # noqa: BLE001 - network problems
+            if strict:
+                raise UnigramFetchError(f"Pile unigram fetch failed on a full run ({e!r}); set LSNE_OFFLINE=1 to "
+                                        f"accept stimulus-bank counts explicitly") from e
             warnings.warn(f"unigram counts could not be fetched ({e!r}); using stimulus-bank token counts")
     counts = np.ones(mb.vocab, dtype=np.int64)
     for v in variants:
@@ -676,13 +703,15 @@ def direction_bank(cfg: RunConfig, mb: ModelBundle, variants: Sequence, site: Ho
 
     # freq
     try:
-        counts, cinfo = unigram_counts(mb, limits.n_unigram, cfg.seed, std)
+        counts, cinfo = unigram_counts(mb, limits.n_unigram, cfg.seed, std, strict=not limits.is_smoke)
         fq = frequency_axis(mb, counts, top_n=100, site=site)
         fq.meta.update(cinfo)
         bank.dirs["freq"] = fq
         bank.freq_ids = [int(i) for i in fq.meta["top_ids"]]
         bank.unigram_counts = counts
         bank.meta["unigram"] = cinfo
+    except UnigramFetchError:
+        raise                       # a full run must not go on with a confounded or missing freq axis
     except Exception as e:  # noqa: BLE001
         warnings.warn(f"freq direction skipped: {e!r}")
         bank.meta["skipped"]["freq"] = repr(e)
@@ -803,6 +832,18 @@ def get_bank(cfg: RunConfig, mb: ModelBundle, variants: Sequence, site: HookSite
                 bank.meta["source"] = f"disk:{rd.path}"
     except Exception:  # noqa: BLE001 - any unreadable previous run: rebuild
         bank = None
+    if bank is not None:
+        # the npz holds only the direction vectors: restore the SAE object of a stored bank
+        # (stages H-J use bank.sae); a hub failure drops only the SAE, not the bank
+        info = bank.meta.get("sae") or {}
+        if sae is not None:
+            bank.sae = sae
+        elif limits.use_sae and isinstance(info, dict) and info.get("repo") and info.get("hookpoint"):
+            try:
+                from ..sae import TopKSAE
+                bank.sae = TopKSAE.load_from_hub(info["repo"], info["hookpoint"], device=str(mb.device))
+            except Exception as e:  # noqa: BLE001
+                warnings.warn(f"SAE of the stored bank could not be reloaded: {e!r}")
     if bank is None:
         bank = direction_bank(cfg, mb, variants, site, original=original, limits=limits, sae=sae)
         bank.meta["source"] = "built"
@@ -965,6 +1006,142 @@ class Substages:
         return p
 
 
+# --------------------------------------------------------------------------------------
+# resumable stage runs (stages C and D)
+# --------------------------------------------------------------------------------------
+def resume_signature(**parts) -> str:
+    """Hash of the inputs of a resumable stage run (JSON of ``parts``, sorted keys)."""
+    payload = json.dumps(to_jsonable(parts), sort_keys=True, default=str)
+    return hashlib.sha1(payload.encode()).hexdigest()[:16]
+
+
+def _concat_frames(frames: Sequence[pd.DataFrame]) -> pd.DataFrame:
+    full = [f for f in frames if len(f)]
+    if not full:
+        return frames[0]
+    if len(full) == 1:
+        return full[0].reset_index(drop=True)
+    return pd.concat(full, ignore_index=True)
+
+
+def concat_results(parts: Sequence):
+    """Concatenate chunk results of the same shape: DataFrames, tuples of DataFrames or
+    dicts of DataFrames (row order = chunk order)."""
+    first = parts[0]
+    if isinstance(first, pd.DataFrame):
+        return _concat_frames(parts)
+    if isinstance(first, tuple):
+        return tuple(_concat_frames([p[i] for p in parts]) for i in range(len(first)))
+    if isinstance(first, dict):
+        return {k: _concat_frames([p[k] for p in parts]) for k in first}
+    raise TypeError(f"cannot concatenate chunk results of type {type(first)}")
+
+
+class Resume:
+    """Checkpoints of one stage run in ``<run_dir>/_resume``: an interrupted or failed run
+    (session limit, disconnect, an exception after hours of work) continues where it stopped
+    when the stage is started again with the same inputs.
+
+    Objects are pickled (exact dtypes; not CSV, so ``merge`` and the table loaders never see
+    them), each written to a temporary file and moved into place with ``os.replace``.
+    ``state.json`` holds the :func:`resume_signature` of the run's inputs; another signature
+    discards the old checkpoints.  :meth:`clear` removes the directory once the stage
+    manifest is written.  ``enabled=False`` computes everything and stores nothing."""
+
+    DIRNAME = "_resume"
+
+    def __init__(self, run_dir, signature: str, enabled: bool = True):
+        self.dir = Path(os.fspath(run_dir)) / self.DIRNAME
+        self.signature = str(signature)
+        self.enabled = bool(enabled)
+        self.loaded: list[str] = []
+        if not self.enabled:
+            return
+        state = self.dir / "state.json"
+        try:
+            old = json.loads(state.read_text(encoding="utf-8")).get("signature") if state.exists() else None
+        except Exception:  # noqa: BLE001 - unreadable state: start over
+            old = None
+        if old != self.signature:
+            if self.dir.exists():
+                shutil.rmtree(self.dir, ignore_errors=True)
+            self.dir.mkdir(parents=True, exist_ok=True)
+            self._atomic(state, lambda tmp: tmp.write_text(json.dumps(dict(signature=self.signature)), encoding="utf-8"))
+
+    @staticmethod
+    def _atomic(path: Path, write) -> None:
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            write(tmp)
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+
+    def _path(self, name: str) -> Path:
+        return self.dir / f"{name}.pkl"
+
+    def get(self, name: str):
+        """The checkpoint ``name`` or None (missing, disabled or unreadable)."""
+        if not self.enabled:
+            return None
+        p = self._path(name)
+        if not p.exists():
+            return None
+        try:
+            obj = pd.read_pickle(p)
+        except Exception as e:  # noqa: BLE001 - truncated file etc.: recompute
+            warnings.warn(f"checkpoint {p} unreadable ({e!r}); recomputing it")
+            return None
+        self.loaded.append(name)
+        return obj
+
+    def put(self, name: str, obj) -> None:
+        if self.enabled:
+            self._atomic(self._path(name), lambda tmp: pd.to_pickle(obj, tmp, compression=None))
+
+    def step(self, name: str, fn):
+        """``fn()`` once: the result is checkpointed under ``name`` and loaded on a rerun."""
+        out = self.get(name)
+        if out is None:
+            out = fn()
+            self.put(name, out)
+        return out
+
+    def chunked(self, name: str, items: Sequence, fn, chunk: int = RESUME_CHUNK):
+        """``fn(items[i:i + chunk])`` for consecutive chunks, each checkpointed as one
+        :meth:`step`; the results (DataFrame / tuple / dict of DataFrames) concatenated in
+        item order (:func:`concat_results`)."""
+        items = list(items)
+        if not items:
+            return fn(items)
+        chunk = max(1, int(chunk))
+        parts = [self.step(f"{name}_{k:05d}", lambda i=i: fn(items[i:i + chunk]))
+                 for k, i in enumerate(range(0, len(items), chunk))]
+        return concat_results(parts)
+
+    def clear(self) -> None:
+        if self.enabled:
+            shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def limited_core(core: Sequence, max_per_cell: Optional[int], seed: int) -> list:
+    """At most ``max_per_cell`` standard variants per (K, C) cell of ``core``: a seeded subset
+    of the formulations, each kept with all its core conditions (so mixed and monolingual
+    variants stay paired); the original-context variants are always kept, the order of
+    ``core`` is preserved.  ``None`` returns ``core`` unchanged."""
+    core = list(core)
+    if max_per_cell is None:
+        return core
+    groups = sorted({group_key(v) for v in core if not is_original(v)})
+    m = max(0, int(max_per_cell))
+    if len(groups) > m:
+        rng = np.random.default_rng(int(seed))
+        groups = [groups[int(i)] for i in sorted(rng.choice(len(groups), size=m, replace=False))]
+    keep = set(groups)
+    return [v for v in core if is_original(v) or group_key(v) in keep]
+
+
 def synthetic_sae(mb: ModelBundle, n_latents: int = 64, k: int = 8, seed: int = 0):
     """Random TopK SAE (``TopKSAE.from_tensors``) of the model width - a *placeholder*
     for code paths that need an SAE when no published one exists (smoke runs); results
@@ -1061,5 +1238,6 @@ __all__ = [
     "get_bank", "marker_lexicon", "finish_stage", "write_error", "pearson",
     "DOMAIN_GROUPS", "DEFAULT_DOMAIN_GROUP", "SMOKE_GL", "family_domain", "families_in_group", "k_subset",
     "prereg_layer_grid", "grid_sites", "last_state", "Substages", "synthetic_sae", "get_sae", "stage_run_dir",
-    "load_stage_table", "family_text_pairs", "boot_row",
+    "load_stage_table", "family_text_pairs", "boot_row", "UnigramFetchError", "LIMITED_GEN_MAX_CORE", "RESUME_CHUNK",
+    "Resume", "resume_signature", "concat_results", "limited_core",
 ]

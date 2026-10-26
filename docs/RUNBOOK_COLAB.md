@@ -131,6 +131,13 @@ Stufe ihre Tabellen direkt nach Drive schreibt:
    nur ihre Tabelle leer, die Stufe endet mit `status: ok` und listet den Fehler unter
    `substages.errors` (Traceback in `substage_errors.txt`). `REUSE=True` würde diesen Lauf
    wiederverwenden; nach der Korrektur deshalb die Stufe mit `REUSE=False` neu rechnen.
+7. Stufen C und D setzen *innerhalb* der Stufe fort: Grid, Attribution und Gradient ×
+   Aktivierung (C) bzw. D1, D2/D9 und D3–D7 (D) werden je 50 Varianten unter
+   `<Laufverzeichnis>/_resume/` gesichert. Bricht die Stufe ab (Sitzungsende, Fehler in
+   einer späteren Substufe), rechnet der nächste Start mit denselben Eingaben (Varianten,
+   Richtungsbank, Dosen, Modell, Limits) nur die fehlenden Blöcke; das Manifest zählt die
+   geladenen Blöcke unter `resumed_checkpoints`. Nach `status: ok` wird `_resume/`
+   gelöscht. Geänderte Eingaben verwerfen die alten Blöcke automatisch.
 
 ## 5. Zusammenführen (`lsne.cli merge`)
 
@@ -158,23 +165,36 @@ Beide Konten haben getrennte Drives. Zum Zusammenführen:
    über alle Shards, Phasendiagramme über Checkpoints) arbeitet auf `merged/`.
    Notebook 05 ruft `merge_runs` für die eigene Shard am Ende automatisch auf.
 
-## 6. Erwartete Laufzeiten (A100, FP32, alle 16 Familien × A/B)
+## 6. Erwartete Laufzeiten (A100, FP32, alle 96 Formulierungen aus 24 Familien, 1 152 Varianten + Original)
 
 | Shard | Stufen | Schätzung | Treiber |
 |---|---|---|---|
-| 1, 2 (160M) | A: < 1 min; B: 3–5 min; C: 10–20 min; D: 45–90 min; E: 5–15 min | 1–3 h | D3–D7: 64 Tokens × 8 Samples × Rampen/Quench/Konstantdosen für die Kernvarianten; D1: ~50 000 Forwards |
-| 3 (160M + SAE) | wie 1 + SAE-Download (~130 MB) + FVU-Messung | 1–3 h | zusätzliche Richtungen `sae_D*`/`sae_E*` in C und D |
-| 4 (Trace, 27 Checkpoints) | B + D (limitiert) je Checkpoint, ~5–8 min | 2–4 h | 27 × Modell-Download (~330 MB) + D limitiert (8 Zufallsrichtungen, nur `lang_dom` in der Generierung) |
+| 1, 2 (160M) | A: < 1 min; B: 3–5 min (+ einmalig die Unigramm-Zählung, s. u.); C: 3,05 h gemessen mit dem alten sequenziellen Grid, mit dem gebatchten Grid geschätzt 20–40 min; D: D1 ≈ 20–40 min (geschätzt) + D3–D7 1–2 h; E: 5–15 min | 2–4 h | C: ≈ 568 000 Grid-Zeilen (35 Richtungen × 2 Vorzeichen × 7 Dosen je Variante) in Forwards zu 64 Zeilen + ≈ 59 000 Attributions-Forwards; D1: 1 153 Varianten × 2 Injektionen × 204 (Richtung, Dosis)-Paare in Forwards zu 64 Zeilen; D3–D7: 64 Tokens × 8 Samples × Rampen/Quench/Konstantdosen für die Kernvarianten |
+| 3 (160M + SAE) | wie 1 + SAE-Download (~130 MB) + FVU-Messung | 2–4 h | zusätzliche Richtungen `sae_D*`/`sae_E*` in C und D |
+| 4 (Trace, 27 Checkpoints) | B + D (limitiert) je Checkpoint | ≈ 1–1,5 h je Checkpoint mit vollem Generierungskern (25–45 h); mit dem auf 24 Formulierungen je (K, C)-Zelle begrenzten Kern (`Limits.gen_max_core`, im limitierten Modus Standard) geschätzt 30–50 min je Checkpoint (≈ 15–25 h) | 27 × Modell-Download (~330 MB) + D limitiert (8 Zufallsrichtungen, nur `lang_dom` in der Generierung); passt nicht in eine Colab-Sitzung: auf 3–4 Sitzungen mit disjunkten `FORCE_PAIRS` verteilen (`REUSE=True`) |
 | 5 (410M) | A–E | 1–3 h | 24 Blöcke, d = 1024; Stufe E mit r = 64, T_w = 32 |
 | 6 (1b, 1.4b) | B, C, D limitiert; nur C1 (6 Varianten/Formulierung) | 3–6 h | Modellgröße; Generierung dominiert |
-| 1–3, Stufen G–L (160M) | G: 10–20 min; H: 30–60 min; I: 10–20 min; J: 10–20 min (+ 2 000 Range-Requests beim ersten Lauf); K: 10–20 min; L: 5–15 min | 1–2 h zusätzlich | H: ≈ 110 000 Forward+Backward-Pässe der λ-Pfade (`H_N_STEPS` / `H_MAX_STARTS` senken auf kleiner GPU); G: Realisierungswolken × Snapshots; K: vier Trainingsarme à 200 Schritte |
+| 1–3, Stufen G–L (160M) | G: 0,4–1,2 h; H: 0,7–1,6 h mit dem alten vollen Forward je Schritt, mit dem Teil-Forward ab Block L kürzer; I: 0,2–1,1 h; J: 0,3–1,3 h (davon 10–30 min für 2 000 Range-Requests beim ersten Lauf); K: 0,15–0,6 h; L: 0,1–0,3 h | 2–6 h zusätzlich | Audit vom 26.10.2026: Forward-Zahlen gezählt, Zeit je Forward an der gemessenen Stufe C kalibriert (≈ 15–18 ms je sequenziellem 160M-Forward statt der früher angenommenen 3 ms); G ≈ 59 000 Forwards, H ≈ 100 000 Forward+Backward-Pässe der λ-Pfade, I ≈ 33 000 Forwards; nicht auf einer GPU gemessen |
 | 7 (TTT über Checkpoints) | K mit `--ttt-checkpoints step4000,step98000,step143000` | 1–2 h | 3 × Modell-Download (~330 MB) + Memorisationstabelle je Checkpoint |
 | Rauchtest (CPU, pythia-14m) | alle A–L | 1–2 min unbelastet (Testbudget 20 min) | `SMOKE=True` bzw. `--smoke` |
 
 Die Zahlen sind Schätzungen aus DESIGN §7 (ein Forward von 160M auf ≤ 320 Tokens ≈ 3 ms)
-und `jobs/shards.yaml`; die tatsächlichen Laufzeiten stehen in jeder `manifest.json`
-(`runtime_s`, für G–L auch je Substufe unter `substages.seconds`) und in `runs.csv` von
-Stufe F.
+und `jobs/shards.yaml`; gemessen ist nur die alte Stufe C (3,05 h). Die Angaben für das
+gebatchte Grid (C), das gebatchte D1 und den begrenzten Generierungskern (Shard 4) sind
+noch nicht auf einer GPU gemessen. Die tatsächlichen Laufzeiten stehen in jeder
+`manifest.json` (`runtime_s`, für G–L auch je Substufe unter `substages.seconds`) und in
+`runs.csv` von Stufe F.
+
+**Unigramm-Zählung (Frequenzachse `freq`).** Jede Stufe, die eine Richtungsbank baut (B,
+und D, F, wenn sie keine passende Bank von B finden), braucht beim ersten Mal auf einem
+Konto 2 000 Pile-Sequenzen per Range-Request: mit 8 Threads und Wiederholung bei
+429/5xx/Abbruch etwa 3 min (früher sequenziell 15–45 min), fortsetzbar über
+`unigram_n2000_s0.partial.npz`. Notebook 00 holt sie vorab; auf dem zweiten Konto
+entweder Notebook 00 laufen lassen oder `MyDrive/LSNE/cache/unigram/unigram_n2000_s0.npz`
+kopieren, bevor die parallelen Notebooks starten. Scheitert der Abruf in einem vollen
+Lauf, bricht die Bank mit `UnigramFetchError` ab, statt still auf die Zählung der
+Stimulusbank auszuweichen (die deutsche Funktionswörter enthält); `LSNE_OFFLINE=1` erlaubt
+diesen Ersatz ausdrücklich. Die Quelle steht in den Manifesten von B, C und D (`unigram`).
 
 ## 7. Wenn TNCO nicht baut
 

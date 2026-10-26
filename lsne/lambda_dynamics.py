@@ -48,8 +48,9 @@ import torch
 from scipy.stats import spearmanr
 
 from .config import HookSite
+from .dynamics import last_logits
 from .geometry import log_volume, mahalanobis
-from .model import Injector, ModelBundle, next_token_stats
+from .model import Injector, ModelBundle, _first_tensor, next_token_stats
 
 __all__ = [
     "Discriminant", "partial_forward", "make_discriminant", "KDEMimicry", "lambda_scale",
@@ -136,11 +137,20 @@ def partial_forward(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite,
     """``f(h) -> logits[V]`` (float32, last position) when the residual at ``(site, position)``
     is REPLACED by ``h``.
 
-    The replacement is done with :class:`lsne.model.Injector` in ``mode="replace"`` and the
-    written value is ``h`` itself (cast to the model dtype/device without detaching), so the
-    returned logits are differentiable with respect to ``h`` whenever ``h.requires_grad``.
-    The forward runs under ``torch.enable_grad()``; wrap calls in ``torch.no_grad()`` when no
+    The written value is ``h`` itself (cast to the model dtype/device without detaching), so
+    the returned logits are differentiable with respect to ``h`` whenever ``h.requires_grad``.
+    ``f`` runs under ``torch.enable_grad()``; wrap calls in ``torch.no_grad()`` when no
     gradient is needed (the frozen model builds no graph for a detached ``h`` anyway).
+
+    For a ``block_input`` site the input of block ``L = site.layer`` (and the keyword
+    arguments the model passes to its blocks: mask, rotary embeddings, ...) is captured
+    once from an unperturbed forward; ``f`` then writes ``h`` at ``position`` and runs only
+    blocks ``L .. n-1`` over all positions, the final LayerNorm and the LM head on the last
+    position.  Blocks ``0 .. L-1`` do not depend on ``h``, so this equals the full forward
+    with the replacement (float32 round-off of the last-position head aside) at a fraction
+    of its cost: one block instead of twelve for the dossier site of pythia-160m, and no
+    full-vocabulary logits at every position.  Other site kinds replace the residual with
+    :class:`lsne.model.Injector` in ``mode="replace"`` inside a full forward.
     """
     ids = torch.as_tensor(input_ids, dtype=torch.long)
     if ids.dim() == 1:
@@ -153,19 +163,64 @@ def partial_forward(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite,
     pos = pos + T if pos < 0 else pos
     if not 0 <= pos < T:
         raise ValueError(f"position {position} out of range for T={T}")
+    if site.site == "block_input":
+        f = _partial_forward_from_block(mb, ids, int(site.layer), pos)
+    else:
+        f = _partial_forward_injector(mb, ids, site, pos)
+    f.site, f.position, f.n_tokens = site, pos, T   # type: ignore[attr-defined]
+    return f
+
+
+def _check_h(h, d: int) -> torch.Tensor:
+    h = torch.as_tensor(h)
+    if h.dim() != 1 or h.numel() != d:
+        raise ValueError(f"h must be a 1-D tensor of length {d}, got shape {tuple(h.shape)}")
+    return h
+
+
+def _partial_forward_injector(mb: ModelBundle, ids: torch.Tensor, site: HookSite, pos: int):
+    """Full forward with the residual at ``(site, pos)`` replaced through an Injector."""
     d = mb.d_model
 
     def f(h: torch.Tensor) -> torch.Tensor:
-        h = torch.as_tensor(h)
-        if h.dim() != 1 or h.numel() != d:
-            raise ValueError(f"h must be a 1-D tensor of length {d}, got shape {tuple(h.shape)}")
-        h_dev = h.to(device=mb.device)
+        h_dev = _check_h(h, d).to(device=mb.device)
         with torch.enable_grad():
             with Injector(mb, site, h_dev, positions=[pos], mode="replace"):
                 out = mb.model(input_ids=ids, use_cache=False)
             return out.logits[0, -1].float()
 
-    f.site, f.position, f.n_tokens = site, pos, T   # type: ignore[attr-defined]
+    return f
+
+
+def _partial_forward_from_block(mb: ModelBundle, ids: torch.Tensor, layer: int, pos: int):
+    """Blocks ``layer .. n-1`` + final LN + LM head (last position) on the captured input of
+    block ``layer`` with position ``pos`` replaced by ``h`` (see :func:`partial_forward`)."""
+    d = mb.d_model
+    cap: dict = {}
+
+    def _pre(module, args, kwargs):
+        cap["hs"] = (args[0] if args else kwargs["hidden_states"]).detach()
+        cap["args"] = tuple(args[1:])
+        cap["kw"] = {k: v for k, v in kwargs.items() if k != "hidden_states"}
+
+    hd = mb.layers[layer].register_forward_pre_hook(_pre, with_kwargs=True)
+    try:
+        with torch.no_grad():
+            last_logits(mb, ids)
+    finally:
+        hd.remove()
+    base, extra, lkw = cap["hs"], cap["args"], cap["kw"]
+    blocks = mb.layers[layer:]
+
+    def f(h: torch.Tensor) -> torch.Tensor:
+        h = _check_h(h, d)
+        with torch.enable_grad():
+            hs = base.clone()
+            hs[0, pos] = h.to(device=hs.device, dtype=hs.dtype)          # keeps the graph to h
+            for block in blocks:
+                hs = _first_tensor(block(hs, *extra, **lkw))
+            return mb.lm_head(mb.final_ln(hs[:, -1]))[0].float()
+
     return f
 
 
@@ -702,7 +757,7 @@ def endpoint_effects(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite, p
     tid = int(target_id)
     fi = None if freq_ids is None else torch.as_tensor(freq_ids, dtype=torch.long).reshape(-1)
     with torch.no_grad():
-        base_logits = mb.model(input_ids=ids.to(mb.device), use_cache=False).logits[0, -1].float()
+        base_logits = last_logits(mb, ids)[0]
         base = next_token_stats(base_logits[None, :], tid, fi)
         base_logp = float(base["logp_target"][0])
         rows = []

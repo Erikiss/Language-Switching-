@@ -103,6 +103,44 @@ def test_partial_forward_reproduces_logits(mb, sample_ids, site, h_unpert):
     assert disc.meta["target_id"] == tid and disc.meta["position"] == sample_ids.shape[1] - 1
 
 
+@pytest.mark.parametrize("which, offset", [("last", 1), ("middle", 5)])
+def test_partial_forward_block_path_matches_injector_path(mb, sample_ids, which, offset):
+    """H1: the block-input fast path (captured input of block L, blocks L..n-1 only, LM head
+    on the last position) gives the logits and the gradient of the full forward with the
+    Injector replacement, for the last block at T-1 and a middle block at T-5."""
+    from lsne import lambda_dynamics as LD
+    from lsne.model import _get_hidden
+    layer = mb.n_layers - 1 if which == "last" else mb.n_layers // 2
+    site = HookSite(layer, "block_input")
+    T = int(sample_ids.shape[1])
+    pos = T - offset
+    fast = partial_forward(mb, sample_ids, site, pos)
+    slow = LD._partial_forward_injector(mb, sample_ids.to(mb.device), site, pos)
+    assert (fast.site, fast.position, fast.n_tokens) == (site, pos, T)
+    h0 = run_with_cache(mb, sample_ids, [site]).resid[site.key][0, pos].clone()
+    h = h0 + 0.3 * h0.norm() * torch.randn(h0.shape, generator=torch.Generator().manual_seed(0)) / h0.numel() ** 0.5
+    with torch.no_grad():
+        assert torch.allclose(fast(h), slow(h), atol=1e-4) and not torch.allclose(fast(h), fast(h0), atol=1e-3)
+    tid = int(slow(h).argmax())
+    grads = []
+    for f in (fast, slow):
+        x = h.clone().requires_grad_(True)
+        (g,) = torch.autograd.grad(torch.log_softmax(f(x), -1)[tid], x)
+        grads.append(g)
+    assert torch.allclose(grads[0], grads[1], atol=1e-4) and grads[0].abs().max() > 0
+    # only blocks L..n-1 run per call: count block calls
+    calls = []
+    hds = [blk.register_forward_pre_hook(lambda m, a, k, i=i: calls.append(i), with_kwargs=True)
+           for i, blk in enumerate(mb.layers)]
+    try:
+        with torch.no_grad():
+            fast(h)
+    finally:
+        for hd in hds:
+            hd.remove()
+    assert calls == list(range(layer, mb.n_layers))
+
+
 # --------------------------------------------------------------------------------------
 # 3. entropy discriminant gradient = -(entropy gradient)
 # --------------------------------------------------------------------------------------
@@ -112,8 +150,10 @@ def test_entropy_discriminant_gradient(mb, sample_ids, site, h_unpert):
     disc = make_discriminant(mb, "entropy", site, input_ids=sample_ids, position=pos)
     g_ref, H_ref = entropy_gradient(mb, sample_ids, site, pos)
     val, grad = disc.evaluate(h)
-    # sign convention: g = -H, hence grad g = -grad H
-    assert torch.allclose(grad, -g_ref, rtol=1e-3, atol=1e-5)
+    # sign convention: g = -H, hence grad g = -grad H.  Both are float32 results of different
+    # kernels (block-input fast path with the LM head on the last position vs. the full
+    # forward); against a float64 reference they deviate by ~3e-5 and ~9e-5 (max abs, |g|<=1.8)
+    assert torch.allclose(grad, -g_ref, rtol=1e-3, atol=2e-4)
     assert abs(val + H_ref) < 1e-4
     assert grad.dtype == torch.float32 and grad.device.type == "cpu"
     assert torch.allclose(disc.grad(h), grad)

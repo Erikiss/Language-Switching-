@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import time
 import warnings
+from dataclasses import asdict
 
 import numpy as np
 import pandas as pd
@@ -78,6 +79,8 @@ FRONT_THRESHOLDS = (0.01, 0.1)
 HYST_N_NULL = 4
 #: Marker-mass floor of the D9 symbolisation (``"auto"`` = CA_MASS_FLOOR_FACTOR x uniform).
 CA_MASS_FLOOR = "auto"
+#: Bump when the meaning of a checkpointed stage-D result changes (invalidates ``_resume``).
+RESUME_VERSION = 1
 
 
 # --------------------------------------------------------------------------------------
@@ -417,7 +420,15 @@ def generation_tables(mb: ModelBundle, variants, bank: C.DirectionBank, dir_name
 # run
 # --------------------------------------------------------------------------------------
 def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFrame]:
-    """D1-D9 on the lattice (all variants) and in generation (core subset)."""
+    """D1-D9 on the lattice (all variants) and in generation (core subset; in the limited
+    stage D of the scale sweep at most ``limits.gen_max_core`` formulations per (K, C) cell,
+    :func:`lsne.experiments.common.limited_core`).
+
+    Resumable (:class:`~lsne.experiments.common.Resume`, ``kw['resume']=False`` disables it):
+    D1, D2/D9 and D3-D7 are checkpointed per chunk of
+    :data:`~lsne.experiments.common.RESUME_CHUNK` variants under ``<run_dir>/_resume`` and
+    picked up when the stage is started again with the same inputs; the checkpoints are
+    removed after the manifest is written."""
     t0 = time.perf_counter()
     limits = C.get_limits(cfg, kw)
     ctx = kw.get("ctx")
@@ -438,24 +449,39 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
         lattice_dirs = [n for n in lattice_dirs if C.dir_family(n) != "rand"] + rand
     doses = tuple(float(e) for e in limits.damage_doses) + tuple(float(e) for e in cfg.doses_steer)
     damage_batch = int(getattr(limits, "damage_batch_size", DAMAGE_BATCH_SIZE))
-    damage, profile = damage_tables(mb, allv, banks, lattice_dirs, doses, enabled=limits.progress,
-                                    batch_size=damage_batch)
-    lexicon = C.marker_lexicon(mb.tokenizer)
-    lens, lens_summary, upd, ca, ca_layers = lens_tables(mb, allv, None, lexicon, bank.get("lang_dom"),
-                                                         limits.ca_threshold, enabled=limits.progress,
-                                                         mass_floor=CA_MASS_FLOOR)
-
     gen_dirs = bank.names(("lang_dom",) if limits.limited else GEN_FAMILIES)
-    core = C.core_subset(allv)
-    gen = generation_tables(mb, core, bank, gen_dirs, cfg, limits, site, enabled=limits.progress)
+    core_all = C.core_subset(allv)
+    gen_max_core = getattr(limits, "gen_max_core", None) if limits.limited else None
+    core = C.limited_core(core_all, gen_max_core, seed=cfg.seed)
+    lexicon = C.marker_lexicon(mb.tokenizer)
+    sig = C.resume_signature(stage="D", version=RESUME_VERSION, tags=[v.tag for v in allv], model=mb.spec.tag(),
+                             dtype=mb.spec.dtype, site=site.key, depth_site=dsite.key,
+                             bank=C.bank_signature(variants, site, cfg, limits, original),
+                             depth_bank=C.bank_signature(variants, dsite, cfg, limits, original),
+                             lattice_dirs=lattice_dirs, doses=list(doses), gen_dirs=gen_dirs,
+                             core=[v.tag for v in core], limits={k: v for k, v in asdict(limits).items()
+                                                                 if k not in ("progress", "damage_batch_size")},
+                             cfg=dict(seed=cfg.seed, gen_n_new=cfg.gen_n_new, gen_n_samples=cfg.gen_n_samples,
+                                      gen_temperature=cfg.gen_temperature, doses_steer=list(cfg.doses_steer)),
+                             lexicon=lexicon, chunk=C.RESUME_CHUNK)
+    res = C.Resume(run_dir, sig, enabled=bool(kw.get("resume", True)))
+    damage, profile = res.chunked("damage", allv, lambda vs: damage_tables(
+        mb, vs, banks, lattice_dirs, doses, enabled=limits.progress, batch_size=damage_batch))
+    lens, lens_summary, upd, ca, ca_layers = res.chunked("lens", allv, lambda vs: lens_tables(
+        mb, vs, None, lexicon, bank.get("lang_dom"), limits.ca_threshold, enabled=limits.progress,
+        mass_floor=CA_MASS_FLOOR))
+
+    gen = res.chunked("generation", core, lambda vs: generation_tables(
+        mb, vs, bank, gen_dirs, cfg, limits, site, enabled=limits.progress))
 
     tables = {"damage": damage, "damage_profile": profile, "damage_phase": phase_table(damage),
               "lens": lens, "lens_summary": lens_summary, "update_norms": upd, "ca": ca, "ca_layers": ca_layers}
     tables.update(gen)
     markers = resolve_markers(mb, lexicon, bank.get("lang_dom"))
-    return C.finish_stage(run_dir, "D", cfg, mb, tables, limits=limits, t0=t0, site=site, depth_site=dsite,
+    out = C.finish_stage(run_dir, "D", cfg, mb, tables, limits=limits, t0=t0, site=site, depth_site=dsite,
                           depth_position="lsne.stimuli.last_switched_position",
                           bank_source=bank.meta.get("source", ""), depth_bank_source=dbank.meta.get("source", ""),
+                          unigram=bank.meta.get("unigram"), depth_unigram=dbank.meta.get("unigram"),
                           depth_directions=[n for n in lattice_dirs if n in dbank],
                           depth_directions_missing=[n for n in lattice_dirs if n not in dbank],
                           cos_dossier_vs_depth={n: cosine(bank[n].vec, dbank[n].vec) for n in lattice_dirs if n in dbank},
@@ -463,8 +489,12 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
                           marker_lexicon=lexicon,
                           ca=dict(threshold=float(limits.ca_threshold), mass_floor=CA_MASS_FLOOR,
                                   mass_floor_value=ca_mass_floor(CA_MASS_FLOOR, len(markers["E"]) + len(markers["D"]), mb.vocab)),
-                          n_variants=len(variants), n_core=len(core),
+                          n_variants=len(variants), n_core=len(core), n_core_all=len(core_all),
+                          gen_max_core=gen_max_core, core_tags=[v.tag for v in core],
                           gen=dict(n_new=cfg.gen_n_new, n_samples=cfg.gen_n_samples, n_steps=limits.gen_n_steps,
                                    tokens_per_step=limits.gen_tokens_per_step, t_on=limits.gen_t_on,
                                    n_null=int(getattr(limits, "gen_n_null", HYST_N_NULL)),
-                                   doses_steer=list(cfg.doses_steer)))
+                                   doses_steer=list(cfg.doses_steer)),
+                          resumed_checkpoints=len(res.loaded))
+    res.clear()
+    return out

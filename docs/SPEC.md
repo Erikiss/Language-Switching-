@@ -37,7 +37,10 @@ DOSES, DOSES_STEER, K_LEVELS, C_LEVELS, MASKS_UNIT_LEVEL, LAYER_GRID  # constant
 
 `fetch_sequence(seq_index, cache_dir) -> np.ndarray[uint16, 2049]` by HTTP range request;
 `verify_state2143(tokens) -> dict`; `load_anchor(cache_dir) -> AnchorData(tokens, context_ids[208], target_id, text, ...)`;
-`sample_unigram_counts(n_sequences, seed, cache_dir) -> np.ndarray[vocab]`.
+`sample_unigram_counts(n_sequences, seed, cache_dir, workers=8) -> np.ndarray[vocab]`
+(concurrent, one `requests.Session` per worker; progress file `*.partial.npz` for resume;
+atomic cache writes).  `fetch_range` retries HTTP 429/5xx, short reads and connection
+errors (`FETCH_ATTEMPTS = 5`, exponential backoff, `Retry-After` honoured).
 
 ## `lsne/model.py`
 
@@ -252,7 +255,9 @@ with two tiny hand-made groups returns cosines in [-1,1] with random controls.
 ```python
 @dataclass Discriminant: name:str, kind:str, fn: Callable[[Tensor[d]], Tensor[()]], grad: Callable[[Tensor[d]], Tensor[d]], meta: dict
 def partial_forward(mb, input_ids:[1,T], site: HookSite, position:int) -> Callable[[Tensor[d]], Tensor[V]]
-    # returns f(h) = last-position logits when the residual at (site, position) is REPLACED by h (Injector replace with a leaf tensor); differentiable wrt h
+    # returns f(h) = last-position logits when the residual at (site, position) is REPLACED by h; differentiable wrt h.
+    # block_input sites: the input of block L is captured once, f runs blocks L..n-1 + final LN + LM head (last position);
+    # other sites: Injector replace inside a full forward
 def make_discriminant(mb, kind:str, site, input_ids=None, position=None, w=None, b=0.0, target_id=None, sae=None, feature=None) -> Discriminant
     # kind "probe": g(h) = w·h + b (w from directions.probe_axis; positive = source class); "target_logit": g(h) = -logp(target | h) ; "entropy": g(h) = -H(next-token) ; "sae_feature": g(h) = -relu(pre-activation of feature) 
 class KDEMimicry:

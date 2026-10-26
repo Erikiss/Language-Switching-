@@ -69,6 +69,7 @@ from ..geometry import layer_covariance
 from ..lambda_dynamics import (KDEMimicry, endpoint_effects, feature_lambda_correlation,
                                geometry_lambda_correlation, lambda_scale, lambda_sweep, make_discriminant,
                                manifold_stats, partial_forward, trajectory_geometry)
+from ..dynamics import last_logits
 from ..model import ModelBundle, next_token_stats, run_with_cache
 from . import common as C
 from .stage_g_geometry import realization_clouds
@@ -138,7 +139,7 @@ def build_discriminants(mb: ModelBundle, kinds: Sequence[str], site: HookSite, i
                         cross_nats: float) -> dict[str, object]:
     out: dict[str, object] = {}
     with torch.no_grad():
-        base = mb.model(input_ids=ids.to(mb.device), use_cache=False).logits[0, -1].float()
+        base = last_logits(mb, ids)[0]
     logp = torch.log_softmax(base, -1)
     logp0 = float(logp[int(target_id)])
     H0 = float(-(logp.exp() * logp).sum())
@@ -199,7 +200,7 @@ def sweep_start(mb: ModelBundle, v, site: HookSite, kinds: Sequence[str], bank, 
     discs = build_discriminants(mb, kinds, site, ids, pos, int(v.target_id), h0, bank, H_target, sae, feature, limits.h_cross_nats)
     f = partial_forward(mb, ids, site, pos)
     with torch.no_grad():
-        base_logits = mb.model(input_ids=ids.to(mb.device), use_cache=False).logits[0, -1].float().cpu()
+        base_logits = last_logits(mb, ids)[0].cpu()
     logp_base = torch.log_softmax(base_logits, -1)
     idc = dict(context=context, tag=v.tag, family=str(v.family_id), formulation=str(v.formulation), K=int(v.K), C=str(v.C),
                site=site.key, position=pos, n_tokens=T, target_id=int(v.target_id), norm_h0=norm0, sae_source=sae_source)

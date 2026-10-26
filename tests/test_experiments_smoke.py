@@ -628,6 +628,258 @@ def test_damage_tables_batched_and_nothing_retained(mb, tok, monkeypatch):
         assert np.allclose(a[num].to_numpy(), b[num].to_numpy(), rtol=1e-4, atol=1e-5, equal_nan=True)
 
 
+def _sequential_grid_rows(mb, variants, bank, site, doses, dir_names):
+    """The grid as it was computed before batching: one full forward per dosed row."""
+    from lsne.model import Injector, forward_logits, make_dose_delta, next_token_stats, run_with_cache
+    freq_t = bank.freq_tensor(mb.device)
+    rows = []
+    for v in variants:
+        ids = C.ids_tensor(mb, v)
+        T = int(ids.shape[1])
+        with torch.no_grad():
+            cache = run_with_cache(mb, ids, [site])
+            base = next_token_stats(cache.logits[:, -1], int(v.target_id), freq_t)
+            h_ref = cache.resid[site.key][0, T - 1].detach()
+        b = {k: float(val[0]) for k, val in base.items()}
+        for name in dir_names:
+            vec = bank[name].vec.to(h_ref.device)
+            for sign in (1, -1):
+                for eps in doses:
+                    eps = float(eps)
+                    if eps == 0.0:
+                        st, dn, err = b, 0.0, 0.0
+                    else:
+                        delta = make_dose_delta(h_ref, sign * vec, eps).to(h_ref.dtype)
+                        inj = Injector(mb, site, delta, positions=[T - 1], mode="add")
+                        with torch.no_grad(), inj:
+                            logits = forward_logits(mb, ids)
+                        st = {k: float(val[0]) for k, val in next_token_stats(logits[:, -1], int(v.target_id), freq_t).items()}
+                        dn, err = float(delta.float().norm()), float(inj.audit.get("rel_err", float("nan")))
+                    rows.append(dict(C.variant_row(v), direction=name, dir_family=C.dir_family(name), sign=sign, eps=eps,
+                                     logp_0=b["logp_target"], logp_delta=st["logp_target"],
+                                     B=st["logp_target"] - b["logp_target"], p_target=st["p_target"],
+                                     entropy_0=b["entropy"], entropy=st["entropy"],
+                                     p_freq_0=b.get("p_freq", float("nan")), p_freq=st.get("p_freq", float("nan")),
+                                     delta_norm=dn, audit_rel_err=err))
+    return rows
+
+
+@pytest.mark.parametrize("batch_size", [5, 64, 1])
+def test_grid_rows_batched_matches_sequential(mb, tok, batch_size):
+    """Stage C grid: the batched forwards (one delta per row, LM head on the last position)
+    give the rows of one forward per dose, in the same order (finding C1)."""
+    from lsne.directions import Direction
+    from lsne.experiments import stage_c_grid as SC
+    vs = C.apply_variant_limit(_dev01a(tok), 3)
+    site = C.dossier_site(mb)
+    g = torch.Generator().manual_seed(1)
+    names = ["ent", "lang_dom", "rand_00"]
+    bank = C.DirectionBank(site=site, dirs={n: Direction(n, torch.randn(mb.d_model, generator=g), site) for n in names},
+                           freq_ids=[11, 13, 17, 19, 23])
+    doses = (0.0, 0.01, 0.1, 0.5)
+    new = pd.DataFrame(SC.grid_rows(mb, vs, bank, site, doses, names, enabled=False, batch_size=batch_size),
+                       columns=SC.GRID_COLS)
+    old = pd.DataFrame(_sequential_grid_rows(mb, vs, bank, site, doses, names), columns=SC.GRID_COLS)
+    assert new.shape == old.shape == (len(vs) * len(names) * 2 * len(doses), len(SC.GRID_COLS))
+    num = [c for c in SC.GRID_COLS if new[c].dtype.kind == "f"]
+    rest = [c for c in SC.GRID_COLS if c not in num]
+    assert new[rest].equals(old[rest])
+    assert np.allclose(new[num].to_numpy(), old[num].to_numpy(), rtol=1e-4, atol=1e-5, equal_nan=True)
+    assert (new.loc[new["eps"] == 0, ["B", "delta_norm", "audit_rel_err"]].to_numpy() == 0).all()
+    dosed = new[new["eps"] > 0]
+    assert (dosed["audit_rel_err"] < 1e-4).all() and (dosed["delta_norm"] > 0).all()
+    assert np.abs(dosed["B"].to_numpy()).max() > 1e-4          # the doses do something
+
+
+def test_resume_checkpoints_chunks_and_signature(tmp_path):
+    """C2: chunk results are checkpointed, a rerun with the same signature loads them instead
+    of recomputing, another signature discards them, clear() removes the directory."""
+    calls = []
+
+    def fn(xs):
+        calls.append(list(xs))
+        if xs and xs[-1] == "boom":
+            raise RuntimeError("boom")
+        return (pd.DataFrame(dict(x=list(xs), n=[len(x) for x in xs])), pd.DataFrame(dict(y=[len(xs)])))
+
+    items = ["a", "bb", "ccc", "dddd", "boom"]
+    r = C.Resume(tmp_path, "sig1")
+    with pytest.raises(RuntimeError, match="boom"):
+        r.chunked("t", items, fn, chunk=2)
+    assert calls == [["a", "bb"], ["ccc", "dddd"], ["boom"]]
+    assert sorted(p.name for p in (tmp_path / "_resume").iterdir()) == ["state.json", "t_00000.pkl", "t_00001.pkl"]
+    calls.clear()
+    items[-1] = "e"                                  # the failure is gone; the signature is unchanged
+    a, b = C.Resume(tmp_path, "sig1").chunked("t", items, fn, chunk=2)
+    assert calls == [["e"]]                          # only the missing chunk is computed
+    assert a["x"].tolist() == items and a.index.tolist() == list(range(5)) and b["y"].tolist() == [2, 2, 1]
+    calls.clear()
+    r2 = C.Resume(tmp_path, "sig2")                  # other inputs: everything is recomputed
+    assert r2.chunked("t", items, fn, chunk=2)[0]["x"].tolist() == items and len(calls) == 3 and not r2.loaded
+    assert r2.step("s", lambda: {"k": pd.DataFrame(dict(z=[1]))})["k"]["z"].tolist() == [1]
+    assert C.Resume(tmp_path, "sig2").step("s", lambda: 1 / 0)["k"]["z"].tolist() == [1]
+    r2.clear()
+    assert not (tmp_path / "_resume").exists()
+    off = C.Resume(tmp_path, "sig3", enabled=False)
+    assert off.chunked("t", [], lambda xs: pd.DataFrame(dict(x=xs))).empty and not (tmp_path / "_resume").exists()
+
+
+def test_limited_core_keeps_pairs_and_originals(tok):
+    """F2: the limited generation core is a seeded subset of formulations with all their core
+    conditions; originals stay; None keeps everything."""
+    import types
+    vs = []
+    for f in range(30):
+        for K, Cc in C.CORE_CONDITIONS:
+            vs.append(types.SimpleNamespace(tag=f"F{f:02d}A:K{K}:{Cc}", family_id=f"F{f:02d}", formulation="A",
+                                            K=K, C=Cc, kind="standard"))
+    vs += [types.SimpleNamespace(tag=f"orig:K{K}", family_id="ORIG", formulation="", K=K, C="orig", kind="original")
+           for K in (0, 9)]
+    assert C.limited_core(vs, None, 0) == vs
+    sub = C.limited_core(vs, 4, seed=1)
+    assert sub == C.limited_core(vs, 4, seed=1) and sub != C.limited_core(vs, 4, seed=2)
+    std = [v for v in sub if v.kind == "standard"]
+    assert len(std) == 4 * len(C.CORE_CONDITIONS) and [v for v in sub if v.kind == "original"] == vs[-2:]
+    fams = {v.family_id for v in std}
+    assert all(sum(1 for v in std if v.family_id == f) == len(C.CORE_CONDITIONS) for f in fams)
+    assert [v for v in vs if v in sub] == sub                                    # order preserved
+    assert C.Limits().gen_max_core is None and C.Limits().as_limited().gen_max_core == C.LIMITED_GEN_MAX_CORE
+    assert C.Limits(gen_max_core=7).as_limited().gen_max_core == 7
+
+
+def test_unigram_counts_strict_on_full_runs(mb, tok, monkeypatch):
+    """B-2: a failed Pile fetch falls back to stimulus-bank counts only in smoke runs; a full
+    run raises (and direction_bank does not swallow it)."""
+    import lsne.pile_fetch as PF
+
+    def boom(*a, **k):
+        raise RuntimeError("HTTP 503")
+
+    monkeypatch.delenv("LSNE_OFFLINE", raising=False)
+    monkeypatch.setattr(PF, "sample_unigram_counts", boom)
+    vs = C.apply_variant_limit(_dev01a(tok), 3)
+    with pytest.warns(UserWarning, match="stimulus-bank"):
+        counts, info = C.unigram_counts(mb, 5, 0, vs)
+    assert info["source"] == "stimulus_bank" and counts.shape == (mb.vocab,)
+    with pytest.raises(C.UnigramFetchError, match="LSNE_OFFLINE=1"):
+        C.unigram_counts(mb, 5, 0, vs, strict=True)
+    cfg = RunConfig(model=mb.spec, families=["DEV01"], n_random_dirs=1, seed=1)
+    with pytest.raises(C.UnigramFetchError):
+        C.direction_bank(cfg, mb, vs, C.dossier_site(mb), limits=C.Limits(n_unigram=5))
+    monkeypatch.setenv("LSNE_OFFLINE", "1")                                     # explicit opt-in
+    assert C.unigram_counts(mb, 5, 0, vs, strict=True)[1]["source"] == "stimulus_bank"
+
+
+def test_get_bank_from_disk_restores_the_sae(mb, tok, tmp_path, monkeypatch):
+    """IJ-1: a bank reloaded from stage B's directory gets its SAE back (published SAE
+    reloaded from the hub; here a synthetic one), so stages H-J see it."""
+    from lsne import sae as SAE
+    from lsne.io import write_manifest
+    vs = C.apply_variant_limit(_dev01a(tok), 3)
+    cfg = RunConfig(model=mb.spec, families=["DEV01"], n_random_dirs=2, seed=1, out_root=str(tmp_path))
+    limits = C.Limits.smoke(use_sae=True, n_sae_features=2, synthetic_sae_if_missing=False)
+    site = C.dossier_site(mb)
+    sae = C.synthetic_sae(mb, n_latents=32)
+    monkeypatch.setenv("LSNE_OFFLINE", "1")
+    bank = C.direction_bank(cfg, mb, vs, site, limits=limits, sae=sae)
+    bank.meta["sae"].update(repo="org/sae-repo", hookpoint=f"layers.{site.layer}")
+    rd = tmp_path / "B" / f"{mb.spec.name.split('/')[-1]}@{mb.spec.revision}"
+    C.save_bank(bank, rd)
+    write_manifest(rd, stage="B", status="ok", bank_signature=C.bank_signature(vs, site, cfg, limits, None))
+    loads = []
+    monkeypatch.setattr(SAE.TopKSAE, "load_from_hub",
+                        classmethod(lambda cls, repo, hp, device="cpu": loads.append((repo, hp)) or sae))
+    back = C.get_bank(cfg, mb, vs, site, {}, limits)
+    assert back.meta["source"].startswith("disk:") and loads == [("org/sae-repo", f"layers.{site.layer}")]
+    assert back.sae is sae and C.get_sae(mb, back, limits, {})[1] == f"hub:org/sae-repo/layers.{site.layer}"
+    # a hub failure drops only the SAE (warning), the stored bank is still used
+    monkeypatch.setattr(SAE.TopKSAE, "load_from_hub", classmethod(lambda cls, *a, **k: 1 / 0))
+    with pytest.warns(UserWarning, match="could not be reloaded"):
+        back = C.get_bank(cfg, mb, vs, site, {}, limits)
+    assert back.sae is None and back.meta["source"].startswith("disk:") and C.get_sae(mb, back, limits, {})[1] == "none"
+
+
+def _boom(msg):
+    def f(*a, **k):
+        raise RuntimeError(msg)
+    return f
+
+
+def _assert_tables_close(a: dict, b: dict):
+    assert sorted(a) == sorted(b)
+    for name in a:
+        x, y = a[name].reset_index(drop=True), b[name].reset_index(drop=True)
+        assert list(x.columns) == list(y.columns) and x.shape == y.shape, name
+        num = [c for c in x.columns if x[c].dtype.kind == "f"]
+        rest = [c for c in x.columns if c not in num]
+        assert x[rest].equals(y[rest]), name
+        assert np.allclose(x[num].to_numpy(dtype=float), y[num].to_numpy(dtype=float), rtol=1e-6, atol=1e-8,
+                           equal_nan=True), name
+
+
+def test_stage_c_resumes_after_a_late_failure(mb, tmp_path, monkeypatch):
+    """C2: a failure after the grid (here in grad x act) keeps the grid and attribution
+    checkpoints; the rerun loads them instead of recomputing and gives the tables of an
+    uninterrupted run; the checkpoints are gone afterwards."""
+    from lsne.experiments import stage_c_grid as SC
+    monkeypatch.setenv("LSNE_OFFLINE", "1")
+    cfg = C.smoke_config(RunConfig(model=mb.spec, families=["DEV01"], out_root=str(tmp_path)))
+    limits = C.Limits.smoke(progress=False)
+    ref = SC.run(cfg, mb, tmp_path / "fresh", ctx={}, limits=limits, resume=False)
+    assert not (tmp_path / "fresh" / "_resume").exists()
+    rd = tmp_path / "C"
+    real = dict(grid_rows=SC.grid_rows, attribution_table=SC.attribution_table, grad_x_act_tables=SC.grad_x_act_tables)
+    monkeypatch.setattr(SC, "grad_x_act_tables", _boom("late failure"))
+    with pytest.raises(RuntimeError, match="late failure"):
+        SC.run(cfg, mb, rd, ctx={}, limits=limits)
+    ck = sorted(p.name for p in (rd / "_resume").iterdir())
+    assert "grid_00000.pkl" in ck and "attribution_00000.pkl" in ck and not any(n.startswith("grad_x_act") for n in ck)
+    monkeypatch.setattr(SC, "grad_x_act_tables", real["grad_x_act_tables"])
+    monkeypatch.setattr(SC, "grid_rows", _boom("grid recomputed"))
+    monkeypatch.setattr(SC, "attribution_table", _boom("attribution recomputed"))
+    out = SC.run(cfg, mb, rd, ctx={}, limits=limits)
+    _assert_tables_close(out, ref)
+    m = json.loads((rd / "manifest.json").read_text())
+    assert m["status"] == "ok" and m["resumed_checkpoints"] == len(ck) - 1 and m["unigram"]["source"] == "stimulus_bank"
+    assert not (rd / "_resume").exists()
+    # other inputs (another dose grid) do not reuse the old checkpoints
+    monkeypatch.setattr(SC, "grad_x_act_tables", _boom("late failure"))
+    monkeypatch.setattr(SC, "grid_rows", real["grid_rows"])
+    monkeypatch.setattr(SC, "attribution_table", real["attribution_table"])
+    with pytest.raises(RuntimeError):
+        SC.run(cfg, mb, rd, ctx={}, limits=limits)
+    from dataclasses import replace
+    cfg2 = replace(cfg, doses=(0.0, 0.05))
+    monkeypatch.setattr(SC, "grad_x_act_tables", real["grad_x_act_tables"])
+    out2 = SC.run(cfg2, mb, rd, ctx={}, limits=limits)
+    assert sorted(out2["grid"]["eps"].unique()) == [0.0, 0.05]
+    assert json.loads((rd / "manifest.json").read_text())["resumed_checkpoints"] == 0
+
+
+def test_stage_d_resumes_after_a_late_failure(mb, tmp_path, monkeypatch):
+    """C2 for stage D: D1 and D2/D9 survive a failure in the generation diagnostics."""
+    from lsne.experiments import stage_d_noneq as SD
+    monkeypatch.setenv("LSNE_OFFLINE", "1")
+    cfg = C.smoke_config(RunConfig(model=mb.spec, families=["DEV01"], out_root=str(tmp_path)))
+    limits = C.Limits.smoke(progress=False)
+    rd = tmp_path / "D"
+    real_gen = SD.generation_tables
+    monkeypatch.setattr(SD, "generation_tables", _boom("generation failed"))
+    with pytest.raises(RuntimeError, match="generation failed"):
+        SD.run(cfg, mb, rd, ctx={}, limits=limits)
+    ck = sorted(p.name for p in (rd / "_resume").iterdir())
+    assert "damage_00000.pkl" in ck and "lens_00000.pkl" in ck
+    monkeypatch.setattr(SD, "generation_tables", real_gen)
+    monkeypatch.setattr(SD, "damage_tables", _boom("damage recomputed"))
+    monkeypatch.setattr(SD, "lens_tables", _boom("lens recomputed"))
+    out = SD.run(cfg, mb, rd, ctx={}, limits=limits)
+    assert len(out["damage"]) and len(out["lens"]) and len(out["hysteresis"])
+    m = json.loads((rd / "manifest.json").read_text())
+    assert m["status"] == "ok" and m["resumed_checkpoints"] == 2 and m["gen_max_core"] is None
+    assert m["n_core"] == m["n_core_all"] == len(m["core_tags"]) and m["unigram"]["source"] == "stimulus_bank"
+    assert not (rd / "_resume").exists()
+
+
 def test_plan_triples_partition():
     pairs = [("m", "r1"), ("m", "r2"), ("n", "r1")]
     fams = ["F01", "F02", "F03", "DEV01"]

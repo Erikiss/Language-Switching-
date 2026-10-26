@@ -9,10 +9,12 @@ the dossier hash check, and two real sequences for the unigram counts.
 """
 import hashlib
 import re
+import threading
 import types
 
 import numpy as np
 import pytest
+import requests as real_requests
 
 import lsne.pile_fetch as PF
 from lsne.config import STATE2143
@@ -82,23 +84,48 @@ class FakeResponse:
 
 class FakePile:
     """Replacement for ``requests.get``: serves byte ranges of the virtual shards and records
-    every request. ``mode`` selects the server behaviour."""
+    every request. ``mode`` selects the server behaviour; the first ``fail_first`` requests
+    fail transiently (HTTP ``fail_status``, or a connection error for ``fail_status="conn"``),
+    requests for a byte offset in ``fail_offsets`` get a permanent 404."""
 
-    def __init__(self, mode="206"):
+    def __init__(self, mode="206", fail_first=0, fail_status=503, retry_after=None):
         self.mode = mode
         self.calls = []
         self.responses = []
+        self.sessions = []
+        self.sleeps = []
+        self.fail_first = int(fail_first)
+        self.fail_status = fail_status
+        self.retry_after = retry_after
+        self.fail_offsets = set()
+        self._lock = threading.Lock()          # the unigram test calls the server from 8 threads
 
-    def __call__(self, url, headers=None, timeout=None, allow_redirects=True, stream=False, **kw):
+    def __call__(self, url, headers=None, timeout=None, allow_redirects=True, stream=False, session=None, **kw):
         m = re.search(r"document-(\d{5})-of-00020\.bin$", url)
         assert m, url
         shard = int(m.group(1))
         rng = re.fullmatch(r"bytes=(\d+)-(\d+)", headers["Range"])
         a, b = int(rng.group(1)), int(rng.group(2))
         n = b - a + 1
-        self.calls.append(dict(shard=shard, a=a, b=b, stream=stream, url=url, timeout=timeout))
+        self.calls.append(dict(shard=shard, a=a, b=b, stream=stream, url=url, timeout=timeout, session=session))
         body = virtual_bytes(shard, a, b)
         ok = {"Content-Range": f"bytes {a}-{b}/{SHARD}", "Content-Length": str(n)}
+        with self._lock:
+            fail = self.fail_first > 0
+            self.fail_first -= int(fail)
+        if fail:
+            if self.fail_status == "conn":
+                raise real_requests.ConnectionError("connection reset by peer")
+            hdr = {"Content-Length": "0"}
+            if self.retry_after is not None:
+                hdr["Retry-After"] = str(self.retry_after)
+            r = FakeResponse(int(self.fail_status), hdr, b"")
+            self.responses.append(r)
+            return r
+        if (shard, a) in self.fail_offsets:
+            r = FakeResponse(404, {"Content-Length": "15"}, b"Entry not found")
+            self.responses.append(r)
+            return r
         mode = self.mode
         if mode == "206":
             r = FakeResponse(206, ok, body)
@@ -128,11 +155,27 @@ class FakePile:
         return r
 
 
+class FakeSession:
+    """``requests.Session`` stand-in: routes ``get`` to the fake server and records itself."""
+
+    def __init__(self, srv):
+        self.srv = srv
+        self.closed = False
+        srv.sessions.append(self)
+
+    def get(self, url, **kw):
+        return self.srv(url, session=self, **kw)
+
+    def close(self):
+        self.closed = True
+
+
 @pytest.fixture
 def fake(monkeypatch):
-    def make(mode="206"):
-        srv = FakePile(mode)
-        monkeypatch.setattr(PF, "requests", types.SimpleNamespace(get=srv))
+    def make(mode="206", **kw):
+        srv = FakePile(mode, **kw)
+        monkeypatch.setattr(PF, "requests", types.SimpleNamespace(get=srv, Session=lambda: FakeSession(srv)))
+        monkeypatch.setattr(PF, "_sleep", srv.sleeps.append)        # no real backoff in tests
         return srv
     return make
 
@@ -251,9 +294,39 @@ def test_fetch_range_rejects_short_and_long_bodies(fake, mode, needle):
     srv = fake(mode)
     with pytest.raises(RuntimeError, match=needle):
         fetch_range(_url(0), 0, 99)
-    assert srv.responses[0].closed
+    assert all(r.closed for r in srv.responses)
+    # a short body is transient (retried FETCH_ATTEMPTS times), an over-long one is not
+    assert len(srv.calls) == (PF.FETCH_ATTEMPTS if mode == "short" else 1)
     with pytest.raises(RuntimeError, match=needle):
         fetch_sequence(ANCHOR)
+
+
+@pytest.mark.parametrize("status, retry_after", [(503, None), (429, 7), (500, None), ("conn", None)])
+def test_fetch_range_retries_transient_failures(fake, status, retry_after):
+    """HTTP 429 / 5xx and connection errors are retried with exponential backoff (Retry-After
+    honoured); the bytes of the eventual 206 are returned unchanged."""
+    srv = fake("206", fail_first=3, fail_status=status, retry_after=retry_after)
+    a, b = 1000, 1000 + SEQ_BYTES - 1
+    assert fetch_range(_url(2), a, b) == virtual_bytes(2, a, b)
+    assert len(srv.calls) == 4
+    expect = [1.0, 2.0, 4.0] if retry_after is None else [7.0, 7.0, 7.0]
+    assert srv.sleeps == expect
+    assert all(r.closed and r.served == 0 for r in srv.responses[:-1])     # error bodies are never read
+
+
+def test_fetch_range_gives_up_after_the_last_attempt_and_never_retries_a_404(fake):
+    srv = fake("206", fail_first=PF.FETCH_ATTEMPTS, fail_status=502)
+    with pytest.raises(PF.TransientFetchError, match="HTTP 502"):
+        fetch_range(_url(0), 0, 99)
+    assert len(srv.calls) == PF.FETCH_ATTEMPTS and len(srv.sleeps) == PF.FETCH_ATTEMPTS - 1
+    srv = fake("404")
+    with pytest.raises(RuntimeError, match="HTTP 404"):
+        fetch_range(_url(0), 0, 99)
+    assert len(srv.calls) == 1 and srv.sleeps == []
+    srv = fake("200-full")
+    with pytest.raises(RuntimeError, match="full shard"):
+        fetch_range(_url(0), 0, 99, attempts=3)
+    assert len(srv.calls) == 1
 
 
 def test_fetch_range_empty_range_is_an_error(fake):
@@ -289,6 +362,55 @@ def test_sample_unigram_counts_two_sequences(fake, tmp_path):
     assert len(srv.calls) > n_calls and int(other.sum()) == 2 * SEQ_LEN and not np.array_equal(other, counts)
     top = frequent_token_ids(counts, top_n=5)
     assert top.shape == (5,) and np.array_equal(np.sort(counts[top])[::-1], np.sort(counts)[::-1][:5])
+
+
+def _expected_counts(idx) -> np.ndarray:
+    expect = np.zeros(VOCAB, dtype=np.int64)
+    for i in idx:
+        expect += np.bincount(virtual_tokens(int(i) * SEQ_LEN, SEQ_LEN).astype(np.int64), minlength=VOCAB)
+    return expect
+
+
+def test_sample_unigram_counts_concurrent_equals_sequential(fake, tmp_path):
+    """Eight worker threads, one session each: the counts equal the sequential sum exactly
+    (int64, order-independent); transient failures on the way are retried."""
+    n = 40
+    idx = np.random.default_rng(3).choice(N_SEQ, size=n, replace=False)
+    srv = fake("206", fail_first=2, fail_status=503)
+    par = sample_unigram_counts(n, seed=3, vocab=VOCAB, cache_dir=tmp_path / "par", workers=8)
+    assert np.array_equal(par, _expected_counts(idx)) and int(par.sum()) == n * SEQ_LEN
+    assert srv.sessions and all(s.closed for s in srv.sessions) and len(srv.sessions) <= 8
+    assert all(c["session"] is not None for c in srv.calls) and len(srv.sleeps) == 2
+    fake("206")
+    seq = sample_unigram_counts(n, seed=3, vocab=VOCAB, workers=1)
+    assert np.array_equal(par, seq)
+    z = np.load(tmp_path / "par" / f"unigram_n{n}_s3.npz")
+    assert np.array_equal(z["counts"], par) and np.array_equal(z["idx"], idx)
+    assert sorted(p.name for p in (tmp_path / "par").iterdir()) == [f"unigram_n{n}_s3.npz"]   # no tmp / progress left
+
+
+def test_sample_unigram_counts_resumes_from_the_progress_file(fake, tmp_path):
+    """A permanent failure keeps the counts so far in the progress file; the restart fetches
+    only the missing sequences and gives the same counts as an uninterrupted run."""
+    n, seed = 12, 5
+    idx = np.random.default_rng(seed).choice(N_SEQ, size=n, replace=False)
+    srv = fake("206")
+    bad = int(idx[7])
+    srv.fail_offsets.add(byte_range_for_sequence(bad)[0][:2])
+    with pytest.raises(RuntimeError, match="HTTP 404"):
+        sample_unigram_counts(n, seed=seed, vocab=VOCAB, cache_dir=tmp_path, workers=1, checkpoint_every=3)
+    prog = tmp_path / f"unigram_n{n}_s{seed}.partial.npz"
+    assert prog.exists() and not (tmp_path / f"unigram_n{n}_s{seed}.npz").exists()
+    with np.load(prog) as z:
+        done = {int(i) for i in z["done_idx"]}
+        assert done == {int(i) for i in idx[:7]} and np.array_equal(z["counts"], _expected_counts(idx[:7]))
+    srv = fake("206")
+    counts = sample_unigram_counts(n, seed=seed, vocab=VOCAB, cache_dir=tmp_path, workers=4)
+    assert np.array_equal(counts, _expected_counts(idx))
+    fetched = {(c["shard"] * SHARD + c["a"]) // SEQ_BYTES for c in srv.calls}     # first byte -> sequence index
+    assert fetched == {int(i) for i in idx[7:]}                                      # only the missing ones
+    assert not prog.exists() and (tmp_path / f"unigram_n{n}_s{seed}.npz").exists()
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 # --------------------------------------------------------------------------------------

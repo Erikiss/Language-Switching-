@@ -554,8 +554,14 @@ wegkontrahieren. Beides wird hier respektiert:
 | Skala | pythia-410m, pythia-1b, pythia-1.4b | step143000 | Skalierung der Signaturen |
 
 Rechenaufwand (Schätzung, A100): ein Forward von 160M auf ≤ 320 Tokens ≈ 3 ms.
-Stage C (Grid, 6 Arme) ≈ 3 000 Forwards; Stage D1/D2 ≈ 50 000 Forwards (≈ 5 min);
-Generierungsstages (D3–D7) ≈ 300 000 Token-Schritte gebatcht (≈ 30–60 min);
+Stage C (Grid) ≈ 568 000 Grid-Zeilen (1 153 Varianten × 35 Richtungen × 2 Vorzeichen × 7
+Dosen), ausgewertet in Forwards zu 64 Zeilen (≈ 9 000 gebatchte Forwards + eine Baseline je
+Variante; der ursprüngliche Ansatz mit einem Forward je Zeile brauchte gemessen 3,05 h),
+plus ≈ 59 000 Forwards der kontrafaktischen Attribution; Stage D1 ≈ 470 000 Schadenskarten
+(1 153 Varianten × 2 Injektionen × 204 Paare) in Forwards zu 64 Zeilen, D2/D9 eine
+Referenz je Variante;
+Generierungsstages (D3–D7) ≈ 300 000 Token-Schritte gebatcht (≈ 30–60 min; gemessen eher
+1–2 h je Checkpoint);
 Checkpoint-Sweep ×27; Skalierungsarm ×(3…10). Alles passt auf 6 A100 in Stunden.
 Shards: `jobs/shards.yaml` teilt nach (Modell, Revision, Familien-Teilmenge); jede
 Shard schreibt eigene Ergebnisdateien, `lsne.cli merge` fügt zusammen.

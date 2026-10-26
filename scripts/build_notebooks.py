@@ -514,6 +514,26 @@ def nb_00() -> list[tuple[str, str]]:
         ),
         code(
             """
+            # --- Unigramm-Zählung vorab holen (Frequenzachse `freq` aller späteren Notebooks) -------
+            # 2 000 Pile-Sequenzen per Range-Request (8 Threads, Wiederholung bei 429/5xx/Abbruch,
+            # Fortsetzung nach Abbruch), gecacht unter LSNE_CACHE/unigram. Einmal pro Google-Konto,
+            # bevor die parallelen Notebooks starten (oder unigram_n2000_s0.npz ins zweite Konto
+            # kopieren). Volle Läufe brechen ohne diese Zählung ab statt still auf die
+            # Stimulusbank auszuweichen (LSNE_OFFLINE=1 erlaubt das ausdrücklich).
+            with guarded("Unigramm-Zählung"):
+                if C.offline():
+                    print("LSNE_OFFLINE gesetzt: übersprungen (Frequenzachse aus der Stimulusbank)")
+                else:
+                    from lsne.pile_fetch import sample_unigram_counts
+                    t_u = time.perf_counter()
+                    _u = sample_unigram_counts(int(limits.n_unigram), int(cfg.seed), vocab=mb.vocab,
+                                               cache_dir=C.cache_dir("unigram"))
+                    print(f"Unigramm-Zählung: {int(limits.n_unigram)} Sequenzen, {int(_u.sum())} Tokens, "
+                          f"{time.perf_counter() - t_u:.0f} s -> {C.cache_dir('unigram')}")
+            """
+        ),
+        code(
+            """
             # --- Stufe A ausführen ----------------------------------------------------------------
             # CLI-Äquivalent (siehe CLI_COMMAND oben):
             #   python -m lsne.cli run --stage A --model EleutherAI/pythia-160m --revision step98000 --out <RUNS_ROOT>

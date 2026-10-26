@@ -297,6 +297,19 @@ def _last_logits_kwargs(mb: ModelBundle) -> dict:
     return {}
 
 
+def last_logits(mb: ModelBundle, input_ids: torch.Tensor) -> torch.Tensor:
+    """``[B, V]`` float32 logits of the last position of ``input_ids [B, T]`` with the LM
+    head applied to that position only (``logits_to_keep=1``; without that kwarg the final
+    hidden state of the base model goes through the head at the last position).  Runs
+    inside the caller's grad mode; hooks on the blocks fire as in a full forward."""
+    ids = input_ids.to(mb.device)
+    kw = _last_logits_kwargs(mb)
+    if kw:
+        return mb.model(input_ids=ids, use_cache=False, **kw).logits[:, -1].float()
+    hs = mb.model.base_model(input_ids=ids, use_cache=False).last_hidden_state
+    return mb.lm_head(hs[:, -1]).float()
+
+
 def _stack_dirs(directions) -> torch.Tensor:
     """[N, d] float32 CPU stack of direction objects / vectors / an [N, d] array."""
     if isinstance(directions, (torch.Tensor, np.ndarray)) and np.ndim(directions) == 2:
