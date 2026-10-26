@@ -53,7 +53,7 @@ TARGET=${TARGET:-EleutherAI/pythia-14m}
 TARGET_REV=${TARGET_REV:-step98000}
 LOG=$OUT/logs
 mkdir -p "$LOG"
-export OUT CACHE ITR ITR_TRAIN VOCAB MODEL UNTRAINED VAL_FRAC SIZE TARGET TARGET_REV EVAL_BLOCKS PROBE_CONFIGS DEVICE
+export OUT CACHE ITR ITR_TRAIN VOCAB MODEL UNTRAINED VAL_FRAC SIZE TARGET TARGET_REV EVAL_BLOCKS PROBE_CONFIGS DEVICE WORKERS
 
 STATUS=0
 timed() {   # timed <log name> <command…>: run, tee the log, append exit code and wall time
@@ -624,40 +624,51 @@ def wall(log):
     return float(m.group(1)) if m else float("nan")
 voc = TraceVocab.load(VOCAB)
 V = len(voc)
-rep = load("vocab/vocab_report.json")
-V_full = V - rep["n_addresses"] + 100000          # scenario: 100 000 addresses (BlockGPT: 93 233)
-bench = pd.read_csv(os.path.join(OUT, "bench.csv")).set_index("size")
+vpath = os.path.join(VOCAB, "vocab_report.json")
+rep = json.load(open(vpath, encoding="utf-8")) if os.path.exists(vpath) else None
+V_full = V - int((rep or voc.meta)["n_addresses"]) + 100000   # scenario: 100 000 addresses (BlockGPT: 93 233)
+bpath = os.path.join(OUT, "bench.csv")
+bench = pd.read_csv(bpath).set_index("size") if os.path.exists(bpath) else pd.DataFrame()
 prof, ev, base = load("profile2016.json"), load("eval.json"), load("baselines.json")
 man = json.load(open(os.path.join(MODEL, "manifest.json"), encoding="utf-8"))
 log = pd.read_csv(os.path.join(MODEL, "train_log.csv"))
 A100_PEAK = 312e12                                   # bf16 dense tensor-core peak (NVIDIA datasheet)
+def bench_val(size, col):
+    return float(bench.loc[size, col]) if size in bench.index else float("nan")
 ext = dict(vocab_size=V, vocab_size_100k_addresses=V_full,
-           cpu_bench_small_tokens_per_s=float(bench.loc["small", "tokens_per_s"]),
-           cpu_bench_blockgpt_tokens_per_s=float(bench.loc["blockgpt", "tokens_per_s"]),
-           cpu_bench_blockgpt_s_per_step_8x512=float(bench.loc["blockgpt", "s_per_step"]),
-           cpu_train_small_tokens_per_s_effective=float(man["tokens_per_s"]))
-T = prof["est_train_tokens_2016"]
+           cpu_bench_small_tokens_per_s=bench_val("small", "tokens_per_s"),
+           cpu_bench_blockgpt_tokens_per_s=bench_val("blockgpt", "tokens_per_s"),
+           cpu_bench_blockgpt_s_per_step_8x512=bench_val("blockgpt", "s_per_step"),
+           cpu_train_tokens_per_s_effective=float(man["tokens_per_s"]))
+T = prof["est_train_tokens_2016"] if prof else float("nan")
 ext.update(tokens_2016_truncated512=T, tokens_spec_run_20000x32x512=20000 * 32 * 512)
-for tag, vs in (("V42k", V), ("V122k", V_full)):
+for tag, vs in (("V_run", V), ("V_100k_addresses", V_full)):
     fpt = flops_per_token("blockgpt", vs, 512)
     ext[f"blockgpt_{tag}_params"] = param_counts("blockgpt", vs)
     ext[f"blockgpt_{tag}_flops_per_token"] = fpt
-    for mfu in (0.15, 0.30):
+    for mfu in (0.15, 0.30):                         # ASSUMED model-FLOP utilisation (extrapolation)
         tps = A100_PEAK * mfu / fpt
         ext[f"a100_{tag}_mfu{int(mfu * 100)}_tokens_per_s"] = tps
         ext[f"a100_{tag}_mfu{int(mfu * 100)}_hours_per_epoch_2016"] = T / tps / 3600
 ext["cpu_blockgpt_hours_per_epoch_2016"] = T / ext["cpu_bench_blockgpt_tokens_per_s"] / 3600
-# data preparation for all of 2016, scaled from the measured slices
-n_chunks = prof["n_chunks_2016"]
-ser_cpu_s = [4 * wall("02_serialize.log") / 31, 4 * wall("12d_serialize_profile.log") / 46]
-ext.update(serialize_cpu_s_per_chunk_range=ser_cpu_s,
-           serialize_2016_cpu_hours_range=[x * n_chunks / 3600 for x in ser_cpu_s],
-           download_2016_gb=prof["est_download_gb_2016"])
+# data preparation for all of 2016, scaled from the measured serialisation runs
+def ser_cpu_s_per_chunk(name):
+    p = os.path.join(OUT, "logs", name)
+    if not os.path.exists(p):
+        return float("nan")
+    txt = open(p, encoding="utf-8").read()
+    m = re.search(r"serialize: (\d+) chunks", txt)
+    return float(os.environ.get("WORKERS", "4")) * wall(name) / int(m.group(1)) if m else float("nan")
+ser_cpu_s = [ser_cpu_s_per_chunk("02_serialize.log"), ser_cpu_s_per_chunk("12d_serialize_profile.log")]
+n_chunks = prof["n_chunks_2016"] if prof else float("nan")
+ext.update(serialize_cpu_s_per_chunk=ser_cpu_s, serialize_2016_cpu_hours=[x * n_chunks / 3600 for x in ser_cpu_s],
+           download_2016_gb=prof["est_download_gb_2016"] if prof else float("nan"))
 summary = dict(train=dict(steps=int(log["step"].max()), tokens_seen=int(log["tokens_seen"].max()),
                           wall_s=float(man.get("wall_s", float("nan"))), tokens_per_s=man.get("tokens_per_s"),
                           params=man.get("params"), curve=log.round(4).to_dict(orient="records")),
-               eval=ev, baselines={k: base[k] for k in base if k != "corpus"}, corpus=base["corpus"],
-               profile2016=prof, extrapolation=ext, vocab=rep, probe=load("probe_report.json"))
+               eval=ev, baselines={k: base[k] for k in base if k != "corpus"} if base else None,
+               corpus=base["corpus"] if base else None, profile2016=prof, extrapolation=ext, vocab=rep,
+               probe=load("probe_report.json"))
 with open(os.path.join(OUT, "summary.json"), "w", encoding="utf-8") as fh:
     json.dump(summary, fh, indent=1, default=float)
 print(json.dumps(dict(train={k: v for k, v in summary["train"].items() if k != "curve"},
