@@ -355,7 +355,7 @@ def test_smoke_stage_h_lambda(smoke_run):
     assert set(steps["discriminant"]) == set(p["discriminant"]) and (steps.groupby(["discriminant", "lam_rel"])["step"].min() == 0).all()
     corr = _csv(out, "H", "lambda_corr")
     pre = corr[corr["preregistered"]]
-    assert set(pre["quantity"]) == {"sae_fvu", "steps_to_cross", "mahal_to_ref_mean"} and (pre["discriminant"] == "target_logit").all()
+    assert set(pre["quantity"]) == {"sae_fvu", "steps_to_cross_censored", "mahal_to_ref_mean"} and (pre["discriminant"] == "target_logit").all()
     boot = _csv(out, "H", "lambda_boot")
     bp = boot[boot["preregistered"]]
     assert len(bp) == 3 and set(bp["expected_sign"]) == {-1, 0}
