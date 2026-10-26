@@ -31,6 +31,7 @@ EXTRA_RANGES=${EXTRA_RANGES-"1718000-1720000 1920000-1922000"}   # fully downloa
 WORKERS=${WORKERS:-4}
 DEVICE=${DEVICE:-cpu}
 N_ADDRESSES=${N_ADDRESSES:-20000}
+VOCAB_REPORT=${VOCAB_REPORT:-1}         # 0: skip the (single-process, slow on all of 2016) OOV report
 ITR=${ITR:-$OUT/itr}                    # all serialised transactions (train + validation split)
 ITR_TRAIN=${ITR_TRAIN:-$OUT/itr_train}        # train split only (tokens), the vocabulary is built from it
 VOCAB=${VOCAB:-$OUT/vocab}
@@ -120,7 +121,7 @@ for fn in list_shards(src):
 print(f"split: {n[0]} train tx -> {dst}, {n[1]} held-out tx (val_frac {frac})")
 PY
     timed 03b_vocab $PY -m lsne.chain.cli vocab --in "$ITR_TRAIN" --out "$VOCAB" --n-addresses "$N_ADDRESSES"
-    step_vocab_report
+    [ "$VOCAB_REPORT" = "0" ] || step_vocab_report
 }
 
 step_vocab_report() {   # composition, held-out OOV (also per era and per vocabulary budget)
