@@ -26,15 +26,23 @@ URL pattern: `https://data.ethpandaops.io/xatu/mainnet/databases/default/<table>
 | canonical_execution_storage_reads | transaction_hash, internal_index, contract_address, slot, value (hex) |
 | canonical_execution_block | block_number, block_date_time, extra_data_string ("dao-hard-fork" for 1 920 000–1 920 009) |
 
-Block-level rows (rewards, the fork's irregular state change) carry a transaction_hash of
+Block-level rows (block and uncle rewards) carry a transaction_hash of
 "0x" followed by zero bytes; they are not transactions and are excluded from the corpus
 (kept only for the fork-block statistics).
 
 DAO drain transaction 0x0ec3f2488a93839524add10ea229e773f6bc891b4eb4794c3337d4495263790b
 (block 1 718 497): 81 trace nodes, call-tree depth up to 28 (recursive splitDAO), 81 native
 transfers from 6 senders to 9 receivers totalling 2 597.76 ETH, 31 logs, 32 storage diffs.
-In chunk 1718000 the per-transaction ETH fan-out (distinct receivers) has median 1, 99th
-percentile 6, maximum 51; 187 of 7 610 transactions have fan-out ≥ 5.
+In chunk 1718000 (7 609 transactions; the block-level reward pseudo-transaction excluded)
+the per-transaction count of distinct receivers over ALL native_transfers rows has median 1,
+99th percentile 6, maximum 9, and 186 transactions reach ≥ 5. Those rows include zero-value
+calls, reverted branches and call_code / delegate_call rows, so this is a structural count.
+The economic fan-out used for the labels (round 2, `lsne/chain/labels.py`) counts only
+value-carrying, non-reverted transfers of successful transactions; in the sampled 2016
+slice of the first end-to-end run only 106 of 225 854 transactions had an economic fan-out
+≥ 5 under the first-round definition. The fork's irregular state change does not appear in
+the trace table (chunk 1920000 contains only reward rows); fork statistics need
+balance_diffs.
 
 ## 1. `lsne/chain/xatu.py`
 
@@ -58,7 +66,9 @@ def is_block_level(tx_hash: str) -> bool                           # "0x" + zero
 @dataclass class TxRecord: tx_hash, block_number, tx_index, frm, to, value, gas_used, success, root: CallNode, native_transfers: list[dict], erc20_transfers: list[dict], n_nodes, max_depth
 def build_records(chunk_rows: dict[str, list[dict]]) -> list[TxRecord]
     # group all tables by tx hash (lower-case), build the call tree from trace_address (sorted lexicographically by the int tuple), skip block-level rows;
-    # attach logs and storage diffs/reads to the FIRST node in depth-first order whose `to` (or `created`) equals the emitting/written address, else to the root (their internal_index is not a node pointer, see §0)
+    # attach logs and storage diffs/reads to a node whose `to` (or `created`) equals the emitting/written address, else to the root
+    # (their internal_index is not a node pointer, see §0). Round 2: candidates are taken in the order of the call tree's Euler tour
+    # (a parent can emit after a child returns) and nodes that cannot have produced the event (reverted subtrees) are skipped.
 def numeric_token(x: int) -> str        # 2 significant figures as in the paper: 0 -> "N0"; else "N{m}e{k}" with m the 2-digit mantissa 10..99 and k = exponent so that x ≈ m·10^k (e.g. 1254 -> "N13e2", 5e18 -> "N50e17")
 def serialize(rec: TxRecord, vocab: "TraceVocab|None"=None, max_depth_token: int=32, max_args: int=4, include_state=True, include_logs=True) -> list[str]
     # breadth-first over the call tree (paper); per node:
