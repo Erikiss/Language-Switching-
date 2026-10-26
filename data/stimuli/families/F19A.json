@@ -25,7 +25,7 @@
      "D": {"subj": "Ingrid", "pred": "mischt ein Chaperonprotein", "adj": "in die Probe"}},
     {"id": 7,
      "E": {"subj": "The chaperone", "pred": "dissolves a small aggregate", "adj": "within an hour"},
-     "D": {"subj": "Das Chaperon", "pred": "löst ein kleines Aggregat", "adj": "innerhalb einer Stunde"}},
+     "D": {"subj": "Das Chaperon", "pred": "zersetzt ein kleines Aggregat", "adj": "innerhalb einer Stunde"}},
     {"id": 8,
      "E": {"subj": "A colleague", "pred": "disagrees with the result", "adj": "at the meeting"},
      "D": {"subj": "Ein Kollege", "pred": "widerspricht dem Ergebnis", "adj": "bei der Besprechung"}},
