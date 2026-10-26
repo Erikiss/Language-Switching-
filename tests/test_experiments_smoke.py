@@ -301,7 +301,14 @@ def test_smoke_stage_g_geometry(smoke_run):
     assert (geom[(geom["readout"] == "last") & (geom["site"] == "L0.block_input")]["r"] == 0).all()
     gate = _csv(out, "G", "g0_gate")
     assert len(gate) == 1 and gate["n_layers"].iloc[0] == 7 and gate["k"].iloc[0] == 5
-    assert bool(gate["degenerate"].iloc[0]) and gate["n_states"].iloc[0] == 2 * n_forms   # N = 8 <= r + 1: the gate is uninformative here
+    # the gate rank is capped at (N-1)//4 so the whitened metric cannot collapse onto a simplex;
+    # a gate that is still degenerate gives no verdict (pass flags empty, never True)
+    N = int(gate["n_states"].iloc[0])
+    assert N == 2 * n_forms and int(gate["r_requested"].iloc[0]) == 128 and int(gate["r"].iloc[0]) == max(1, (N - 1) // 4)
+    if bool(gate["degenerate"].iloc[0]):
+        assert gate["pass_all"].isna().all() and gate["pass_middle"].isna().all()
+    else:
+        assert gate["pass_all"].iloc[0] in (True, False) and gate["pass_middle"].iloc[0] in (True, False)
     po = _csv(out, "G", "pair_ordering")
     assert set(po["category"]) >= {"exact_translation", "same_meaning_same_lang", "other_family"} and set(po["site"]) == snaps
     depth = _csv(out, "G", "depth_trajectory")

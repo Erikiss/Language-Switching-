@@ -11,6 +11,7 @@ import socketserver
 import threading
 from types import SimpleNamespace
 
+import numpy as np
 import pyarrow.parquet as pq
 import pytest
 
@@ -121,7 +122,10 @@ def test_build_records_drain(drain):
     assert drain.block_number == 1718497 and drain.tx_index == 0
     assert drain.frm == "0x969837498944ae1dc0dcac2d0c65634c88729b2d"
     f = labels.sharing_features(drain)
-    assert f["fan_out_eth"] == 9 and f["fan_in_eth"] == 6
+    # structural counts (one native_transfers row per trace node, zero-value calls included)
+    assert f["n_call_targets"] == 9 and f["n_call_sources"] == 6
+    # economic fan-out / fan-in: only the 20 value-carrying rows
+    assert f["fan_out_eth"] == 3 and f["fan_in_eth"] == 4 and f["n_native_transfers_pos"] == 20
     assert len(drain.native_transfers) == 81
     assert abs(sum(t["value"] for t in drain.native_transfers) / WEI - 2597.76) < 0.01
     nodes = {n.internal_index: n for n in drain.nodes()}
@@ -342,9 +346,11 @@ def test_labels_drain(drain):
     assert f["era"] == "drain_crisis"
     assert f["max_depth"] == 28 and f["n_nodes"] == 81
     assert f["n_state_writes"] == 32
-    assert f["fan_out_eth_pos"] == 3 and f["fan_in_eth_pos"] == 4
+    assert f["fan_out_eth"] == 3 and f["fan_in_eth"] == 4 and f["fan_definition"] == "value_gt_0"
+    assert f["n_call_targets"] == 9 and f["n_call_sources"] == 6
     assert f["has_value_transfer"] and abs(f["total_eth"] - 2597.76) < 0.01
     assert labels.sharing_label(f) == "many_to_many"
+    assert labels.sharing_label(f, structural=True) == "many_to_many"
 
 
 def test_labels_withdraw_dao(recs_1920):
@@ -354,6 +360,14 @@ def test_labels_withdraw_dao(recs_1920):
         assert f["withdraw_dao_involved"] and f["dao_involved"]
         assert f["era"] == "post_fork"
         assert f["fan_out_erc20"] <= 1
+    # the withdrawal: 3 call targets but one economic ETH transfer (160 ETH) -> "single"
+    fw = labels.sharing_features(by[WITHDRAW_TXS[0]])
+    assert (fw["n_call_targets"], fw["fan_out_eth"], fw["fan_in_eth"]) == (3, 1, 1)
+    assert labels.sharing_label(fw) == "single" and labels.sharing_label(fw, structural=True) == "many_to_many"
+    # zero-value ERC-20 rows and zero-value calls do not count: the failed withdrawal moves nothing
+    ff = labels.sharing_features(by[WITHDRAW_TXS[1]])
+    assert ff["fan_out_eth"] == ff["fan_in_eth"] == 0 and ff["n_call_targets"] == 2
+    assert labels.sharing_label(ff) == "none"
     others = [r for r in recs_1920 if r.tx_hash not in WITHDRAW_TXS]
     assert not any(labels.sharing_features(r)["withdraw_dao_involved"] for r in others)
     plain = by["0x6f75b64d9364b71b43cde81a889f95df72e6be004b28477f9083ed0ee471a7f9"]
@@ -371,8 +385,9 @@ def test_sharing_label_rules():
     assert lab(3, 1) == "other"
     assert lab(1, 1, has_value_transfer=False) == "none"
     assert labels.sharing_label(dict(base, fan_out_eth=4, fan_in_eth=1), k=4) == "distribution"
-    f = dict(base, fan_out_eth=9, fan_in_eth=6, fan_out_eth_pos=5, fan_in_eth_pos=1)
-    assert labels.sharing_label(f, value_only=True) == "distribution"
+    f = dict(base, fan_out_eth=5, fan_in_eth=1, n_call_targets=9, n_call_sources=6)
+    assert labels.sharing_label(f) == "distribution"
+    assert labels.sharing_label(f, structural=True) == "many_to_many"
     erc = dict(has_value_transfer=True, fan_out_eth=0, fan_in_eth=0, fan_out_erc20=1, fan_in_erc20=1)
     assert labels.sharing_label(erc) == "single"
 
@@ -382,18 +397,29 @@ def test_probe_sets_matched_on_era(all_recs):
     assert set(df.columns) >= {"fan_out_eth", "fan_in_eth", "fan_out_erc20", "fan_in_erc20", "n_value_calls",
                                "n_state_writes", "n_distinct_slots_written", "dao_involved",
                                "withdraw_dao_involved", "max_depth", "n_nodes", "era", "label"}
-    # gas deciles: in this 14-transaction pool high fan-out and fan-out 1 share no decile
-    pos, neg, mt = labels.probe_sets(all_recs, df, "fanout", n=10)
-    assert len(pos) == len(neg) == len(mt)
+    # economic fan-out in the fixture is at most 3 (the drain), so the probe uses k=2:
+    # positives drain, 0x124532… (drain_crisis), 0x29c093… (post_fork)
+    # gas deciles: in this small pool high fan-out and fan-out 1 share (almost) no decile, so
+    # the default (min_pairs = min(n, 20)) falls back to era-only matching
+    pos, neg, mt = labels.probe_sets(all_recs, df, "fanout", n=10, k=2)
+    assert len(pos) == len(neg) == len(mt) == 3
     assert all(mt["era"].notna()) and list(mt.columns)[:3] == ["pair", "era", "gas_decile"]
-    pos, neg, mt = labels.probe_sets(all_recs, df, "fanout", n=10, gas_bins=1)
-    assert len(pos) == len(neg) == len(mt) >= 2
+    assert set(mt["matching"]) == {"era_only"} and mt.attrs["matching"] == "era_only"
+    assert np.isfinite(mt["gas_smd"]).all() and mt["gas_smd"].nunique() == 1
+    assert mt.attrs["log_gas_smd"] == pytest.approx(float(mt["log_gas_smd"].iloc[0]))
+    assert mt["gas_smd"].iloc[0] == pytest.approx(labels.standardized_mean_difference(mt["pos_gas"], mt["neg_gas"]))
+    # without the fallback the gas-decile matching is kept (fewer pairs)
+    strict = labels.probe_sets(all_recs, df, "fanout", n=10, k=2, min_pairs=0)[2]
+    assert set(strict["matching"]) <= {"era+gas_decile"} and len(strict) < 3
+    pos, neg, mt = labels.probe_sets(all_recs, df, "fanout", n=10, k=2, gas_bins=1)
+    assert len(pos) == len(neg) == len(mt) >= 2 and set(mt["matching"]) == {"era_only"}
     for p, q, (_, row) in zip(pos, neg, mt.iterrows()):
         assert labels.era_of(p.block_number) == labels.era_of(q.block_number) == row["era"]
-        assert labels.sharing_features(p)["fan_out_eth"] >= 5
+        assert labels.sharing_features(p)["fan_out_eth"] >= 2
         assert labels.sharing_features(q)["fan_out_eth"] == 1
         assert row["pos_tx"] == p.tx_hash and row["neg_tx"] == q.tx_hash
     assert len({r.tx_hash for r in pos + neg}) == 2 * len(pos)
+    assert len(labels.probe_sets(all_recs, df, "fanout", n=10)[0]) == 0          # no economic fan-out >= 5 here
     pos, neg, mt = labels.probe_sets(all_recs, None, "dao", n=10, seed=1, gas_bins=2)
     assert len(pos) >= 2
     assert set(mt["era"]) <= {"drain_crisis", "post_fork"}
@@ -402,9 +428,38 @@ def test_probe_sets_matched_on_era(all_recs):
         assert labels.sharing_features(p)["dao_involved"] and not labels.sharing_features(q)["dao_involved"]
     again = labels.probe_sets(all_recs, None, "dao", n=10, seed=1, gas_bins=2)[2]
     assert again.equals(mt)
-    assert len(labels.probe_sets(all_recs, df, "fanout", n=1, gas_bins=1)[0]) == 1
+    assert len(labels.probe_sets(all_recs, df, "fanout", n=1, k=2, gas_bins=1)[0]) == 1
     with pytest.raises(ValueError):
         labels.probe_sets(all_recs, df, "nope", n=1)
+    # features of an older serialisation (fan_out_eth counted zero-value call rows) are refused
+    stale = df.drop(columns=["n_call_targets", "n_call_sources"]).assign(fan_out_eth_pos=0)
+    with pytest.raises(ValueError, match="older serialisation"):
+        labels.probe_sets(all_recs, stale, "fanout", n=10)
+
+
+def test_standardized_mean_difference():
+    assert labels.standardized_mean_difference([1, 2, 3], [1, 2, 3]) == 0.0
+    assert labels.standardized_mean_difference([2, 3, 4], [1, 2, 3]) == pytest.approx(1.0)
+    assert np.isnan(labels.standardized_mean_difference([1], [1, 2]))
+
+
+def test_surface_features_and_baseline(drain, all_recs):
+    toks = itr.serialize(drain)
+    sf = labels.surface_features(toks)
+    assert sf["n_tokens"] == len(toks) and sf["n_call"] == drain.n_nodes == 81
+    assert sf["n_value_tokens"] == sum(t.startswith("V:") for t in toks)
+    assert sf["n_value_calls_nonzero"] == labels.sharing_features(drain)["n_value_calls"] == 20
+    assert labels.surface_features(toks, max_len=10)["n_tokens"] == 10
+    # perfectly separable by length -> AUC 1 for n_tokens and the combination
+    short = [["[TX]", "[START]", "[CALL]", "V:N0", "[END]", "[/TX]"]] * 6
+    long_ = [itr.serialize(r) for r in all_recs[:6]]
+    long_ = [t + ["[START]", "[CALL]", "V:N10e17", "[END]"] * 3 for t in long_]
+    res = labels.surface_baseline_auc(long_, short, seed=0)
+    assert res["n_tokens"] == 1.0 and res["combined"] == 1.0 and res["n_pairs"] == 6
+    assert res["best_single"] in labels.SURFACE_FEATURES
+    flipped = labels.surface_baseline_auc(short, long_, seed=0)
+    assert flipped["n_tokens"] == 1.0                                   # orientation fitted on the training half
+    assert np.isnan(labels.surface_baseline_auc(short[:3], long_[:3])["combined"])
 
 
 # ======================================================================================
