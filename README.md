@@ -37,6 +37,18 @@ Störungsausbreitung entlang der Tiefe als Funktion von (K, ε, Richtung) auf de
 gemeinsamen englischen Schlussabschnitt, mit isotropen Zufallsrichtungen gleicher
 RMS-Dosis als Nullmodell (`docs/PREREGISTRATION.md` §2).
 
+**Erweiterungsstufen G–L** (`docs/DESIGN.md` §4.4–4.9, Tabellen und Endpunkt-Karte in
+`docs/STAGES.md`): Sprachwechsel bleibt das Mittel, mit dem lokale Verdichtung der
+semantischen Geometrie kontrolliert gestellt wird (G, *Meaning Contracts*), die
+Eingriffe werden zu λ-Pfaden zwischen Trennschärfe und Mimikry verallgemeinert (H,
+Biggio et al.), die Steuerrichtung wird am Domänen-Kompass und am schlechtesten Head
+gewählt (I), Differenzen statt Einzeldomänen werden erklärt und der Gegenpol
+(Proteinfehlfaltung) empirisch per Pile-Schwierigkeitsrangfolge geprüft (J), ein
+DAO-Fork-Korpus wird per Test-Time-Training gegen drei Kontrollarme injiziert (K) und
+die Transplantation eines Quellmodell-Merkmals in den Residualstrom bzw. KV-Cache wird
+mit einem Stand-in validiert (L). Die Stufen laufen mit derselben Stufenschnittstelle
+(`run()`), schreiben ihre Tabellen in dasselbe Layout und fangen Fehler pro Substufe ab.
+
 ## Der Anker: State 2143
 
 | Merkmal | Wert |
@@ -169,25 +181,42 @@ Details, Herleitung und Grenzen: `docs/TNCO_INTEGRATION.md`.
 | `notebooks/03_nonequilibrium.ipynb` | D | Damage-Maps, λ(ε,K)-Phasendiagramm, Lens, Hysterese, Relaxation, CA |
 | `notebooks/04_tn_linear_response.ipynb` | E | gemessen vs. linear vs. faktorisiert, TNCO vs. opt_einsum |
 | `notebooks/05_scale_and_checkpoints.ipynb` | F | Shard-Auswahl, Checkpoint-Trace / Skalierungsarm, Resume, Merge |
+| `notebooks/06_geometry_trajectory.ipynb` | G | Realisierungswolken, G0-Gate, T1 Tiefen-Trajektorie, G1 Kontraktion (n-angepasst), T2 Position, T3 Steering-Validität, T5 Kopplung mit Stufe D |
+| `notebooks/07_lambda_dynamics.ipynb` | H | λ-Pfade (g, Dichte, F), Endpunkt-Größen vs. λ, Spearman mit Bootstrap, SAE-Feature-Kandidaten, B(x)(λ) für State 2143 |
+| `notebooks/08_compass_heads.ipynb` | I | Domänenprofile (Atlas-Proxy/-Import), Domänenachsen, Gegensteuern × Familiendomäne, Head-Attribution, schlechtester Head, Head-Arm |
+| `notebooks/09_rdx_sharing.ipynb` | J | Pile-Schwierigkeitsrangfolge (Gegenpol), RDX-z-Karten pro Kontrast × Basis × Layer, Stabilität, Sharing-Index und Netzwerkaktivität |
+| `notebooks/10_ttt_injection.ipynb` | K | Korpora (Platzhalter markiert), Memorisationsgeschwindigkeit, Trainingsverlauf, Vorher/Nachher-Effekte gegen drei Kontrollarme |
+| `notebooks/11_transplant.ipynb` | L | Funktionaler Transfertest pro Layer, Layer-Matching, Residual-Substitution / KV-Pflanzung / beides gegen Kontrollen |
 
 Jedes Notebook klont den Branch `claude/language-switching-non-equilibrium-ejpz0q` dieses
 Repositories nach `/content/lsne-repo`, installiert `requirements.txt` + `pip install -e .`,
 bindet Google Drive ein (`OUT_ROOT = /content/drive/MyDrive/LSNE`), ruft die Stufenfunktion
 `lsne.experiments.<stage>.run()` direkt auf und zeichnet die Kerntabellen. Mit `SMOKE = True`
-läuft jedes Notebook in < 3 min auf CPU (pythia-14m). Die Notebooks werden von
-`scripts/build_notebooks.py` erzeugt (`tests/test_notebooks.py` prüft, dass sie nicht
-abdriften). Schritt-für-Schritt-Anleitung für zwei Colab-Konten: `docs/RUNBOOK_COLAB.md`.
+läuft jedes Notebook in wenigen Minuten auf CPU (pythia-14m). Die Notebooks 06–11 haben
+zusätzlich eine Parameterzelle für die vom Auftraggeber gelieferten Eingaben
+(`ATLAS_DIR`, `TTT_INPUTS`/`TTT_CORPUS`/`TTT_CHECKPOINTS`, `TRANSPLANT_SOURCE`), einen
+Substufen-Bericht aus dem Manifest und im Kopf die präregistrierten Kontraste mit den
+Tabellen, die sie tragen. Die Notebooks werden von `scripts/build_notebooks.py` erzeugt
+(`tests/test_notebooks.py` prüft, dass sie nicht abdriften, und führt 00 und 06 im
+Rauchtest kopflos aus). Schritt-für-Schritt-Anleitung für zwei Colab-Konten:
+`docs/RUNBOOK_COLAB.md`.
 
 ### Kommandozeile
 
 ```bash
 pip install -r requirements.txt && pip install -e .
-# eine Stufe (A|B|C|D|E|F) oder mehrere; Ausgabe unter --out/<stage>/<modell>@<revision>/
+# eine Stufe (A|B|…|L) oder mehrere; Ausgabe unter --out/<stage>/<modell>@<revision>/
 python -m lsne.cli run --stage A,B,C,D,E --model EleutherAI/pythia-160m --revision step98000 \
     --dtype float32 --device auto --out runs --families F01,F02
+# Erweiterungsstufen G-L auf demselben Lauf (Stufe K mit dem DAO-Korpus, Stufe L mit einem HF-Quellmodell)
+python -m lsne.cli run --stage G,H,I,J,K,L --model EleutherAI/pythia-160m --revision step98000 --out runs \
+    --ttt-corpus data/ttt/dao_fork --transplant-source EleutherAI/pythia-70m@step143000 [--atlas-dir data/atlas]
 # Checkpoint-Trace (27 Dossier-Checkpoints) mit Stufen B und D, auf 2 GPUs aufgeteilt
 python -m lsne.cli run --stage F --pairs trace --f-stages B,D --shard-index 0 --shard-count 2 --out runs
-# Rauchtest auf CPU (< 3 min)
+# Memorisationsgeschwindigkeit über drei Checkpoints (Shard 7)
+python -m lsne.cli run --stage K --model EleutherAI/pythia-160m --revision step98000 --out runs_ttt \
+    --ttt-corpus data/ttt/dao_fork --ttt-checkpoints step4000,step98000,step143000
+# Rauchtest auf CPU, alle Stufen A-L (~1-2 min unbelastet)
 python -m lsne.cli run --stage all --model EleutherAI/pythia-14m --revision step98000 \
     --device cpu --families DEV01 --out runs/smoke --smoke
 # Tabellen aller Läufe zusammenführen
@@ -196,34 +225,57 @@ python -m lsne.cli merge --root runs --out runs/merged
 
 Weitere Optionen: `--use-sae`, `--axis-npz`, `--k-levels`, `--c-levels`, `--k-extreme`,
 `--n-random-dirs`, `--gen-n-new`, `--gen-n-samples`, `--tn-rank`, `--tn-window`,
-`--limit-variants`, `--limit-families`, `--seed` (`python -m lsne.cli run --help`).
-Umgebungsvariablen: `LSNE_CACHE` (Anker-/Unigramm-Cache), `LSNE_RUNS` (Standard-`--out`
-außerhalb von Colab), `LSNE_OFFLINE=1` (keine Netzzugriffe; `freq` aus der Stimulusbank),
-`HF_TOKEN` (nur bei Rate-Limits).
+`--limit-variants`, `--limit-families`, `--seed`; für G–L `--ttt-corpus`,
+`--ttt-checkpoints`, `--transplant-source`, `--atlas-dir` (`python -m lsne.cli run --help`).
+Umgebungsvariablen: `LSNE_CACHE` (Anker-/Unigramm-/Pile-NLL-Cache), `LSNE_RUNS`
+(Standard-`--out` außerhalb von Colab), `LSNE_OFFLINE=1` (keine Netzzugriffe; `freq` aus
+der Stimulusbank, Stufe J ohne Schwierigkeitsrangfolge), `HF_TOKEN` (nur bei Rate-Limits).
+`--stage all` läuft A B C D E F G H I J K L in dieser Reihenfolge auf einem geladenen
+Modell; die Stufen G–L fangen Fehler pro Substufe ab (`manifest.json → substages`,
+`substage_errors.txt`), eine fehlgeschlagene Substufe lässt ihre Tabelle leer und die
+Stufe läuft weiter (`docs/STAGES.md`).
+
+### Eingaben, die der Auftraggeber liefert
+
+Alle optional; ohne sie laufen die Stufen mit Platzhaltern bzw. Proxys und vermerken das
+im Manifest. Nichts davon wird eingecheckt (`.gitignore`), nur die Ablagenotizen.
+
+| Ablage | Stufe | Inhalt | Ohne die Datei |
+|---|---|---|---|
+| `data/ttt/dao_fork/` (+ `neutral/`, `nofork/`) | K | DAO-Fork-Korpus 2016 und zwei Kontrollkorpora (`*.txt` / `*.jsonl`, `data/ttt/README.md`); `--ttt-corpus`, im Notebook `TTT_INPUTS` (Drive-Ordner wird in den Checkout kopiert) | gemeinfreier Platzhalter, jede Zeile `is_placeholder = True` (Funktionstest, kein Befund) |
+| `data/atlas/*.txt` | I | gespeicherte Extraktion des Pythia-Suszeptibilitätsatlas (Cluster-Schlüsselwörter); `--atlas-dir` / `ATLAS_DIR` | nur der lokale Logit-Lens-Proxy, `atlas_overlap` leer |
+| `data/s4/axes.npz` | B | ARI-Achsen aus S4, gegen die `ent` orthogonalisiert wird; `--axis-npz` / `AXIS_NPZ` | `ent` ohne Orthogonalisierung |
+| Quellmodell | L | BlockGPT-artiges Spurenmodell über die `SourceModel`-Schnittstelle (`docs/BLOCKGPT_FEASIBILITY.md`, `docs/TRACE_SOURCE_SPEC.md`, Paket `lsne.chain`); bis dahin `--transplant-source EleutherAI/pythia-70m@step143000` | Stand-in `rotated_self` (Validierung der Maschinerie, kein Transferbefund) |
 
 ### Tests
 
 ```bash
 python -m pytest tests -q -p no:warnings              # CPU, pythia-14m step98000 (gecacht)
 python -m pytest tests -q -m "not slow and not network"
-python -m pytest tests/test_notebooks.py -q           # Notebooks regenerieren + Drift-Check
+python -m pytest tests/test_notebooks.py -q -m "not slow"   # Notebooks regenerieren + Drift-Check
+python -m pytest tests/test_notebooks.py -q -m slow         # Notebooks 00 und 06 kopflos im Rauchtest ausführen (nbclient, ipykernel)
 ```
 
-## Rechenplan: 6 A100-Shards (`jobs/shards.yaml`)
+## Rechenplan: 7 A100-Shards (`jobs/shards.yaml`)
 
 | Shard | Konto | Modell @ Revision | Stufen | Zweck |
 |---|---|---|---|---|
-| 1 | A | pythia-160m @ step98000 | A–E | Kernarm, Eingriffs-Checkpoint |
-| 2 | A | pythia-160m @ step99000 | A–E | Kernarm, zweiter Eingriffs-Checkpoint |
-| 3 | A | pythia-160m @ step143000 | A–E, `--use-sae` | SAE-Arm (Feature-Richtungen) |
+| 1 | A | pythia-160m @ step98000 | A–E, G–L | Kernarm, Eingriffs-Checkpoint |
+| 2 | A | pythia-160m @ step99000 | A–E, G–L | Kernarm, zweiter Eingriffs-Checkpoint |
+| 3 | A | pythia-160m @ step143000 | A–E, G–L, `--use-sae` | SAE-Arm (Feature-Richtungen; H/J/K mit publiziertem SAE) |
 | 4 | B | pythia-160m, 27 Checkpoints | F (B, D limitiert) | Verlauf über das Training |
 | 5 | B | pythia-410m @ step143000 | A–E | Skalierungsarm (SAE nur MLP-Hookpoints) |
 | 6 | B | pythia-1b, pythia-1.4b @ step143000 | F (B, C, D limitiert; nur C1) | Skalierungsarm |
+| 7 | B | pythia-160m @ step98000 (+ step4000, step143000) | K, `--ttt-checkpoints` | Memorisationsgeschwindigkeit über die Dossier-Checkpoints (`runs_ttt`) |
 
 Schätzung (A100): ein Forward von 160M auf ≤ 320 Tokens ≈ 3 ms; Stage C ≈ 3 000 Forwards,
 Stage D1/D2 ≈ 50 000 Forwards (≈ 5 min), Generierungsstufen D3–D7 ≈ 300 000 Token-Schritte
-gebatcht (≈ 30–60 min); Shards 1–3 und 5 je 1–3 h, Shard 4 2–4 h, Shard 6 3–6 h. Jede Shard
-schreibt eigene Laufverzeichnisse; `python -m lsne.cli merge` fügt sie zusammen.
+gebatcht (≈ 30–60 min); Stufen G–L zusammen 1–2 h (Stufe H dominiert: ≈ 110 000
+Forward+Backward-Pässe der λ-Pfade im vollen Budget; Stufe J zieht 2 000 Pile-Sequenzen
+per Range-Request, gecacht). Shards 1–3 je 2–5 h, Shard 5 1–3 h, Shard 4 2–4 h, Shard 6
+3–6 h, Shard 7 1–2 h. Jede Shard schreibt eigene Laufverzeichnisse; `python -m lsne.cli
+merge` fügt sie zusammen. Shards 1–3 nennen `--stage A,B,C,D,E,G,H,I,J,K,L` statt `all`,
+weil `all` auch Stufe F (den Checkpoint-Sweep) anstoßen würde.
 
 ## Ausgabe-Layout
 
@@ -237,16 +289,28 @@ schreibt eigene Laufverzeichnisse; `python -m lsne.cli merge` fügt sie zusammen
 │   ├── E/pythia-160m@step98000/    tn_compare.csv, tn_summary.csv, tn_paths.csv, tn_basis.csv
 │   ├── F/pythia-160m@step143000/   plan.csv, runs.csv
 │   │   └── shard0of1/<stage>/<modell>@<revision>/   Teilläufe des Sweeps (gleiches Schema)
+│   ├── G/pythia-160m@step98000/    clouds, geometry, pair_ordering, g0_gate, depth_trajectory, contraction(_boot), position_traj, steering(_boot), coupling
+│   ├── H/pythia-160m@step98000/    lambda_paths, lambda_steps, lambda_corr, lambda_boot, lambda_features(_summary), lambda_original
+│   ├── I/pythia-160m@step98000/    compass(_summary), atlas_overlap, domain_axes, direction_domain(_T/_boot), head_effects, head_direct, worst_head, head_steering(_boot), directions_domain.npz
+│   ├── J/pythia-160m@step98000/    pile_difficulty, pile_ranking, pile_rank_check, rdx, rdx_summary, rdx_stability, sharing
+│   ├── K/pythia-160m@step98000/    ttt_corpora, ttt_memorisation(_boot), ttt_training, ttt_before_after, ttt_effects
+│   ├── L/pythia-160m@step98000/    transfer_test, transfer_summary, layer_matching, alignments, transplant, transplant_summary
 │   ├── merged/                     Ausgabe von `lsne.cli merge` (Spalten run_id, run_stage, run_model, run_revision)
 │   └── run_report_<modell>_<rev>_<dtype>.json
-├── cache/                          state2143/ (Anker), unigram/ (Zählungen) — LSNE_CACHE
+├── runs_ttt/K/…                    Shard 7 (Stufe K über drei Checkpoints), getrennt vom Kernlauf
+├── cache/                          state2143/ (Anker), unigram/ (Zählungen), pile_nll/ (Stufe J) — LSNE_CACHE
 ├── figures/<notebook>/             PNG-Abbildungen der Notebooks
 └── summary_<notebook>_*.json       kurze Laufzusammenfassung je Notebook
 ```
 
 Jede `manifest.json` enthält Git-SHA, Paketversion, Modellspezifikation, dtype, Hook-Site,
 Anker-Hashes, Zeitstempel, Tabellengrößen und Laufzeit; ein Stufenfehler hinterlässt
-`error.txt` und `status: "error"`, die übrigen Stufen laufen weiter.
+`error.txt` und `status: "error"`, die übrigen Stufen laufen weiter. Die Manifeste der
+Stufen G–L enthalten zusätzlich `substages` (Laufzeiten und Fehler pro Substufe) und
+`prereg` (welche Tabelle und welche Zeilen jeden präregistrierten Kontrast tragen;
+vollständige Karte Endpunkt → CSV → Spalten in `docs/STAGES.md`). Platzhalter sind nie
+stumm: Zeilen aus einem synthetischen SAE tragen `sae_source = "synthetic_random"`,
+TTT-Zeilen auf dem Platzhaltertext `is_placeholder = True`.
 
 ## Präregistrierung
 
@@ -255,9 +319,13 @@ Anker-Hashes, Zeitstempel, Tabellengrößen und Laufzeit; ein Stufenfehler hinte
 monoton in K und größer als derselbe Kontrast mit `rand`“, Familien-Cluster-Bootstrap
 (10 000 Ziehungen), Mindesteffekt Δλ ≥ 0,05 pro Layer; sekundäre Endpunkte (T(K),
 K × C, Delimiter-Recovery, Hysteresefläche, Nichtmonotonie, Transfer von `ent`,
-Geometrie-Gate G0, Kontraktion G1, Steering-Validität T3, λ-Dynamik) BH-korrigiert;
-Ausschlussregeln vor Sichtung der Modellwerte. Alles darüber hinaus (Phasendiagramme,
-Checkpoint-Sweeps, Skalierungsarme, SAE-Feature-Auswahl, FDT) ist explorativ.
+Geometrie-Gate G0, Kontraktion G1, Steering-Validität T3, λ-Dynamik und B(x)(λ) für
+State 2143, Domänen-Kompass, Richtung × Domäne, Head-Arm, RDX-Anteil,
+Schwierigkeitsrangfolge, Test-Time-Training, Transplantations-Validierung — Kontraste
+1–18) BH-korrigiert; Ausschlussregeln vor Sichtung der Modellwerte. Alles darüber hinaus
+(Phasendiagramme, Checkpoint-Sweeps, Skalierungsarme, SAE-Feature-Auswahl, FDT) ist
+explorativ. `docs/STAGES.md` ordnet jedem Kontrast die Stufe, die Tabelle und die Spalten
+zu, die ihn tragen.
 
 ## Grenzen
 
@@ -291,6 +359,9 @@ Checkpoint-Sweeps, Skalierungsarme, SAE-Feature-Auswahl, FDT) ist explorativ.
   Distanz, Log-Volumen; Stufe G/`lsne.geometry`). arXiv:2610.30715.
 - Biggio, B. et al. (2013/2017). *Evasion attacks against machine learning at test time*
   (λ-Mimikry-Dynamik, `lsne.lambda_dynamics`). arXiv:1708.06131.
+- Gai, Y., Zhou, L., Qin, K., Song, D. & Gervais, A. (2023). *BlockGPT* (Causal-LM auf
+  EVM-Ausführungsspuren; Quellmodell-Vorbild für Stufe L, keine Gewichte verfügbar:
+  `docs/BLOCKGPT_FEASIBILITY.md`). arXiv:2304.12749.
 - EleutherAI (2024). *sparsify* — TopK-SAEs für Pythia (`EleutherAI/sae-pythia-160m-32k`,
   `EleutherAI/sae-pythia-410m-65k`). https://github.com/EleutherAI/sparsify
 - Google Research (2025). *TNCO — Tensor Network Contraction Optimizer.*
@@ -306,15 +377,19 @@ Checkpoint-Sweeps, Skalierungsarme, SAE-Feature-Auswahl, FDT) ist explorativ.
 
 ```
 lsne/            Paket: config, anchor, pile_fetch, model, stimuli, lang_id, directions, sae, patching,
-                 dynamics, generation, tn_lattice, geometry, trajectory, lambda_dynamics, stats, io, cli
-lsne/experiments Stufen A-F (run() je Stufe) + common (Limits, Stimulusbank, Richtungsbank)
-data/stimuli     Familien F01-F12, DEV01-DEV04 (A/B), original_2143.json, SCHEMA.md
-data/lexicon     Funktionswort-Lexikon für die Sprachklassifikation
-docs/            DESIGN.md, PREREGISTRATION.md, SPEC.md, RUNBOOK_COLAB.md, TNCO_INTEGRATION.md
-jobs/shards.yaml Rechenplan (6 Shards)
-notebooks/       generierte Colab-Notebooks 00-05
+                 dynamics, generation, tn_lattice, geometry, trajectory, lambda_dynamics, atlas, heads,
+                 rdx, pile_domains, sharing, ttt, transplant, stats, io, cli
+lsne/chain       Quelladapter für ein BlockGPT-artiges Spurenmodell (Xatu-Traces 2016, docs/TRACE_SOURCE_SPEC.md)
+lsne/experiments Stufen A-L (run() je Stufe) + common (Limits, Stimulusbank, Richtungsbank, Substufen, Familiengruppen)
+data/stimuli     Familien F01-F20, DEV01-DEV04 (Formulierungen A-D), original_2143.json, SCHEMA.md, review.csv
+data/lexicon     Funktionswort-Lexikon (Sprachklassifikation), domains.json (Domänenlexika E/D)
+data/ttt, data/atlas, data/s4   Ablagen für die Eingaben des Auftraggebers (nur die Notizen sind eingecheckt)
+docs/            DESIGN.md, PREREGISTRATION.md, SPEC.md, STAGES.md, RUNBOOK_COLAB.md, TNCO_INTEGRATION.md,
+                 BLOCKGPT_FEASIBILITY.md, TRACE_SOURCE_SPEC.md, ROUND2_ITEMS.md
+jobs/shards.yaml Rechenplan (7 Shards)
+notebooks/       generierte Colab-Notebooks 00-11
 scripts/         build_notebooks.py
-tests/           pytest (CPU, pythia-14m)
+tests/           pytest (CPU, pythia-14m); test_experiments_smoke.py = Rauchtest A-L über die CLI
 ```
 
 Lizenz: Apache-2.0.

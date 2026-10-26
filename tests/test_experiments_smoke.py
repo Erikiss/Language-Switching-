@@ -1,11 +1,12 @@
-"""End-to-end CPU smoke test of the experiment stages and the CLI (pythia-14m, DEV01).
+"""End-to-end CPU smoke test of the experiment stages A-L and the CLI (pythia-14m, DEV01).
 
 ``python -m lsne.cli run --smoke --stage all`` on the DEV01 family must finish in well under
-four minutes and leave at least one csv table plus a manifest.json in every stage directory
-(stage F re-runs B/C/D for the same model/revision in its own sub-run directories).  The
-``merge`` command is exercised on the result.  A few fast unit tests cover the helpers of
-``lsne.experiments.common`` and ``stage_f_scale`` (variant limiting, shard partition, pair
-parsing, direction bank with a synthetic SAE, bank persistence).
+ten minutes and leave at least one csv table plus a manifest.json in every stage directory
+(stage F re-runs B/C/D for the same model/revision in its own sub-run directories; stages
+G-L must report no failed substage).  The ``merge`` command is exercised on the result.  A
+few fast unit tests cover the helpers of ``lsne.experiments.common`` and the stage modules
+(variant limiting, shard partition, pair parsing, direction bank with a synthetic SAE, bank
+persistence, realization clouds, substage error capture, domain groups, text pairs).
 """
 import json
 import time
@@ -17,17 +18,18 @@ import pytest
 import torch
 
 from lsne import stimuli
-from lsne.cli import main, merge_runs, parse_stages
+from lsne.cli import duration_summary, main, merge_runs, parse_stages
 from lsne.config import HookSite, RunConfig
-from lsne.experiments import STAGE_ORDER, STAGES
+from lsne.experiments import STAGE_ORDER, STAGE_TITLES, STAGES
 from lsne.experiments import common as C
 from lsne.experiments.stage_f_scale import parse_pairs, plan_triples
 from lsne.sae import TopKSAE
 
 REPO = Path(__file__).resolve().parent.parent
-# Wall-clock budget for the whole --smoke run on a shared 4-core CPU box. The run takes
-# ~4 min unloaded but up to ~12 min when other processes compete for the cores (observed
-# 730 s at load average 7), so the budget guards against runaway runs, not against load.
+# Wall-clock budget for the whole --smoke run (A-L) on a shared 4-core CPU box. The run
+# takes ~2 min unloaded but several times longer when other processes compete for the
+# cores (observed 730 s for A-F alone at load average 7), so the budget guards against
+# runaway runs, not against load.
 SMOKE_BUDGET_S = 1200.0
 
 
@@ -67,8 +69,13 @@ def test_smoke_all_stages_produce_tables(smoke_run):
     out, rc = smoke_run["out"], smoke_run["rc"]
     assert rc == 0
     assert smoke_run["seconds"] < SMOKE_BUDGET_S, f"smoke run took {smoke_run['seconds']:.0f} s"
+    assert tuple(STAGE_ORDER) == tuple("ABCDEFGHIJKL") and set(STAGE_TITLES) == set(STAGE_ORDER)
     for stage in STAGE_ORDER:
-        _assert_run_dir(_stage_dir(out, stage))
+        _csvs, m = _assert_run_dir(_stage_dir(out, stage))
+        if stage in "GHIJKL":   # per-substage error capture: nothing may have failed in the smoke run
+            assert m["substages"]["n_failed"] == 0, (stage, m["substages"]["errors"])
+            assert not (_stage_dir(out, stage) / "substage_errors.txt").exists()
+            assert m["prereg"]   # the pre-registration map of the stage (docs/STAGES.md)
     # stage F: one sub-run per (pair, stage) with its own tables and manifest
     f_dir = _stage_dir(out, "F")
     runs = pd.read_csv(f_dir / "runs.csv")
@@ -193,12 +200,23 @@ def test_smoke_stage_contents(smoke_run):
     cal = pd.read_csv(_stage_dir(out, "D") / "ca_layers.csv")
     assert (cal[cal["layer"] == 0]["frac_N"].mean() > cal[cal["layer"] == 6]["frac_N"].mean())
     hy = pd.read_csv(_stage_dir(out, "D") / "hysteresis.csv")
-    assert set(hy["direction"]) == {"ent", "lang_dom"} and np.isfinite(hy[["area", "null_area", "null_area_sd"]].to_numpy()).all()
+    assert set(hy["direction"]) == {"ent", "lang_dom"}
+    # NaN-aware areas (ROUND2 G3.2): a plateau without E/D-labelled tokens is missing data, so with
+    # the 2-token smoke plateaus an area may be NaN; the standard variants must still be finite
+    hy_std = hy[hy["kind"] == "standard"]
+    assert len(hy_std) and np.isfinite(hy_std[["area", "null_area", "null_area_sd"]].to_numpy()).all()
+    assert (hy["kind"][hy[["area", "null_area"]].isna().any(axis=1)] == "original").all()
     assert set(hy["K"]) >= {0, 8, 28} and (hy["n_null"] == 4).all() and (hy["n_null_pairs"] == 6).all()
     curves = pd.read_csv(_stage_dir(out, "D") / "hysteresis_curves.csv")
     assert set(curves["branch"]) == {"up", "down", "restart_a", "restart_b", "restart_c", "restart_d"}
     rs = curves[curves["replicate"] >= 0]
-    assert rs["seed"].min() >= 10_000 and rs.groupby(["tag", "direction"])["seed"].nunique().eq(8).all()
+    # ramp levels 0, eps/2, eps (zero-dose plateaus at both ends, ROUND2 G3.1); one restart seed per
+    # (replicate, level): 4 replicates x 3 levels
+    n_levels = int(rs["level"].nunique())
+    assert n_levels == 3 and rs["seed"].min() >= 10_000
+    assert rs.groupby(["tag", "direction"])["seed"].nunique().eq(4 * n_levels).all()
+    up = curves[curves["branch"] == "up"].sort_values(["tag", "direction", "step"])
+    assert (up.groupby(["tag", "direction"])["eps"].first() == 0).all() and (up.groupby(["tag", "direction"])["eps"].last() == 0.5).all()
     rx = pd.read_csv(_stage_dir(out, "D") / "relaxation.csv")
     assert (rx["eps"] == 0.5).all() and (rx["n_new"] == 8).all()
     assert {"tau_raw", "tau_censored", "identifiable", "reason", "b_se", "r2", "f_pvalue", "b_lo", "b_hi"} <= set(rx.columns)
@@ -256,6 +274,235 @@ def test_smoke_stage_contents(smoke_run):
     assert eman["measured_dtype"] == "float64" and eman["softmax_float64"] and eman["full_rank_reference"] == "computed"
 
 
+def _csv(out, stage, name):
+    return pd.read_csv(_stage_dir(out, stage) / f"{name}.csv")
+
+
+def _manifest(out, stage):
+    return json.loads((_stage_dir(out, stage) / "manifest.json").read_text(encoding="utf-8"))
+
+
+def test_smoke_stage_g_geometry(smoke_run):
+    out = smoke_run["out"]
+    snaps = {f"L{l}.block_input" for l in range(6)} | {"L5.block_output"}
+    clouds = _csv(out, "G", "clouds")
+    n_forms = clouds[clouds["K"] == 0]["formulation"].nunique()
+    assert n_forms >= 1 and set(clouds["K"]) == {0, 8} and set(clouds["C"]) == {"C1"} and not clouds["excluded"].any()
+    assert len(clouds[clouds["K"] == 8]) == 3 * n_forms and clouds[clouds["K"] == 8]["unit_mask"].nunique() == 3
+    for m in clouds[clouds["K"] == 8]["unit_mask"]:      # unit 1 / 10 English, unit 9 German, exactly 8 switches
+        assert m[0] == "E" and m[-1] == "E" and m[-2] == "D" and sum(a != b for a, b in zip(m, m[1:])) == 8
+    geom = _csv(out, "G", "geometry")
+    assert set(geom["site"]) == snaps and set(geom["readout"]) == {"mean", "last"} and set(geom["k"]) == {0, 5}
+    assert set(geom["group"]) == {"DEV01|K0|C1", "DEV01|K8|C1"} and np.isfinite(geom["log_volume"]).all()
+    k0 = geom[geom["K"] == 0]
+    # the K=0 cloud is its own reference; the Mahalanobis displacement is undefined only where the pooled
+    # states have no variance at all (block-0 last token: the identical tail token embedding, r = 0)
+    assert (k0["disp_euclid"] == 0).all() and ((k0["disp_mahal"] == 0) | (k0["disp_mahal"].isna() & (k0["r"] == 0))).all()
+    assert (geom[(geom["readout"] == "last") & (geom["site"] == "L0.block_input")]["r"] == 0).all()
+    gate = _csv(out, "G", "g0_gate")
+    assert len(gate) == 1 and gate["n_layers"].iloc[0] == 7 and gate["k"].iloc[0] == 5
+    assert bool(gate["degenerate"].iloc[0]) and gate["n_states"].iloc[0] == 2 * n_forms   # N = 8 <= r + 1: the gate is uninformative here
+    po = _csv(out, "G", "pair_ordering")
+    assert set(po["category"]) >= {"exact_translation", "same_meaning_same_lang", "other_family"} and set(po["site"]) == snaps
+    depth = _csv(out, "G", "depth_trajectory")
+    assert (depth["n_layers"] == 7).all() and set(depth["layer"]) == set(range(7)) and depth["breathing_index"].between(0, 5).all()
+    con = _csv(out, "G", "contraction")
+    pre = con[con["preregistered"]]
+    assert len(pre) == 7 * 2 * 1 and (pre["k"] == 5).all() and (pre["n_ref"] == n_forms).all() and (pre["n_mixed"] == 3 * n_forms).all()
+    assert (con["n_subsample"] >= 1).all() and np.isfinite(con.loc[con["readout"] == "mean", "d_log_volume"]).all()
+    # the raw contrast carries the n-dependence of the log-volume (12 vs 4 eigenvalues); the matched one does not
+    assert (con.loc[con["readout"] == "mean", "d_log_volume_raw"].abs() > con.loc[con["readout"] == "mean", "d_log_volume"].abs()).all()
+    boot = _csv(out, "G", "contraction_boot")
+    bp = boot[boot["preregistered"]]
+    assert sorted(set(zip(bp["quantity"], bp["readout"]))) == [("d_log_volume", "mean"), ("d_participation_ratio", "last")]
+    assert len(bp) == 14 and (bp["n_clusters"] == 1).all()
+    pos = _csv(out, "G", "position_traj")
+    assert set(pos["region"]) == {"tail", "prefix_bin", "from_switch"} and set(pos["site"]) == {"L5.block_input", "L3.block_input"}
+    assert set(pos["group"]) == {"DEV01|K0|C1", "DEV01|K8|C1"}
+    st = _csv(out, "G", "steering")
+    assert set(st["inject_site"]) == {"L5.block_input", "L2.block_input"} and set(st["eps"]) == {0.05, 0.5}
+    assert (st["direction"] == "lang_dom").all() and (st["n_random"] == 2).all() and st["cos_steer_vs_K"].between(-1, 1).all()
+    assert (st[st["inject_site"] == "L2.block_input"]["snapshot"].nunique() == 5) and (st[st["inject_site"] == "L5.block_input"]["snapshot"].nunique() == 2)
+    assert st.groupby(["inject_site", "eps"])["at_max_disp_layer"].sum().eq(1).all()
+    sb = _csv(out, "G", "steering_boot")
+    top = sb[sb["quantity"] == "cos_at_max_disp_layer"]
+    assert len(top) == 4 and top["preregistered"].sum() == 2 and top["min_effect_met"].isin([True, False]).all()
+    # T5 coupling with stage D of the same run: both partners joined on (family, K, C, layer)
+    cp = _csv(out, "G", "coupling")
+    assert set(cp["partner"]) == {"lambda", "kl"} and (cp["n"] >= 3).all() and cp["rho"].dropna().between(-1, 1).all()
+    gm = _manifest(out, "G")
+    assert gm["stage_d_available"] and gm["g0_gate"]["degenerate"] and set(gm["steering_sites"]) == {"L5.block_input", "L2.block_input"}
+
+
+def test_smoke_stage_h_lambda(smoke_run):
+    out = smoke_run["out"]
+    p = _csv(out, "H", "lambda_paths")
+    assert set(p["discriminant"]) == {"target_logit", "probe", "sae_feature"} and set(p["lam_rel"]) == {0.0, 0.3, 3.0, 30.0}
+    assert (p["sae_source"] == "synthetic_random").all() and (p["context"] == "standard").all() and (p["site"] == "L5.block_input").all()
+    assert p["tag"].nunique() == 1 and (p["n_steps"] <= 6).all() and (p["n_target"] == 3 * _csv(out, "G", "clouds")[lambda d: d["K"] == 0]["formulation"].nunique()).all()
+    assert np.isfinite(p[["B", "entropy", "kl_from_base", "mahal_to_ref_mean", "sae_fvu", "path_length", "initial_g"]].to_numpy()).all()
+    assert (p.loc[np.isclose(p["lam_rel"], 0.0), "final_density"] <= 1.0).all() and (p["lambda_unit"] > 0).all()
+    z = p[np.isclose(p["lam_rel"], 0.0)]
+    assert (z["lam"] == 0).all() and (z["g_drop"] >= -1e-5).all()      # lambda = 0: pure descent of g
+    steps = _csv(out, "H", "lambda_steps")
+    assert set(steps["discriminant"]) == set(p["discriminant"]) and (steps.groupby(["discriminant", "lam_rel"])["step"].min() == 0).all()
+    corr = _csv(out, "H", "lambda_corr")
+    pre = corr[corr["preregistered"]]
+    assert set(pre["quantity"]) == {"sae_fvu", "steps_to_cross", "mahal_to_ref_mean"} and (pre["discriminant"] == "target_logit").all()
+    boot = _csv(out, "H", "lambda_boot")
+    bp = boot[boot["preregistered"]]
+    assert len(bp) == 3 and set(bp["expected_sign"]) == {-1, 0}
+    feats = _csv(out, "H", "lambda_features")
+    assert len(feats) and feats["candidate"].dtype == bool and feats["rho"].dropna().between(-1, 1).all()
+    orig = _csv(out, "H", "lambda_original")
+    if len(orig):   # anchor available (cached or fetched)
+        assert (orig["context"] == "original_2143").all() and orig["target_id"].iloc[0] == 22905 and len(orig) == 4
+        assert orig["same_sign"].dtype == bool and np.isfinite(orig[["B_lambda0", "B_lambda3"]].to_numpy()).all()
+        assert (orig["target_cloud"] == "orig_K>0 + std_K8C1").all()
+    hm = _manifest(out, "H")
+    assert hm["kde"]["metric"] == "mahalanobis" and hm["path"]["ball_metric"] == "l2" and hm["n_starts"] == 1
+
+
+def test_smoke_stage_i_compass(smoke_run):
+    out = smoke_run["out"]
+    comp = _csv(out, "I", "compass")
+    dirs = {"state", "ent", "lang_dom", "freq", "dom_law", "dom_culture_politics", "dom_protein_misfolding"}
+    assert set(comp["direction"]) == dirs and set(comp["lang"]) == {"E", "D"}
+    assert comp.groupby(["direction", "lang"])["domain"].nunique().eq(11).all() and comp.groupby(["direction", "lang"])["is_top"].sum().eq(1).all()
+    assert (comp[comp["direction"] != "state"]["eps"] == 0.05).all() and np.isfinite(comp["z"]).all()
+    summ = _csv(out, "I", "compass_summary")
+    ent = summ[(summ["direction"] == "ent") & (summ["lang"] == "E")]
+    assert len(ent) == 1 and ent["law_rank"].between(1, 11).all() and ent["law_is_top"].dtype == bool
+    assert _csv(out, "I", "atlas_overlap").empty           # no atlas extraction in the repository
+    axes = _csv(out, "I", "domain_axes")
+    assert set(axes["name"]) == {"dom_law", "dom_culture_politics", "dom_protein_misfolding"} and (axes["site"] == "L5.block_input").all()
+    assert axes["cos_denoised_plain"].between(-1, 1).all() and np.allclose(np.diag(axes[[f"cos_{n}" for n in axes["name"]]].to_numpy()), 1.0)
+    assert C.load_bank(_stage_dir(out, "I"), name="directions_domain") is not None
+    dd = _csv(out, "I", "direction_domain")
+    assert set(dd["direction"]) == {"dom_culture_politics_cs", "dom_culture_politics", "dom_law", "lang_dom", "rand"}
+    assert set(dd["eps"]) == {0.1} and (dd["family_domain"] == "everyday").all() and sorted(set(dd["K"])) == [0, 8]
+    cs = dd[dd["direction"] == "dom_culture_politics_cs"]
+    assert (cs["arm"] == "counter_steer_replace").all() and (cs["cos_after_remove"].abs() < 1e-5).all()
+    assert (dd[dd["direction"] == "rand"]["n_dirs"] == 2).all() and (dd["audit_rel_err"].dropna() < 1e-3).all()
+    assert np.allclose(dd["B"], dd["logp_delta"] - dd["logp_0"])
+    T = _csv(out, "I", "direction_domain_T")
+    assert len(T) == 1 and np.isfinite(T["T"]).all() and T["family_domain"].iloc[0] == "everyday"
+    db = _csv(out, "I", "direction_domain_boot")
+    q = db[db["quantity"] == "B_cs_minus_lang_dom"]
+    assert len(q) == 2 and (~q["preregistered"]).all() and q["min_effect_met"].isin([True, False]).all()
+    eff = _csv(out, "I", "head_effects")
+    assert set(eff["layer"]) == {1, 2, 4, 5} and set(eff["head"]) == {0, 1, 2, 3} and eff["tag"].nunique() == 2
+    assert np.allclose(eff["delta"], eff["logp_ablated"] - eff["logp_base"])
+    direct = _csv(out, "I", "head_direct")
+    assert len(direct) == 2 * 4 * 4 and np.isfinite(direct["direct_effect"]).all()
+    wh = _csv(out, "I", "worst_head")
+    assert len(wh) == 16 and wh["selected"].sum() == 1 and (wh["selection"] == "fallback_all_families_vs_none").all()
+    assert wh.iloc[0]["selected"] and wh["score"].is_monotonic_increasing
+    hs = _csv(out, "I", "head_steering")
+    assert set(hs["arm"]) == {"head", "residual"} and set(hs["direction"]) == {"lang_dom", "dom_culture_politics"} and set(hs["eps"]) == {0.5}
+    assert (hs[hs["arm"] == "residual"]["cos_realised_direction"] == 1.0).all() and hs[hs["arm"] == "head"]["cos_realised_direction"].between(-1, 1).all()
+    assert (hs["layer"] == wh.iloc[0]["layer"]).all() and (hs["head"] == wh.iloc[0]["head"]).all()
+    hb = _csv(out, "I", "head_steering_boot")
+    assert len(hb) == 2 and (hb["quantity"] == "B_head_minus_residual").all() and np.isfinite(hb["mean"]).all()
+    im = _manifest(out, "I")
+    assert im["state_source"] in ("original_2143", "DEV01A:K0:C1") and im["worst_head"]["selection"] == "fallback_all_families_vs_none"
+
+
+def test_smoke_stage_j_rdx(smoke_run):
+    out = smoke_run["out"]
+    jm = _manifest(out, "J")
+    pile = _csv(out, "J", "pile_difficulty")
+    assert len(pile) == 3 and (pile["n_tokens"] == 63).all() and np.isfinite(pile["mean_nll"]).all()
+    assert set(pile["subfield_lexicon"]) <= set(["other"] + list(json.loads((REPO / "data/lexicon/domains.json").read_text())["domains"]))
+    rank = _csv(out, "J", "pile_ranking")
+    assert rank["rank"].tolist() == list(range(1, len(rank) + 1)) and rank["mean_nll"].is_monotonic_decreasing
+    chk = _csv(out, "J", "pile_rank_check")
+    assert len(chk) == 1 and chk["subfield"].iloc[0] == "protein_misfolding" and chk["n_sequences"].iloc[0] == 3
+    assert chk["counterpole"].iloc[0] == (chk["hardest"].iloc[0] if not chk["in_hardest_third"].iloc[0] else "protein_misfolding")
+    rdx = _csv(out, "J", "rdx")
+    assert set(rdx["contrast"]) == {"E_vs_D", "K0_vs_K8"} and set(rdx["basis"]) == {"domain_axes", "heads", "sae", "pca"}
+    assert set(rdx["site"]) == {"L4.block_input", "L5.block_input"} and set(rdx["readout"]) == {"last", "mean"}
+    assert rdx["explained"].between(0, 1).all() and (rdx["delta_norm"] > 0).all() and (~rdx["preregistered"]).all()
+    assert (rdx.loc[rdx["basis"] == "sae", "sae_source"] == "synthetic_random").all() and (rdx.loc[rdx["basis"] == "heads", "k"] == 4).all()
+    assert set(rdx["unit"]) == {"pooled", "DEV01"}
+    assert (rdx.loc[rdx["basis"] == "pca", "explained"] > 0.99).all()   # a one-row cloud per side: the PC spans the difference
+    summ = _csv(out, "J", "rdx_summary")
+    assert (summ["n_sites"] == 2).all() and summ["frac_z_ge_2"].between(0, 1).all() and summ["min_effect_met"].dtype == bool
+    stab = _csv(out, "J", "rdx_stability")
+    assert len(stab) and (stab["n_families"] == 1).all()
+    sh = _csv(out, "J", "sharing")
+    assert set(sh["kind"]) == {"sharing", "activity", "heads"} and (sh["sae_source"] == "synthetic_random").all()
+    assert sh[sh["kind"] == "sharing"]["jaccard"].between(0, 1).all() and set(sh[sh["kind"] == "heads"]["layer"]) == {1, 2, 4, 5}
+    assert set(sh[sh["kind"] == "activity"]["a"]) == {"everyday", "K0", "K8C1"}
+    assert jm["contrasts"] == {"E_vs_D": [1, 1], "K0_vs_K8": [1, 1]} and jm["pile"]["n"] == 3
+
+
+def test_smoke_stage_k_ttt(smoke_run):
+    out = smoke_run["out"]
+    corp = _csv(out, "K", "ttt_corpora")
+    assert corp["arm"].tolist() == ["injection", "neutral", "nofork", "permuted"] and corp["is_placeholder"].all()
+    assert (corp["n_snippets"] == corp["n_snippets"].iloc[0]).all() and (corp["n_tokens"] == corp["n_tokens"].iloc[0]).all()
+    mem = _csv(out, "K", "ttt_memorisation")
+    assert len(mem) == 8 and (mem["checkpoint"] == "step98000").all() and set(mem["arm"]) == set(corp["arm"])
+    assert np.isfinite(mem[["nll_start", "final_nll", "auc_drop"]].to_numpy()).all() and mem["is_placeholder"].all()
+    assert (mem["reached_threshold"] == mem["steps_to_threshold"].notna()).all()
+    # the permuted arm starts from a higher NLL than the readable text
+    assert mem[mem["arm"] == "permuted"]["nll_start"].mean() > mem[mem["arm"] == "injection"]["nll_start"].mean()
+    mb_ = _csv(out, "K", "ttt_memorisation_boot")
+    assert {"injection", "injection-neutral", "injection-nofork", "injection-permuted"} <= set(mb_["arm"])
+    assert set(mb_["quantity"]) == {"steps_to_threshold", "auc_drop", "final_nll"}
+    tr = _csv(out, "K", "ttt_training")
+    assert len(tr) == 4 * 3 and set(tr["step"]) == {1, 2, 3} and np.isfinite(tr["loss"]).all()
+    ba = _csv(out, "K", "ttt_before_after")
+    assert set(ba["phase"]) == {"before", "after"} and set(ba[ba["phase"] == "after"]["arm"]) == set(corp["arm"])
+    measures = {"logp_target", "B_lang_dom", "T_K8", "sharing_jaccard", "activity_frac_active", "activity_mean_mass", "head_delta",
+                "head_delta_mean", "log_volume", "participation_ratio"}
+    assert measures <= set(ba["measure"]) and (ba["sae_source"] == "synthetic_random").all()
+    before = ba[ba["phase"] == "before"]
+    assert (before["arm"].isna() | (before["arm"] == "")).all() and before["measure"].value_counts()["logp_target"] == 2
+    eff = _csv(out, "K", "ttt_effects")
+    assert set(eff["arm"]) == set(corp["arm"]) and np.allclose(eff["delta"], eff["after"] - eff["before"])
+    inj = eff[eff["arm"] == "injection"]
+    # identical placeholder corpora in the injection / neutral / nofork arms: no effect can exceed all controls
+    assert (~inj["exceeds_all_controls"].astype(bool)).all() and inj["delta_injection_minus_control"].isna().all()
+    assert np.allclose(eff[eff["arm"] == "neutral"]["delta_injection_minus_control"], 0.0)
+    km = _manifest(out, "K")
+    assert km["is_placeholder"] and km["memorisation"]["threshold"] == 0.5 and km["training"]["steps"] == 3
+
+
+def test_smoke_stage_l_transplant(smoke_run):
+    out = smoke_run["out"]
+    tt = _csv(out, "L", "transfer_test")
+    assert tt["layer_tgt"].tolist() == [1, 2, 4, 5] and (tt["layer_src"] == tt["layer_tgt"]).all() and (tt["n_null"] == 3).all()
+    # the rotated-self stand-in: the alignment has to undo a known isometry; it beats the permuted-pairs null clearly
+    assert (tt["cos_transferred_vs_native"] > 0.9).all() and (tt["cos_transferred_vs_native"] > tt["cos_null_max"]).all()
+    assert (tt["r2_holdout"] > tt["r2_permuted"]).all() and (tt["r2_gap"] >= 0.2).all() and tt["r2_gap_ok"].all() and tt["cos_ok"].all()
+    assert (tt["n_pairs"] == 28).all() and tt["readout_alive"].all() and (tt["n_ED_baseline"] > 0).all()
+    assert (tt["validated"] == (tt["r2_gap_ok"] & tt["cos_ok"] & tt["sign_agreement"])).all()
+    summ = _csv(out, "L", "transfer_summary")
+    assert len(summ) == 1 and summ["best_layer"].iloc[0] in tt["layer_tgt"].tolist() and summ["n_layers"].iloc[0] == 4
+    if tt["validated"].any():
+        assert bool(summ["validated"].iloc[0]) and summ["n_validated_layers"].iloc[0] == int(tt["validated"].sum())
+    lm = _csv(out, "L", "layer_matching")
+    assert set(lm["layer_tgt"]) == set(lm["layer_src"]) == set(range(7)) and len(lm) == 49 and (lm["method"] == "procrustes").all()
+    assert (lm["gap"] > 0).all()
+    al = _csv(out, "L", "alignments")
+    assert al["layer_tgt"].tolist() == list(range(7)) and (al["r2_holdout"] > al["r2_permuted"]).all()
+    tp = _csv(out, "L", "transplant")
+    assert len(tp) == 12 and set(tp["mode"]) == {"residual", "kv", "both"}
+    assert set(tp["control"]) == {"none", "random", "identity", "permuted_alignment"}
+    assert (tp.loc[tp["mode"] != "residual", "kv_layers"] == "0,1,2,3,4,5,6").all() and (tp.loc[tp["mode"] != "residual", "n_prefix"] == 2).all()
+    ident = tp[(tp["mode"] == "residual") & (tp["control"] == "identity")]
+    assert (ident["written_norm"] == 0).all() and (tp[(tp["mode"] == "residual") & (tp["control"] == "none")]["written_norm"] > 0).all()
+    assert np.isfinite(tp[["entropy", "logp_target", "fD"]].to_numpy()).all() and tp["prompt_idx"].nunique() == 1
+    ts = _csv(out, "L", "transplant_summary")
+    assert set(ts["mode"]) == {"residual", "kv", "both"} and set(ts["sign_fD_vs_identity"]) <= {-1, 0, 1}
+    assert ts["sign_agrees_with_native"].dtype == bool
+    lman = _manifest(out, "L")
+    assert lman["source"]["kind"] == "rotated_self" and not lman.get("stub")
+    assert lman["n_texts"]["E"] == lman["n_texts"]["D"] == 12 and 1 <= lman["n_texts"]["neutral"] <= 12
+
+
 def test_merge_concatenates_runs(smoke_run, tmp_path):
     out = smoke_run["out"]
     merged = tmp_path / "merged"
@@ -268,7 +515,8 @@ def test_merge_concatenates_runs(smoke_run, tmp_path):
     assert (df["run_stage"] == "B").all() and (df["run_model"] == "pythia-14m").all()
     assert (df["run_revision"] == "step98000").all()
     manifests = json.loads((merged / "manifests.json").read_text(encoding="utf-8"))
-    assert len(manifests) >= 9 and all("run_id" in m for m in manifests)
+    assert len(manifests) >= 15 and all("run_id" in m for m in manifests)
+    assert counts["lambda_paths"] > 0 and counts["transfer_test"] == 4 and counts["ttt_effects"] > 0
     index = pd.read_csv(merged / "merge_index.csv")
     assert set(index["table"]) == set(counts)
     # the merge command through the CLI
@@ -301,7 +549,8 @@ def test_load_variants_and_smoke_config(mb):
     assert cfg.limit_variants == 3 and cfg.limit_families == 1 and cfg.n_random_dirs == 2
     variants, checks = C.load_variants(cfg, mb)
     assert [v.tag for v in variants] == ["DEV01A:K0:C1", "DEV01A:K8:C1", "DEV01A:K28:seg"]
-    assert len(checks) == 24 and not checks["excluded"].any()
+    n_forms = len([f for f in stimuli.load_families() if f.family_id == "DEV01"])     # A/B (+ C/D once shipped)
+    assert n_forms >= 2 and len(checks) == 12 * n_forms and not checks["excluded"].any()
     cfg2 = RunConfig(model=mb.spec, families=["DEV01B", "DEV02"], limit_families=1)
     fams = C.select_families(cfg2)
     assert [f.tag for f in fams] == ["DEV01B"]
@@ -327,10 +576,12 @@ def test_parse_pairs_and_stages():
     assert len(parse_pairs("trace", cfg)) == 27
     assert parse_pairs("EleutherAI/pythia-1b@step143000, step5000", cfg) == [("EleutherAI/pythia-1b", "step143000"),
                                                                              ("EleutherAI/pythia-160m", "step5000")]
-    assert parse_stages("all") == list(STAGE_ORDER) and parse_stages("b, d") == ["B", "D"]
+    assert parse_stages("all") == list(STAGE_ORDER) and parse_stages("b, d") == ["B", "D"] and parse_stages("g,L") == ["G", "L"]
     with pytest.raises(SystemExit):
         parse_stages("Z")
-    assert set(STAGES) == set(STAGE_ORDER) and all(hasattr(m, "run") for m in STAGES.values())
+    assert set(STAGES) == set(STAGE_ORDER) == set("ABCDEFGHIJKL") and all(hasattr(m, "run") for m in STAGES.values())
+    text = duration_summary({"A": dict(seconds=1.5, status="ok"), "G": dict(seconds=2.0, status="error")})
+    assert "total   3.5 s" in text and "G" in text and "error" in text
 
 
 def test_direction_bank_with_synthetic_sae_and_roundtrip(mb, tok, tmp_path):
@@ -393,6 +644,84 @@ def test_marker_lexicon_and_sites(mb, tok):
     assert len(lex["E"]) == 6 and len(lex["D"]) == 6 and not set(lex["E"]) & set(lex["D"])
     assert C.dossier_site(mb) == HookSite(mb.n_layers - 1, "block_input")
     assert C.depth_site(mb) == HookSite(mb.n_layers // 3, "block_input")
+
+
+# --------------------------------------------------------------------------------------
+# stages G-L: shared helpers
+# --------------------------------------------------------------------------------------
+def test_limits_smoke_preset_covers_stages_g_to_l():
+    full, smoke = C.Limits(), C.Limits.smoke()
+    assert full.g_k_levels == (0, 2, 4, 8) and full.j_n_pile == 2000 and full.h_n_steps == 100 and not full.synthetic_sae_if_missing
+    assert smoke.smoke and smoke.g_k_levels == (0, 8) and smoke.g_max_masks == 3 and smoke.j_n_pile == 3 and smoke.synthetic_sae_if_missing
+    assert set(C.SMOKE_GL) <= {f.name for f in C.Limits.__dataclass_fields__.values()}
+    assert C.Limits.smoke(h_n_steps=2).h_n_steps == 2 and C.Limits.smoke().n_unigram == 5
+
+
+def test_family_domain_groups():
+    assert [C.family_domain(f) for f in ("F13", "F16", "F17", "F18", "F19", "F20")] == \
+        ["culture_politics", "culture_politics", "law", "law", "protein_misfolding", "protein_misfolding"]
+    assert C.family_domain("F01") == C.family_domain("F12") == C.family_domain("DEV01") == C.family_domain("orig2143") == "everyday"
+    assert sum(len(v) for v in C.DOMAIN_GROUPS.values()) == 8
+    assert C.prereg_layer_grid(12) == (2, 5, 8, 11) and C.prereg_layer_grid(6) == (1, 2, 4, 5)
+
+
+def test_realization_clouds(tok):
+    from lsne.experiments.stage_g_geometry import realization_clouds, select_masks
+    from lsne.geometry import count_switches
+    m8 = select_masks(8, 10, None, 0)
+    assert len(m8) == 8 and all(count_switches(m) == 8 and m[0] == "E" and m[-1] == "E" and m[-2] == "D" for m in m8)
+    assert len(select_masks(2, 10, None, 0)) == 8 and len(select_masks(4, 10, None, 0)) > 8
+    sub = select_masks(4, 10, 3, 0)
+    assert len(sub) == 3 and sub == select_masks(4, 10, 3, 0) and sub != select_masks(4, 10, 3, 1) and set(sub) <= set(select_masks(4, 10, None, 0))
+    fams = [f for f in stimuli.load_families() if f.family_id == "DEV01"]
+    groups, mono_D, clouds = realization_clouds(fams, tok, (0, 2), ("C1", "C3"), 2, 0)
+    n_forms = len(fams)
+    assert set(groups) == {("DEV01", 0, "C1"), ("DEV01", 2, "C1"), ("DEV01", 2, "C3")}
+    assert len(groups[("DEV01", 0, "C1")]) == n_forms and len(groups[("DEV01", 2, "C1")]) == 2 * n_forms
+    assert set(mono_D) == {("DEV01", f.formulation) for f in fams}
+    for (fid, form), v in mono_D.items():
+        assert set(v.mask) == {"D"} and v.annot["n_tokens_D"] > 0 and v.target_id == groups[("DEV01", 0, "C1")][0].target_id
+    assert not clouds["excluded"].any() and len(clouds) == n_forms * (1 + 2 + 2)
+    for v in groups[("DEV01", 2, "C3")]:
+        assert v.K == 2 and v.C == "C3" and count_switches(v.mask) == 2
+
+
+def test_substages_capture_errors_and_defaults(tmp_path):
+    sub = C.Substages("X", verbose=False)
+    assert sub.run("ok", lambda: 3) == 3 and sub.ok
+    with pytest.warns(UserWarning, match="substage 'bad' failed"):
+        out = sub.run("bad", lambda: 1 / 0, default=lambda: "dflt")
+    assert out == "dflt" and not sub.ok and "ZeroDivisionError" in sub.errors["bad"]
+    assert sub.run("bad2", lambda: [][1], default=None) is None
+    rep = sub.report()
+    assert rep["n_failed"] == 2 and set(rep["seconds"]) == {"ok", "bad", "bad2"}
+    p = sub.write_tracebacks(tmp_path)
+    assert p is not None and "=== bad ===" in p.read_text() and "ZeroDivisionError" in p.read_text()
+    assert C.Substages("Y", verbose=False).write_tracebacks(tmp_path / "none") is None
+
+
+def test_synthetic_sae_and_get_sae(mb):
+    sae = C.synthetic_sae(mb, n_latents=32, k=4, seed=1)
+    assert sae.d_in == mb.d_model and sae.num_latents == 32 and sae.k == 4
+    assert torch.equal(sae.W_enc, C.synthetic_sae(mb, n_latents=32, k=4, seed=1).W_enc)
+    bank = C.DirectionBank(site=HookSite(0, "block_input"))
+    assert C.get_sae(mb, bank, C.Limits(), {}) == (None, "none")
+    s2, src = C.get_sae(mb, bank, C.Limits.smoke(), {})
+    assert src == "synthetic_random" and s2.num_latents == 64
+    assert C.get_sae(mb, bank, C.Limits(), {"sae": sae}) == (sae, "given")
+    bank.sae, bank.meta["sae"] = sae, dict(repo="r", hookpoint="layers.0")
+    assert C.get_sae(mb, bank, C.Limits(), {}) == (sae, "hub:r/layers.0")
+
+
+def test_family_text_pairs_and_stage_tables(tmp_path):
+    fams = [f for f in stimuli.load_families() if f.family_id in ("DEV01", "DEV02")]
+    E, D, N = C.family_text_pairs(fams, 15)
+    assert len(E) == len(D) == 15 and len(N) <= 15 and all(e.endswith(".") and d.endswith(".") for e, d in zip(E, D))
+    assert E[0].startswith(fams[0].units[0].E["subj"]) and D[0].startswith(fams[0].units[0].D["subj"]) and len(set(E)) == 15
+    cfg = RunConfig(out_root=str(tmp_path))
+    assert C.stage_run_dir(cfg, "D") is None and C.load_stage_table(cfg, "D", "lens") is None
+    row = C.boot_row(pd.DataFrame(dict(family=["a", "a", "b"], x=[1.0, 3.0, 5.0])), "x", 50, 0, quantity="x")
+    assert row["n_clusters"] == 2 and row["n_rows"] == 3 and row["ci_low"] <= row["mean"] <= row["ci_high"] and row["quantity"] == "x"
 
 
 # --------------------------------------------------------------------------------------

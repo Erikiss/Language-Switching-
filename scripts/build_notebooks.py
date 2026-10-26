@@ -31,6 +31,14 @@ Every notebook has the same skeleton (German prose, English code comments):
 
 Every code cell is compiled at build time so that a syntax error fails the build (and
 the test), not the Colab session.
+
+Notebooks 00-05 cover the dossier stages A-F, notebooks 06-11 the extension stages G-L
+(docs/STAGES.md: local geometry / trajectory, lambda dynamics, domain compass + heads,
+RDX + Pile difficulty + sharing, test-time training, cross-model transplant).  The G-L
+notebooks add a parameter cell for the stage's user-supplied inputs (atlas extraction,
+TTT corpus / checkpoints, transplant source), a substage report read from the manifest
+(``substages``, ``prereg``) and a header paragraph naming the pre-registered contrasts
+and the tables that carry them.
 """
 from __future__ import annotations
 
@@ -58,6 +66,12 @@ NOTEBOOKS: dict[str, tuple[str, str]] = {
     "03_nonequilibrium": ("D", "Nicht-Gleichgewichts-Diagnostiken"),
     "04_tn_linear_response": ("E", "Tensornetzwerk und lineare Antwort"),
     "05_scale_and_checkpoints": ("F", "Skalierung und Checkpoint-Sweep"),
+    "06_geometry_trajectory": ("G", "Lokale Geometrie und Trajektorie"),
+    "07_lambda_dynamics": ("H", "λ-Dynamik im Aktivierungsraum"),
+    "08_compass_heads": ("I", "Domänen-Kompass, Domänenachsen und Heads"),
+    "09_rdx_sharing": ("J", "RDX, Pile-Schwierigkeit und Sharing"),
+    "10_ttt_injection": ("K", "Test-Time-Training als strukturelle Injektion"),
+    "11_transplant": ("L", "Cross-Modell-Transplantation"),
 }
 
 
@@ -86,12 +100,14 @@ def code(text: str, **subst: str):
 # shared cells
 # ======================================================================================
 def header_cell(stem: str, stage: str, title: str, purpose: str, inputs: str, outputs: str,
-                steps: str) -> tuple[str, str]:
-    return md(
-        """
+                steps: str, prereg: str = "") -> tuple[str, str]:
+    """Markdown header; ``prereg`` (stages G-L) adds the paragraph naming the pre-registered
+    contrasts of the stage and the tables that carry them (docs/STAGES.md)."""
+    docs = "siehe `docs/DESIGN.md` §8" + (" und `docs/STAGES.md`" if stage in "GHIJKL" else "")
+    head = """
         # LS-NEQ {{STEM}} — {{TITLE}}
 
-        **Dossier-Stufe {{STAGE}}** (`lsne.experiments.STAGES["{{STAGE}}"]`, siehe `docs/DESIGN.md` §8).
+        **Dossier-Stufe {{STAGE}}** (`lsne.experiments.STAGES["{{STAGE}}"]`, {{DOCS}}).
         Dieses Notebook wird von `scripts/build_notebooks.py` erzeugt; Änderungen bitte dort
         vornehmen und neu generieren (`python scripts/build_notebooks.py`).
 
@@ -106,14 +122,21 @@ def header_cell(stem: str, stage: str, title: str, purpose: str, inputs: str, ou
         `<OUT_ROOT>/figures/{{STEM}}/`; am Ende eine kurze `summary_{{STEM}}_*.json` in `OUT_ROOT`.
 
         **Ablauf.** {{STEPS}}
-
+"""
+    prereg_block = """
+        **Präregistrierung.** {{PREREG}}
+""" if prereg else ""
+    tail = """
         Hinweise: Die Zellen sind gegen Fehler abgesichert (ein fehlgeschlagener Schritt druckt
         den Traceback und das Notebook läuft weiter). Mit `SMOKE = True` läuft alles in
         < 3 min auf CPU mit `pythia-14m` (Rauchtest, keine wissenschaftliche Aussage).
         Mit `REUSE = True` werden vorhandene Ergebnisse (manifest.json mit `status: ok`)
         geladen statt neu gerechnet — so lässt sich nach einem Colab-Abbruch fortsetzen.
-        """,
-        STEM=stem, TITLE=title, STAGE=stage, PURPOSE=purpose, INPUTS=inputs, OUTPUTS=outputs, STEPS=steps,
+        """
+    return md(
+        head + prereg_block + tail,
+        STEM=stem, TITLE=title, STAGE=stage, DOCS=docs, PURPOSE=purpose, INPUTS=inputs, OUTPUTS=outputs, STEPS=steps,
+        PREREG=prereg,
     )
 
 
@@ -389,6 +412,42 @@ def summary_cell() -> tuple[str, str]:
                 json.dump(C.to_jsonable(summary), f, indent=1, ensure_ascii=False)
             print("Zusammenfassung:", path)
             print(json.dumps(C.to_jsonable(summary), indent=1, ensure_ascii=False)[:3000])
+        """
+    )
+
+
+def substages_cell() -> tuple[str, str]:
+    """Stages G-L: substage report from the manifest + a helper for boolean csv columns."""
+    return code(
+        """
+        # --- Substufen-Bericht: die Stufen G-L fangen Fehler pro Substufe ab (docs/STAGES.md) ----
+        # A failed substage is recorded in manifest.json -> substages.errors (traceback in
+        # substage_errors.txt), its table stays empty and the stage goes on; the manifest's
+        # `prereg` map names the table / rows that carry every pre-registered contrast.
+        def substage_report(stage: str) -> dict:
+            \"\"\"Print the substage report and the pre-registration map of a G-L manifest.\"\"\"
+            rd = RunDir(cfg.out_root, stage, cfg.model)
+            if not rd.manifest_path.exists():
+                print(f"Stufe {stage}: kein manifest.json in {rd.path}")
+                return {}
+            m = read_manifest(rd)
+            sub = m.get("substages") or {}
+            rt = m.get("runtime_s")
+            print(f"Stufe {stage}: Status {m.get('status')}" + (f", {rt:.0f} s" if isinstance(rt, (int, float)) else "")
+                  + f", Substufen fehlgeschlagen: {sub.get('n_failed', '?')}"
+                  + (" | STUB: lsne.transplant nicht importierbar" if m.get("stub") else ""))
+            for name, err in (sub.get("errors") or {}).items():
+                print(f"  FEHLER in Substufe {name}: {err}")
+            if sub.get("n_failed"):
+                print(f"  Tracebacks: {rd.path / 'substage_errors.txt'}")
+            for k, v in (m.get("prereg") or {}).items():
+                print(f"  Präregistrierung {k}: {v}")
+            return m
+
+
+        def truthy(s: pd.Series) -> pd.Series:
+            \"\"\"Boolean view of a flag column (bool in memory, 'True'/'False' strings after a csv reload).\"\"\"
+            return s.astype(str).str.lower().eq("true")
         """
     )
 
@@ -1597,6 +1656,1195 @@ def nb_05() -> list[tuple[str, str]]:
     ]
 
 
+# ======================================================================================
+# 06 local geometry and trajectory (stage G)
+# ======================================================================================
+def nb_06() -> list[tuple[str, str]]:
+    return [
+        header_cell(
+            "06_geometry_trajectory", "G", "Lokale Geometrie und Trajektorie",
+            purpose=("Der Zwischenschritt aus `docs/DESIGN.md` §4.4/§4.5 (Godoy Ortiz 2026, *Meaning Contracts*): "
+                     "Realisierungswolken pro Bedingung (Familie, K, C) aus allen Formulierungen × zulässigen "
+                     "Einheitsmasken, lokale Geometrie an jedem Residual-Snapshot (Top-k-Deflation, trunkierte "
+                     "Mahalanobis-Distanz, Log-Volumen, Participation Ratio, Verschiebung zur K=0-Wolke), G0-Gate "
+                     "(Kern-und-Streuung-Ordnung exakter Übersetzungen), G1-Kontraktionskontrast (n-angepasst, "
+                     "Familien-Bootstrap) und die Trajektorien T1 (Tiefe: „atmet“ der Raum?), T2 (Position relativ zur "
+                     "Wechselstelle), T3 (Steering-Validität: reproduziert `lang_dom` die diskrete K-Verschiebung?) "
+                     "und T5 (Kopplung von Δ log-Vol mit λ_ℓ und Lens-KL aus Stufe D)."),
+            inputs=("Stimulusbank (alle Formulierungen A–D einer Familie), Richtungsbank (Stufe B auf Drive oder neu); "
+                    "für T5 der Stufe-D-Lauf desselben Modells unter `RUNS_ROOT` (Notebook 03)."),
+            outputs=("Tabellen `clouds`, `geometry`, `pair_ordering`, `g0_gate`, `depth_trajectory`, `contraction`, "
+                     "`contraction_boot`, `position_traj`, `steering`, `steering_boot`, `coupling`."),
+            steps=("Setup → Drive → Konfiguration → Modell → Stufe G → G0-Gate → T1 Tiefenkurven → G1 Kontraktion mit "
+                   "Bootstrap → T2 Positionsinkremente → T3 Steering-Kosinus → T5 Kopplung → Zusammenfassung."),
+            prereg=("Kontrast 7 (G0-Gate: `g0_gate.pass_all` / `pass_middle`; `degenerate = True` heißt: zu wenige "
+                    "Zustände für den Rang, Gate nicht aussagekräftig), Kontrast 8 (G1: `contraction_boot`-Zeilen mit "
+                    "`preregistered = True`, K=8/C1, Deflation k=5, Mean-Pool für Log-Vol, Last-Token für PR, Vorzeichen "
+                    "offen) und Kontrast 9 (T3: `steering_boot`, `quantity = cos_at_max_disp_layer`, ε = 0,05, "
+                    "Mindesteffekt cos ≥ 0,3 gegen 32 Zufallsrichtungen). Fällt G0 durch, werden 8–9 nicht interpretiert; "
+                    "fällt T3 negativ aus, gelten Dosis-Phasendiagramme nur als Eingriffs-, nicht als Sprachwechselbefunde."),
+        ),
+        setup_cell(),
+        tnco_cell(False),
+        drive_cell(),
+        config_cell("06_geometry_trajectory", "G"),
+        model_cell(),
+        runner_cell(),
+        substages_cell(),
+        code(
+            """
+            # --- Stufe G ausführen ----------------------------------------------------------------
+            # CLI-Äquivalent:
+            #   python -m lsne.cli run --stage G --model EleutherAI/pythia-160m --revision step98000 --out <RUNS_ROOT>
+            # T5 (coupling) reads damage_profile / lens of the stage-D run of the same model below
+            # RUNS_ROOT (empty until notebook 03 has run); the clouds are shared with H/K via ctx.
+            print(f"Wolken: K {limits.g_k_levels} × C {limits.g_c_levels}, bis {limits.g_max_masks} Masken je Bedingung, "
+                  f"Deflation k {limits.g_deflate_k}, Rang r_mean={limits.g_r_mean} / r_last={limits.g_r_last}, "
+                  f"T3-Dosen {limits.g_steer_eps}, n-Matching: {limits.g_n_subsample} Ziehungen")
+            res_G = run_stage("G")
+            print({k: len(v) for k, v in res_G.items()})
+            manifest_G = substage_report("G")
+            cl = table("G", "clouds")
+            if len(cl):
+                print("Realisierungen pro Bedingung (excluded = Konsistenzprüfung nicht bestanden):")
+                show(cl.groupby(["group", "excluded"]).size().rename("n").reset_index(), n=60)
+            """
+        ),
+        code(
+            """
+            # --- G0-Gate: Kern-und-Streuung-Ordnung exakter Übersetzungen (Kontrast 7) ---------------
+            # d(A_E, A_D) < d(A_E, B_E) < d(other family) under the truncated Mahalanobis distance of the
+            # prefix-mean states (deflation k=5); the gate passes when the order holds in >= 50 % of the
+            # snapshots (all / middle third).  `degenerate`: r_eff >= N-1, the distance is uninformative.
+            with guarded("G0-Gate"):
+                gate = table("G", "g0_gate")
+                show(gate)
+                if len(gate) and truthy(gate["degenerate"]).iloc[0]:
+                    print("ACHTUNG: degenerate = True (r_eff ≥ N−1: zu wenige gepoolte Zustände für den Rang) -> "
+                          "Gate nicht aussagekräftig; mehr Familien/Formulierungen nötig (FAMILIES = None).")
+                po = table("G", "pair_ordering")
+                cats = [c for c in ["exact_translation", "same_meaning_same_lang", "other_family"] if c in set(po["category"])]
+                fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 4))
+                for c in cats:
+                    g = po[po["category"] == c].sort_values("layer")
+                    a1.errorbar(g["layer"], g["mean_mahal"], yerr=g["sd_mahal"].fillna(0), marker="o", ms=4, capsize=2, label=c)
+                    a2.plot(g["layer"], g["mean_cosine"], marker="o", ms=4, label=c)
+                for _, r in po[truthy(po["core_order_ok"])].drop_duplicates("layer").iterrows():
+                    a1.axvspan(r["layer"] - 0.4, r["layer"] + 0.4, color="green", alpha=0.08)
+                a1.set_xlabel("Snapshot ℓ")
+                a1.set_ylabel("mittlere Mahalanobis-Distanz (trunkiert, k=5)")
+                a1.set_title("Kern (exakte Übersetzung) < Streuung (freie Realisierung) < Fremdfamilie?\\n(grün: Ordnung hält)", fontsize=9)
+                a1.legend(fontsize=7)
+                a2.set_xlabel("Snapshot ℓ")
+                a2.set_ylabel("mittlerer Kosinus")
+                a2.set_title("Kosinus derselben Paare (Mean-Pool des Präfixes)", fontsize=9)
+                a2.legend(fontsize=7)
+                savefig("g0_pair_ordering")
+                plt.show()
+            """
+        ),
+        code(
+            """
+            # --- T1: Tiefen-Trajektorie der lokalen Geometrie (Log-Volumen, Inkremente, PR) ----------
+            with guarded("T1 Tiefen-Trajektorie"):
+                dt = table("G", "depth_trajectory")
+                k_def = 5 if 5 in set(dt["k"]) else int(dt["k"].iloc[0])
+                fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+                for (K, Cc), g in sorted(dt[(dt["readout"] == "mean") & (dt["k"] == k_def)].groupby(["K", "C"])):
+                    m = g.groupby("layer")[["log_volume", "delta_log_volume"]].mean()
+                    axes[0].plot(m.index, m["log_volume"], marker="o", ms=3, label=f"K={K} {Cc}")
+                    axes[1].plot(m.index, m["delta_log_volume"], marker="o", ms=3, label=f"K={K} {Cc}")
+                for (K, Cc), g in sorted(dt[(dt["readout"] == "last") & (dt["k"] == k_def)].groupby(["K", "C"])):
+                    m = g.groupby("layer")["participation_ratio"].mean()
+                    axes[2].plot(m.index, m.values, marker="s", ms=3, label=f"K={K} {Cc}")
+                axes[0].set_title(f"Log-Volumen der Realisierungswolke (Mean-Pool, k={k_def})", fontsize=9)
+                axes[1].set_title("Inkrement Δ_ℓ log-Vol (negativ = Kontraktion; Vorzeichenwechsel = „Atmen“)", fontsize=9)
+                axes[1].axhline(0, color="k", lw=0.6)
+                axes[2].set_title(f"Participation Ratio (Last-Token, k={k_def})", fontsize=9)
+                for ax in axes:
+                    ax.set_xlabel("Snapshot ℓ")
+                    ax.legend(fontsize=7)
+                savefig("t1_depth_trajectory")
+                plt.show()
+                cols = [c for c in ["family_id", "K", "C", "readout", "k", "breathing_index", "breathing_amplitude",
+                                    "layer_of_max_contraction", "layer_of_max_expansion", "net_change"] if c in dt.columns]
+                print("Atem-Index (Vorzeichenwechsel von Δ_ℓ log-Vol), Amplitude und Phasenlage pro Bedingung:")
+                show(dt[dt["k"] == k_def].drop_duplicates(["family_id", "K", "C", "readout"])[cols], n=40)
+            """
+        ),
+        code(
+            """
+            # --- G1: Kontraktion unter Sprachwechsel, n-angepasst, mit Familien-Bootstrap (Kontrast 8) --
+            # d_log_volume = log-Vol(K, C) - log-Vol(K=0) per family and snapshot; the mixed cloud is
+            # re-sampled to the K=0 cloud's size because the log-volume sums min(n, d) eigenvalues
+            # (raw values of clouds with different n are not comparable; both are reported).
+            with guarded("G1 Kontraktion"):
+                cb = table("G", "contraction_boot")
+                k_def = 5 if 5 in set(cb["k"]) else int(cb["k"].iloc[0])
+                fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+                for ax, (q, ro) in zip(axes, [("d_log_volume", "mean"), ("d_participation_ratio", "last")]):
+                    sub = cb[(cb["quantity"] == q) & (cb["readout"] == ro) & (cb["k"] == k_def)]
+                    for (K, Cc), g in sorted(sub.groupby(["K", "C"])):
+                        g = g.sort_values("layer")
+                        pre = bool(truthy(g["preregistered"]).any())
+                        ax.errorbar(g["layer"], g["mean"],
+                                    yerr=[(g["mean"] - g["ci_low"]).clip(lower=0).fillna(0), (g["ci_high"] - g["mean"]).clip(lower=0).fillna(0)],
+                                    marker="o", ms=4, capsize=2, lw=2 if pre else 1, label=f"K={K} {Cc}" + (" (präregistriert)" if pre else ""))
+                    ax.axhline(0, color="k", lw=0.6)
+                    ax.set_xlabel("Snapshot ℓ")
+                    ax.set_title(f"{q} ({ro}-Readout, k={k_def}); 95 %-CI aus {limits.n_boot} Familien-Bootstraps", fontsize=9)
+                    ax.legend(fontsize=7)
+                savefig("g1_contraction")
+                plt.show()
+                con = table("G", "contraction")
+                pre = con[truthy(con["preregistered"])]
+                if len(pre):
+                    print("Roh vs. n-angepasst (präregistrierte Zeilen K=8/C1/k=5, Mittel über Familien):")
+                    show(pre.groupby(["readout", "layer"])[["n_mixed", "n_ref", "d_log_volume_raw", "d_log_volume",
+                                                              "d_participation_ratio_raw", "d_participation_ratio"]].mean())
+            """
+        ),
+        code(
+            """
+            # --- T2: Positions-Trajektorie — Log-Volumen pro Position (Präfix-Bins, ab Wechselstelle, Tail) --
+            with guarded("T2 Positions-Trajektorie"):
+                pt = table("G", "position_traj")
+                site0 = C.dossier_site(mb).key if C.dossier_site(mb).key in set(pt["site"]) else str(pt["site"].iloc[0])
+                sub = pt[pt["site"] == site0]
+                regions = [r for r in ["prefix_bin", "from_switch", "tail"] if r in set(sub["region"])]
+                titles = {"prefix_bin": "Präfix (relative Positionsbins)", "from_switch": "Position relativ zur letzten Wechselstelle",
+                          "tail": "gemeinsamer Schlussabschnitt (vom Ende her)"}
+                fig, axes = plt.subplots(1, len(regions), figsize=(5 * len(regions), 3.8), squeeze=False)
+                for ax, region in zip(axes[0], regions):
+                    for grp, g in sorted(sub[sub["region"] == region].groupby("group")):
+                        g = g.sort_values("index")
+                        ax.plot(g["index"], g["log_volume"], marker="o", ms=3, label=grp)
+                    ax.set_title(titles[region], fontsize=9)
+                    ax.set_xlabel("Index")
+                    ax.set_ylabel("Log-Volumen (Last-Token je Position)")
+                    ax.legend(fontsize=6)
+                fig.suptitle(f"T2 an {site0}: wandert die Verdichtung mit den Wechselstellen?", fontsize=10)
+                savefig("t2_position_trajectory")
+                plt.show()
+            """
+        ),
+        code(
+            """
+            # --- T3: Steering-Validität — cos(Steuerverschiebung, mean(K=8) − mean(K=0)) (Kontrast 9) --
+            with guarded("T3 Steering"):
+                st = table("G", "steering")
+                sb = table("G", "steering_boot")
+                eps0 = 0.05 if np.isclose(st["eps"], 0.05).any() else float(st["eps"].iloc[0])
+                sites = list(dict.fromkeys(st["inject_site"]))
+                fig, axes = plt.subplots(1, len(sites), figsize=(6 * len(sites), 4), squeeze=False, sharey=True)
+                for ax, isk in zip(axes[0], sites):
+                    g = st[(st["inject_site"] == isk) & np.isclose(st["eps"], eps0)]
+                    m = g.groupby("layer")[["cos_steer_vs_K", "cos_rand_mean", "cos_rand_sd"]].mean()
+                    ax.plot(m.index, m["cos_steer_vs_K"], "o-", label="lang_dom (Mittel über Familien)")
+                    ax.fill_between(m.index, m["cos_rand_mean"] - 2 * m["cos_rand_sd"], m["cos_rand_mean"] + 2 * m["cos_rand_sd"],
+                                    color="grey", alpha=0.25, label="Zufallsrichtungen ± 2 SD")
+                    ax.axhline(0.3, color="r", lw=0.8, ls="--", label="Mindesteffekt cos ≥ 0,3")
+                    ax.axhline(0, color="k", lw=0.6)
+                    for b in sorted(set(g[truthy(g["at_max_disp_layer"])]["layer"])):
+                        ax.axvline(b, color="C1", lw=0.8, ls=":")
+                    ax.set_title(f"Injektion {isk}, ε={eps0:g}", fontsize=9)
+                    ax.set_xlabel("Snapshot ℓ")
+                    ax.legend(fontsize=7)
+                axes[0, 0].set_ylabel("cos(Steuerverschiebung, mean(K=8) − mean(K=0))")
+                fig.suptitle("T3: reproduziert kontinuierliches Steuern die Geometrie echter Wechsel? "
+                             "(gepunktet: Layer maximaler diskreter Verschiebung)", fontsize=10)
+                savefig("t3_steering_cosine")
+                plt.show()
+                top = sb[sb["quantity"] == "cos_at_max_disp_layer"]
+                if len(top):
+                    print("Präregistrierter Kontrast 9: Kosinus im Layer maximaler Verschiebung (Familien-Bootstrap):")
+                    show(top[["inject_site", "eps", "preregistered", "min_effect_met", "mean", "ci_low", "ci_high", "n_clusters"]])
+            """
+        ),
+        code(
+            """
+            # --- T5: Kopplung von Δ log-Vol mit λ_ℓ (D1) und Lens-KL (D2) über die Layer --------------
+            with guarded("T5 Kopplung"):
+                cp = table("G", "coupling")
+                if cp.empty:
+                    print("Keine Kopplung: Stufe D ist für dieses Modell unter RUNS_ROOT noch nicht gelaufen (Notebook 03) "
+                          "oder die Tabellen damage_profile / lens fehlen.")
+                else:
+                    show(cp.sort_values(["partner", "K", "C"]), n=60)
+                    fig, ax = plt.subplots(figsize=(7, 3.6))
+                    for partner, g in cp.groupby("partner"):
+                        lab = {"lambda": "λ_ℓ (Störungswachstum, Stufe D)", "kl": "Lens-KL (Stufe D)"}.get(partner, partner)
+                        ax.scatter([f"K={k} {c}" for k, c in zip(g["K"], g["C"])], g["rho"], label=lab, s=30)
+                    ax.axhline(0, color="k", lw=0.6)
+                    ax.set_ylabel("Spearman ρ über Layer")
+                    ax.set_title("Ist Verdichtung der Ordnungsparameter der Nicht-Gleichgewichts-Signaturen?", fontsize=9)
+                    ax.legend(fontsize=7)
+                    savefig("t5_coupling")
+                    plt.show()
+            """
+        ),
+        summary_cell(),
+    ]
+
+
+# ======================================================================================
+# 07 lambda dynamics (stage H)
+# ======================================================================================
+def nb_07() -> list[tuple[str, str]]:
+    return [
+        header_cell(
+            "07_lambda_dynamics", "H", "λ-Dynamik im Aktivierungsraum",
+            purpose=("Biggio et al. (2013/2017), Algorithmus 1 im Aktivierungsraum (`docs/DESIGN.md` §4.6): von der "
+                     "Dossier-Stelle (Block-Eingang des letzten Blocks, letzte Position) eines K=0-Starts aus wird "
+                     "F(h) = ĝ(h) − λ·p̂(h) per Einheitsschritten minimiert — ĝ eine Diskriminante (`target_logit`: "
+                     "−log p(Ziel); `probe`: lineare Sprach-Probe; `entropy`; `sae_feature`), p̂ eine KDE über echte "
+                     "K=8/C1-Zustände (Mahalanobis-gewhitet). λ = 0 überquert die Grenze schnellstmöglich, aber ohne "
+                     "Datenstützung; λ > 0 erzwingt Mimikry. Pro λ werden Pfadgeometrie, Datenstützung des Endpunkts "
+                     "(Mahalanobis zur Zielwolke, k-NN, SAE-FVU), Wirkung (B, Entropie, p_freq) und die SAE-Features "
+                     "gemessen; Spearman-ρ mit λ über den Sweep, Familien-Bootstrap; zusätzlich B(x)(λ) für State 2143."),
+            inputs=("Stimulusbank, Richtungsbank (für `probe`: `lang_probe`), K=8/C1-Realisierungswolke (Stufe G aus `ctx`, "
+                    "sonst neu gebaut), optional SAE (`USE_SAE=True` auf step143000; Rauchtest: zufälliger Platzhalter-SAE, "
+                    "markiert `sae_source = synthetic_random`), Anker für State 2143."),
+            outputs=("Tabellen `lambda_paths`, `lambda_steps`, `lambda_corr`, `lambda_boot`, `lambda_features`, "
+                     "`lambda_features_summary`, `lambda_original`."),
+            steps=("Setup → Drive → Konfiguration → Stufe-H-Parameter → Modell → Stufe H → Pfade (g, Dichte, F) → "
+                   "Endpunkt-Größen vs. λ → Spearman mit Bootstrap → SAE-Feature-Kandidaten → State 2143 → Zusammenfassung."),
+            prereg=("Kontrast 10 (`lambda_boot`-Zeilen mit `preregistered = True`: Diskriminante `target_logit`, ρ(λ, SAE-FVU) < 0, "
+                    "ρ(λ, Schritte bis zur Grenze) offen, ρ(λ, Mahalanobis zur Zielwolke) < 0; Feature-Kandidaten "
+                    "|ρ| ≥ 0,7 in `lambda_features`) und Kontrast 11 (`lambda_original`: Vorzeichen von B bei λ_rel = 3 "
+                    "gegenüber λ = 0, `same_sign`). Kandidaten werden auf Entwicklungsfamilien eingefroren und auf "
+                    "Testfamilien geprüft."),
+        ),
+        setup_cell(),
+        tnco_cell(False),
+        drive_cell(),
+        config_cell("07_lambda_dynamics", "H"),
+        code(
+            """
+            # --- Stufe-H-Parameter (Budget ≈ Starts × Diskriminanten × λ-Stufen × Schritte Forward+Backward) --
+            H_N_STEPS = None       # Schritte pro Pfad (Standard limits.h_n_steps = 100; kleine GPU: 30)
+            H_MAX_STARTS = None    # Startzustände (K=0-Formulierungen) pro Familie (Standard 4)
+            if H_N_STEPS is not None:
+                limits.h_n_steps = int(H_N_STEPS)
+            if H_MAX_STARTS is not None:
+                limits.h_max_starts = int(H_MAX_STARTS)
+            print(f"λ_rel-Sweep {limits.h_lambdas_rel}; Pfad: {limits.h_n_steps} Schritte × {limits.h_step_rel}·‖h₀‖ in der "
+                  f"ℓ₂-Kugel {limits.h_dmax_rel}·‖h₀‖; Starts/Familie {limits.h_max_starts}; Diskriminanten {limits.h_discriminants}; "
+                  f"KDE k_nearest={limits.h_knn}, Rang {limits.h_cov_rank}; Grenzabstand {limits.h_cross_nats} nats; "
+                  f"SAE-Platzhalter bei Bedarf: {limits.synthetic_sae_if_missing}")
+            """
+        ),
+        model_cell(),
+        runner_cell(),
+        substages_cell(),
+        code(
+            """
+            # --- Stufe H ausführen ----------------------------------------------------------------
+            # CLI-Äquivalent:
+            #   python -m lsne.cli run --stage H --model EleutherAI/pythia-160m --revision step98000 --out <RUNS_ROOT> [--use-sae]
+            # (--stage G,H shares the realization clouds; with --use-sae on step143000 the sae_feature
+            # discriminant and the feature correlations use the published SAE instead of a placeholder)
+            res_H = run_stage("H")
+            print({k: len(v) for k, v in res_H.items()})
+            manifest_H = substage_report("H")
+            if manifest_H:
+                print("Starts:", manifest_H.get("n_starts"), "| Zielzustände:", manifest_H.get("n_target"), "| KDE:", manifest_H.get("kde"),
+                      "| SAE:", manifest_H.get("sae_source"))
+            """
+        ),
+        code(
+            """
+            # --- Pfade im Aktivierungsraum: g, Dichte und F = g − λ·Dichte pro Schritt (erster Start) -------
+            with guarded("λ-Pfade"):
+                steps = table("H", "lambda_steps")
+                tag0 = str(steps["tag"].iloc[0])
+                discs = list(dict.fromkeys(steps["discriminant"]))
+                fig, axes = plt.subplots(len(discs), 3, figsize=(15, 3.2 * len(discs)), squeeze=False)
+                for i, disc in enumerate(discs):
+                    g = steps[(steps["tag"] == tag0) & (steps["discriminant"] == disc)]
+                    for lam_rel, p in sorted(g.groupby("lam_rel")):
+                        p = p.sort_values("step")
+                        for ax, col in zip(axes[i], ["g", "density", "F"]):
+                            ax.plot(p["step"], p[col], marker=".", ms=3, label=f"λ_rel={lam_rel:g}")
+                    axes[i, 0].set_ylabel(disc)
+                    axes[i, 0].set_title("Diskriminante g (g < 0: Grenze überquert)", fontsize=9)
+                    axes[i, 1].set_title("Zielklassen-Dichte p̂ (KDE, Mahalanobis)", fontsize=9)
+                    axes[i, 2].set_title("F = g − λ·p̂ (Alg. 1 minimiert F)", fontsize=9)
+                    axes[i, 0].axhline(0, color="k", lw=0.6)
+                for ax in axes[-1]:
+                    ax.set_xlabel("Schritt")
+                axes[0, 2].legend(fontsize=7)
+                fig.suptitle(f"Start {tag0}: λ = 0 steigt schnellstmöglich ab, λ > 0 bleibt in der Datenstützung (Mimikry)", fontsize=10, y=1.01)
+                savefig("lambda_paths")
+                plt.show()
+            """
+        ),
+        code(
+            """
+            # --- Endpunkt-Größen als Funktion von λ: Schritte bis zur Grenze, Mahalanobis, SAE-FVU, B -------
+            with guarded("Endpunkte vs. λ"):
+                paths = table("H", "lambda_paths")
+                quants = [q for q in ["steps_to_cross", "mahal_to_ref_mean", "knn_mean_dist", "sae_fvu", "B", "path_length"] if q in paths.columns]
+                fig, axes = plt.subplots(1, len(quants), figsize=(3.4 * len(quants), 3.6), squeeze=False)
+                for ax, q in zip(axes[0], quants):
+                    for disc, g in paths.groupby("discriminant"):
+                        m = g.groupby("lam_rel")[q].agg(["mean", "std"])
+                        ax.errorbar(m.index, m["mean"], yerr=m["std"].fillna(0), marker="o", ms=4, capsize=2, label=disc)
+                    ax.set_xscale("symlog", linthresh=0.1)
+                    ax.set_xlabel("λ_rel")
+                    ax.set_title(q, fontsize=9)
+                axes[0, 0].legend(fontsize=7)
+                fig.suptitle("Mittel ± SD über Starts (steps_to_cross: NaN = Grenze im Budget nicht erreicht)", fontsize=10)
+                savefig("lambda_endpoints")
+                plt.show()
+                print("Anteil überquerter Grenzen pro (Diskriminante, λ_rel):")
+                show(paths.assign(crossed=truthy(paths["crossed"]).astype(float)).pivot_table(index="discriminant", columns="lam_rel", values="crossed", aggfunc="mean"))
+            """
+        ),
+        code(
+            """
+            # --- Spearman-ρ(λ, ·) pro Diskriminante mit Familien-Bootstrap (Kontrast 10) -----------------
+            with guarded("Spearman-Korrelationen"):
+                lb = table("H", "lambda_boot")
+                pre = lb[truthy(lb["preregistered"])]
+                print("Präregistrierte Zeilen (target_logit; erwartete Vorzeichen: sae_fvu < 0, mahal_to_ref_mean < 0, steps_to_cross offen):")
+                show(pre[["discriminant", "quantity", "expected_sign", "sign_as_expected", "mean", "ci_low", "ci_high", "n_clusters"]])
+                quants = [q for q in ["steps_to_cross", "mahal_to_ref_mean", "knn_mean_dist", "sae_fvu", "local_log_volume", "B", "entropy",
+                                      "kl_from_base", "path_length", "tortuosity"] if q in set(lb["quantity"])]
+                sub = lb[lb["quantity"].isin(quants)]
+                discs = list(dict.fromkeys(sub["discriminant"]))
+                fig, ax = plt.subplots(figsize=(1.1 * len(quants) + 3, 4))
+                x = np.arange(len(quants))
+                w = 0.8 / max(1, len(discs))
+                for i, disc in enumerate(discs):
+                    g = sub[sub["discriminant"] == disc].set_index("quantity").reindex(quants)
+                    ax.bar(x + (i - (len(discs) - 1) / 2) * w, g["mean"], w,
+                           yerr=[(g["mean"] - g["ci_low"]).clip(lower=0).fillna(0), (g["ci_high"] - g["mean"]).clip(lower=0).fillna(0)],
+                           capsize=2, label=disc)
+                ax.set_xticks(x)
+                ax.set_xticklabels(quants, rotation=40, ha="right", fontsize=8)
+                ax.axhline(0, color="k", lw=0.6)
+                ax.set_ylabel("Spearman ρ(λ, Größe), Familienmittel")
+                ax.set_title("Welche Pfadgrößen korrelieren monoton mit λ?", fontsize=10)
+                ax.legend(fontsize=7)
+                savefig("lambda_spearman")
+                plt.show()
+            """
+        ),
+        code(
+            """
+            # --- SAE-Features vs. λ: Kandidaten |ρ| ≥ 0,7; nur bei λ=0 bzw. nur bei λ>0 aktive Features ----
+            with guarded("SAE-Feature-Korrelationen"):
+                fs = table("H", "lambda_features_summary")
+                paths = table("H", "lambda_paths")
+                if fs.empty:
+                    print("Keine SAE-Feature-Tabelle (kein SAE: USE_SAE=True auf step143000; im Rauchtest ein Platzhalter-SAE).")
+                else:
+                    src = str(paths["sae_source"].iloc[0]) if len(paths) else "?"
+                    print("SAE-Quelle:", src, "(synthetic_random = Platzhalter: Funktionstest, kein Befund)")
+                    cand = fs[truthy(fs["candidate_all"])]
+                    print(f"{len(cand)} Kandidaten-Features (|ρ| ≥ 0,7 bei allen Starts):")
+                    show(cand.sort_values("rho_mean"), n=40)
+                    fig, ax = plt.subplots(figsize=(7, 3.6))
+                    for disc, g in fs.groupby("discriminant"):
+                        ax.scatter(g["feature"], g["rho_mean"], s=12, label=disc, alpha=0.7)
+                    ax.axhline(0.7, color="r", lw=0.7, ls="--")
+                    ax.axhline(-0.7, color="r", lw=0.7, ls="--")
+                    ax.axhline(0, color="k", lw=0.5)
+                    ax.set_xlabel("SAE-Feature (Latent-Index)")
+                    ax.set_ylabel("mittleres ρ(λ, Aktivierung am Endpunkt)")
+                    ax.set_title("Feature-Aktivierung vs. λ (gestrichelt: Kandidatenschwelle |ρ| = 0,7)", fontsize=9)
+                    ax.legend(fontsize=7)
+                    savefig("lambda_features")
+                    plt.show()
+                    print("Nur bei λ=0 aktiv (Artefakt-Kandidaten) bzw. nur bei λ>0 aktiv (Repräsentations-Kandidaten):")
+                    show(fs[(fs["n_active_only_lambda0"] > 0) | (fs["n_active_only_lambda_pos"] > 0)]
+                         .sort_values(["n_active_only_lambda_pos", "n_active_only_lambda0"], ascending=False), n=30)
+            """
+        ),
+        code(
+            """
+            # --- Kontrast 11: B(x)(λ) für State 2143 — bleibt der 98k/99k-Nutzen auf der Datenmannigfaltigkeit bestehen? --
+            with guarded("State 2143: B(λ)"):
+                orig = table("H", "lambda_original")
+                if orig.empty:
+                    print("Keine Original-Tabelle (Anker nicht verfügbar oder zu wenige Zielzustände).")
+                else:
+                    r = orig.iloc[0]
+                    print(f"B(λ=0) = {r['B_lambda0']:+.4f} nats, B(λ_rel=3) = {r['B_lambda3']:+.4f} nats, gleiches Vorzeichen: {r['same_sign']}; "
+                          f"Zielwolke: {r['target_cloud']} (n_orig={r['n_target_orig']}, n={r['n_target']})")
+                    g = orig.sort_values("lam_rel")
+                    fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 3.6))
+                    a1.plot(g["lam_rel"], g["B"], "o-", label="B = ln p_δ(bey) − ln p₀(bey)")
+                    a1.axhline(0, color="k", lw=0.6)
+                    a1.set_xscale("symlog", linthresh=0.1)
+                    a1.set_xlabel("λ_rel")
+                    a1.set_ylabel("B [nats]")
+                    a1.set_title("State 2143 (Ziel 22905 „bey“), Diskriminante target_logit", fontsize=9)
+                    a1.legend(fontsize=7)
+                    a2.plot(g["lam_rel"], g["mahal_to_ref_mean"], "s-", color="C1", label="Mahalanobis zur Zielwolke")
+                    a2.plot(g["lam_rel"], g["sae_fvu"], "^-", color="C2", label="SAE-FVU am Endpunkt")
+                    a2.set_xscale("symlog", linthresh=0.1)
+                    a2.set_xlabel("λ_rel")
+                    a2.set_title("Datenstützung des Endpunkts", fontsize=9)
+                    a2.legend(fontsize=7)
+                    savefig("lambda_original_2143")
+                    plt.show()
+                    show(g[["lam_rel", "lam", "n_steps", "steps_to_cross", "crossed", "B", "entropy", "p_freq", "mahal_to_ref_mean", "sae_fvu"]])
+            """
+        ),
+        summary_cell(),
+    ]
+
+
+# ======================================================================================
+# 08 domain compass and heads (stage I)
+# ======================================================================================
+def nb_08() -> list[tuple[str, str]]:
+    return [
+        header_cell(
+            "08_compass_heads", "I", "Domänen-Kompass, Domänenachsen und Heads",
+            purpose=("Wohin steuern? (`docs/DESIGN.md` §4.7) Domänenprofil des State-2143-Zustands h₂₀₇ und der Richtungen "
+                     "`ent`, `lang_dom`, `freq` (Logit-Lens-Proxy des Suszeptibilitätsatlas: beförderte Masse pro Domäne, "
+                     "z gegen Zufallsrichtungen gleicher Dosis), Import der gespeicherten Atlas-Extraktion (optional), "
+                     "Domänenachsen `dom_law`, `dom_culture_politics`, `dom_protein_misfolding` (Difference-of-Means auf "
+                     "Domänensätzen), **Gegensteuern** (Jura-Anteil herausprojizieren, dann Kultur/Politik-Dosis, als "
+                     "Substitution geschrieben) gegen `dom_law`, `lang_dom` und Zufall nach Familiendomäne, Head-Attribution "
+                     "(Mean-Ablation, direkter Logit-Beitrag) und Steering am **schlechtesten Head** vs. am Residualstrom."),
+            inputs=("Stimulusbank (für den Domänenvergleich die Familien F13–F16 Kultur/Politik, F17–F18 Jura, F19–F20 "
+                    "Proteinfehlfaltung, Rest Alltag), Richtungsbank, Domänenlexikon `data/lexicon/domains.json`, optional "
+                    "`data/atlas/*.txt` (ATLAS_DIR), Anker für h₂₀₇."),
+            outputs=("Tabellen `compass`, `compass_summary`, `atlas_overlap`, `domain_axes`, `direction_domain`, "
+                     "`direction_domain_T`, `direction_domain_boot`, `head_effects`, `head_direct`, `worst_head`, "
+                     "`head_steering`, `head_steering_boot`; Achsen in `directions_domain.npz`."),
+            steps=("Setup → Drive → Konfiguration → Stufe-I-Parameter → Modell → Stufe I → Domänenprofile → Domänenachsen → "
+                   "Richtung × Domäne → Head-Attribution und schlechtester Head → Head-Arm → Zusammenfassung."),
+            prereg=("Kontrast 12 (`compass_summary`, `direction = ent`, `lang = E`: `law_is_top` / `law_rank` — Dokumentation, "
+                    "kein Test), Kontrast 13 (`direction_domain_boot`, `quantity = B_cs_minus_lang_dom`, "
+                    "`family_domain = culture_politics`, K=8/C1, Mindesteffekt 0,05 nats) und Kontrast 14 "
+                    "(`head_steering_boot`, `quantity = B_head_minus_residual`, zweiseitig; Head-Auswahl auf "
+                    "Entwicklungsfamilien eingefroren)."),
+        ),
+        setup_cell(),
+        tnco_cell(False),
+        drive_cell(),
+        config_cell("08_compass_heads", "I"),
+        code(
+            """
+            # --- Stufe-I-Parameter ---------------------------------------------------------------
+            ATLAS_DIR = None   # Verzeichnis der gespeicherten Atlas-Extraktion (*.txt / *.md); None = data/atlas; z. B. "/content/drive/MyDrive/LSNE/inputs/atlas"
+            _atlas = ATLAS_DIR or str(C._REPO_ROOT / "data" / "atlas")
+            _n_atlas = len([f for f in (os.listdir(_atlas) if os.path.isdir(_atlas) else []) if f.endswith((".txt", ".md"))])
+            print("Domänen-Lexikon:", C._REPO_ROOT / "data" / "lexicon" / "domains.json")
+            print(f"Atlas-Verzeichnis: {_atlas} ({_n_atlas} Datei(en); ohne Dateien läuft nur der Logit-Lens-Proxy)")
+            print(f"Dosen B(x): {limits.i_doses}; Head-Arm-Dosen (relativ zur Head-RMS): {limits.i_head_eps}; "
+                  f"Zufallsrichtungen des Domänenprofils: {limits.i_n_random_profile}")
+            if ATLAS_DIR:
+                CLI_COMMAND += f" --atlas-dir {ATLAS_DIR}"
+            """
+        ),
+        model_cell(),
+        runner_cell(),
+        substages_cell(),
+        code(
+            """
+            # --- Stufe I ausführen ----------------------------------------------------------------
+            # CLI-Äquivalent:
+            #   python -m lsne.cli run --stage I --model EleutherAI/pythia-160m --revision step98000 --out <RUNS_ROOT> [--atlas-dir data/atlas]
+            res_I = run_stage("I", atlas_dir=ATLAS_DIR)
+            print({k: len(v) for k, v in res_I.items()})
+            manifest_I = substage_report("I")
+            if manifest_I:
+                print("Zustand h₂₀₇ aus:", manifest_I.get("state_source"), "| schlechtester Head:", manifest_I.get("worst_head"),
+                      "| verworfene Lexikonwörter (mehr als ein Token):", manifest_I.get("domain_ids_dropped"))
+            """
+        ),
+        code(
+            """
+            # --- Kontrast 12: Domänenprofil von h₂₀₇ und der Richtungen (z gegen Zufallsrichtungen) ----------
+            with guarded("Domänen-Kompass"):
+                comp = table("I", "compass")
+                summ = table("I", "compass_summary")
+                print("Zustand:", comp["state_source"].iloc[0] if len(comp) else "?", "| Atlas-Erwartung für ent: law (Jura) ganz oben")
+                show(summ[summ["state_source"] != "sae_decoder"], n=40)
+                lang0 = "E"
+                sub = comp[(comp["lang"] == lang0) & (comp["state_source"] != "sae_decoder")]
+                dirs = [d for d in ["state", "ent", "lang_dom", "freq", "dom_law", "dom_culture_politics", "dom_protein_misfolding"]
+                        if d in set(sub["direction"])]
+                doms = sorted(set(sub["domain"]))
+                piv = sub.pivot_table(index="direction", columns="domain", values="z").reindex(dirs)[doms]
+                fig, ax = plt.subplots(figsize=(0.8 * len(doms) + 3, 0.5 * len(dirs) + 2))
+                vmax = float(np.nanmax(np.abs(piv.to_numpy(dtype=float)))) or 1.0
+                im = ax.imshow(piv.to_numpy(dtype=float), cmap="RdBu_r", vmin=-vmax, vmax=vmax, aspect="auto")
+                ax.set_xticks(range(len(doms)))
+                ax.set_xticklabels(doms, rotation=45, ha="right", fontsize=8)
+                ax.set_yticks(range(len(dirs)))
+                ax.set_yticklabels(dirs)
+                for i in range(len(dirs)):
+                    for j in range(len(doms)):
+                        val = piv.iat[i, j]
+                        if np.isfinite(val):
+                            ax.text(j, i, f"{val:+.1f}", ha="center", va="center", fontsize=7)
+                ax.set_title(f"Domänenprofil (Lexikon {lang0}): z der beförderten Masse pro Domäne, ε=0,05, "
+                             f"gegen {limits.i_n_random_profile} Zufallsrichtungen", fontsize=9)
+                fig.colorbar(im, ax=ax, label="z", shrink=0.8)
+                savefig("compass_domain_profile")
+                plt.show()
+                atl = table("I", "atlas_overlap")
+                if len(atl):
+                    print("Überlappung der Atlas-Cluster (Schlüsselwörter) mit den Domänenlexika:")
+                    show(atl.sort_values("jaccard", ascending=False), n=30)
+                else:
+                    print("Keine Atlas-Extraktion gefunden (data/atlas bzw. ATLAS_DIR ohne *.txt) -> nur der lokale Proxy.")
+            """
+        ),
+        code(
+            """
+            # --- Domänenachsen: Kosinus zur Richtungsbank und untereinander --------------------------
+            with guarded("Domänenachsen"):
+                ax_t = table("I", "domain_axes")
+                show(ax_t)
+                cos_cols = [c for c in ax_t.columns if c.startswith("cos_") and c != "cos_denoised_plain"]
+                M = ax_t.set_index("name")[cos_cols].astype(float)
+                fig, ax = plt.subplots(figsize=(0.9 * len(cos_cols) + 2, 2.6))
+                im = ax.imshow(M.to_numpy(), cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
+                ax.set_xticks(range(len(cos_cols)))
+                ax.set_xticklabels([c[4:] for c in cos_cols], rotation=45, ha="right", fontsize=8)
+                ax.set_yticks(range(len(M)))
+                ax.set_yticklabels(M.index, fontsize=8)
+                for i in range(M.shape[0]):
+                    for j in range(M.shape[1]):
+                        if np.isfinite(M.iat[i, j]):
+                            ax.text(j, i, f"{M.iat[i, j]:+.2f}", ha="center", va="center", fontsize=7)
+                ax.set_title("Kosinus der Domänenachsen zu ent / lang_dom / freq / lang_probe und untereinander", fontsize=9)
+                fig.colorbar(im, ax=ax, shrink=0.8)
+                savefig("domain_axes_cosines")
+                plt.show()
+            """
+        ),
+        code(
+            """
+            # --- Kontrast 13: B(x) pro Richtung × Familiendomäne (Gegensteuern gegen dom_law, dann dom_culture_politics) --
+            with guarded("Richtung × Domäne"):
+                dd = table("I", "direction_domain")
+                db = table("I", "direction_domain_boot")
+                std = dd[dd["kind"] == "standard"] if "kind" in dd else dd
+                eps0 = 0.05 if np.isclose(std["eps"], 0.05).any() else float(sorted(set(std["eps"]))[-1])
+                sub = std[np.isclose(std["eps"], eps0)]
+                sub = sub[sub["K"] == 8] if (sub["K"] == 8).any() else sub
+                order = [d for d in ["dom_culture_politics_cs", "dom_culture_politics", "dom_law", "lang_dom", "rand"] if d in set(sub["direction"])]
+                groups = list(dict.fromkeys(sub["family_domain"]))
+                piv = sub.groupby(["family_domain", "direction"])["B"].mean().unstack("direction").reindex(groups)[order]
+                ax = piv.plot(kind="bar", figsize=(8, 4), width=0.8)
+                ax.axhline(0, color="k", lw=0.6)
+                ax.set_ylabel(f"B = ln p_δ − ln p₀ [nats], ε={eps0:g}, K=8/C1")
+                ax.set_xlabel("Familiendomäne")
+                ax.set_title("Ist Steuern in der Schwachdomäne (Kultur/Politik) treffsicherer? (cs = nach Gegensteuern)", fontsize=10)
+                ax.legend(fontsize=7, ncol=2)
+                savefig("direction_x_domain")
+                plt.show()
+                q = db[db["quantity"] == "B_cs_minus_lang_dom"]
+                if len(q):
+                    print("Präregistrierter Kontrast 13: B(dom_culture_politics nach Gegensteuern) − B(lang_dom), Familien-Bootstrap, Mindesteffekt 0,05 nats:")
+                    show(q[["family_domain", "K", "C", "eps", "preregistered", "min_effect_met", "mean", "ci_low", "ci_high", "n_clusters"]])
+                    if not truthy(q["preregistered"]).any():
+                        print("Hinweis: die präregistrierte Zeile braucht Kultur/Politik-Familien (F13–F16) im Lauf (FAMILIES = None).")
+                T = table("I", "direction_domain_T")
+                if len(T):
+                    print("Texteffekt T(K=8, C1) pro Familiendomäne:")
+                    show(T.groupby("family_domain")["T"].agg(["mean", "std", "count"]))
+            """
+        ),
+        code(
+            """
+            # --- Head-Attribution: Mean-Ablation und direkter Logit-Beitrag pro Head, schlechtester Head ----
+            with guarded("Head-Attribution"):
+                eff = table("I", "head_effects")
+                wh = table("I", "worst_head")
+                hd = table("I", "head_direct")
+                fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 3.8))
+                piv = eff.groupby(["layer", "head"])["delta"].mean().unstack("head")
+                vmax = float(np.nanmax(np.abs(piv.to_numpy(dtype=float)))) or 1.0
+                im = a1.imshow(piv.to_numpy(dtype=float), cmap="RdBu_r", vmin=-vmax, vmax=vmax, aspect="auto")
+                a1.set_xticks(range(piv.shape[1]))
+                a1.set_xticklabels(piv.columns)
+                a1.set_yticks(range(piv.shape[0]))
+                a1.set_yticklabels([f"L{l}" for l in piv.index])
+                a1.set_xlabel("Head")
+                a1.set_title("Δ ln p(Ziel) bei Mean-Ablation (Mittel über Varianten; Stern = schlechtester Head)", fontsize=9)
+                fig.colorbar(im, ax=a1, shrink=0.8)
+                if len(wh):
+                    sel = wh[truthy(wh["selected"])].iloc[0]
+                    a1.plot([list(piv.columns).index(sel["head"])], [list(piv.index).index(sel["layer"])], marker="*", color="k", ms=14)
+                    print(f"Schlechtester Head: L{sel['layer']}H{sel['head']} (Auswahl: {sel['selection']}; schwache Familien: "
+                          f"{sel['families_weak']}; stabile Familien: {sel['families_stable'] or '-'})")
+                    show(wh.head(8))
+                pv2 = hd.groupby(["layer", "head"])["direct_effect"].mean().unstack("head")
+                vmax2 = float(np.nanmax(np.abs(pv2.to_numpy(dtype=float)))) or 1.0
+                im2 = a2.imshow(pv2.to_numpy(dtype=float), cmap="RdBu_r", vmin=-vmax2, vmax=vmax2, aspect="auto")
+                a2.set_xticks(range(pv2.shape[1]))
+                a2.set_xticklabels(pv2.columns)
+                a2.set_yticks(range(pv2.shape[0]))
+                a2.set_yticklabels([f"L{l}" for l in pv2.index])
+                a2.set_xlabel("Head")
+                a2.set_title("direkter Beitrag zum Ziel-Logit (W_O-Slice, letzte Position)", fontsize=9)
+                fig.colorbar(im2, ax=a2, shrink=0.8)
+                savefig("head_attribution")
+                plt.show()
+            """
+        ),
+        code(
+            """
+            # --- Kontrast 14: Steering am schlechtesten Head vs. am Residualstrom bei gleicher relativer Dosis --
+            with guarded("Head-Arm"):
+                hs = table("I", "head_steering")
+                hb = table("I", "head_steering_boot")
+                std = hs[hs["kind"] == "standard"] if "kind" in hs else hs
+                piv = std.groupby(["direction", "eps", "arm"])["B"].mean().unstack("arm")
+                ax = piv.plot(kind="bar", figsize=(7, 3.8), width=0.7)
+                ax.axhline(0, color="k", lw=0.6)
+                ax.set_ylabel("B [nats], Mittel über Varianten")
+                ax.set_title("Head-Arm: Richtung durch den Head (W_O-Urbild) vs. Addition am Block-Ausgang", fontsize=9)
+                ax.legend(fontsize=8)
+                savefig("head_steering")
+                plt.show()
+                if len(hb):
+                    print("B_head − B_residual pro (Richtung, Dosis), Familien-Bootstrap:")
+                    show(hb)
+                if len(std):
+                    print("Realisierte Richtung im Residualstrom (Kosinus) und Urbild-Fehler des Head-Arms:")
+                    show(std[std["arm"] == "head"].groupby(["direction", "eps"])[["rms_delta", "cos_realised_direction", "preimage_rel_err"]].mean())
+            """
+        ),
+        summary_cell(),
+    ]
+
+
+# ======================================================================================
+# 09 RDX, Pile difficulty and sharing (stage J)
+# ======================================================================================
+def nb_09() -> list[tuple[str, str]]:
+    return [
+        header_cell(
+            "09_rdx_sharing", "J", "RDX, Pile-Schwierigkeit und Sharing",
+            purpose=("`docs/DESIGN.md` §4.8 a–c: (a) **RDX** — nicht absolute Repräsentationen, sondern Differenzvektoren "
+                     "Δ = mean(A) − mean(B) zwischen kontrollierten Bedingungen (Kultur/Politik ↔ Proteinfehlfaltung, Jura ↔ "
+                     "Kultur/Politik, Englisch ↔ Deutsch, K=0 ↔ K=8) werden erklärt: welcher Anteil von ‖Δ‖² liegt in einer "
+                     "Kandidatenbasis (Domänenachsen, SAE-Decoderzeilen, Head-Beiträge, Hauptkomponenten), z-standardisiert "
+                     "gegen Zufallsbasen gleicher Größe, Stabilität über Familien; (b) der **Gegenpol wird gemessen, nicht "
+                     "gesetzt**: mittlere Token-NLL pro Pile-Teilgebiet aus per Range-Request gezogenen Trainingssequenzen "
+                     "(Schlüsselwortprofil, PubMed-Marker), Rang von `protein_misfolding`; (c) **Sharing-Index** (Jaccard der "
+                     "aktiven TopK-SAE-Features zwischen Bedingungen) und **Netzwerkaktivität** (Anteil aktiver Features, "
+                     "Masse, Participation Ratio), Kosinus der Head-Beitragsprofile."),
+            inputs=("Stimulusbank (Familiengruppen F13–F16 / F17–F18 / F19–F20 / Alltag), Richtungsbank, Domänenlexikon, "
+                    "SAE (`USE_SAE=True`; Rauchtest: Platzhalter), Pile per Range-Request (Cache `LSNE_CACHE/pile_nll`; "
+                    "`LSNE_OFFLINE=1` lässt die Rangfolge aus)."),
+            outputs="Tabellen `pile_difficulty`, `pile_ranking`, `pile_rank_check`, `rdx`, `rdx_summary`, `rdx_stability`, `sharing`.",
+            steps=("Setup → Drive → Konfiguration → Stufe-J-Parameter → Modell → Stufe J → Schwierigkeitsrangfolge → "
+                   "RDX-z-Karten → Stabilität → Sharing und Aktivität → Zusammenfassung."),
+            prereg=("Kontrast 15 (`rdx_summary`-Zeile `contrast = culture_politics_vs_misfolding`, `basis = domain_axes`, "
+                    "`readout = last`: z ≥ 2 in mindestens der Hälfte der Layer, `min_effect_met`) und Kontrast 16 "
+                    "(`pile_rank_check`: Rang von `protein_misfolding` aus N ≥ 2 000 Sequenzen; liegt es nicht im schwersten "
+                    "Drittel, ersetzt `counterpole` den Gegenpol durch das tatsächlich schwerste Teilgebiet)."),
+        ),
+        setup_cell(),
+        tnco_cell(False),
+        drive_cell(),
+        config_cell("09_rdx_sharing", "J"),
+        code(
+            """
+            # --- Stufe-J-Parameter ---------------------------------------------------------------
+            J_N_PILE = None     # Pile-Sequenzen der Schwierigkeitsrangfolge (Standard 2 000 = Präregistrierung 16; Rauchtest 3)
+            if J_N_PILE is not None:
+                limits.j_n_pile = int(J_N_PILE)
+            print(f"Pile-Sequenzen: {limits.j_n_pile} (je {limits.j_pile_max_len} Tokens, Range-Requests, Cache {C.cache_dir('pile_nll')}); "
+                  f"Zufallsbasen: {limits.j_n_random_bases}; PCA-Komponenten: {limits.j_n_pca}; Offline: {C.offline()}")
+            """
+        ),
+        model_cell(),
+        runner_cell(),
+        substages_cell(),
+        code(
+            """
+            # --- Stufe J ausführen ----------------------------------------------------------------
+            # CLI-Äquivalent:
+            #   python -m lsne.cli run --stage J --model EleutherAI/pythia-160m --revision step98000 --out <RUNS_ROOT> [--use-sae]
+            res_J = run_stage("J")
+            print({k: len(v) for k, v in res_J.items()})
+            manifest_J = substage_report("J")
+            if manifest_J:
+                print("Kontraste (n_A, n_B):", manifest_J.get("contrasts"), "| Basen:", manifest_J.get("bases"), "| SAE:", manifest_J.get("sae_source"))
+            """
+        ),
+        code(
+            """
+            # --- Kontrast 16: empirische Schwierigkeitsrangfolge der Pile-Teilgebiete (mittlere Token-NLL) ----
+            with guarded("Pile-Schwierigkeit"):
+                rk = table("J", "pile_ranking")
+                chk = table("J", "pile_rank_check")
+                pile = table("J", "pile_difficulty")
+                if rk.empty:
+                    print("Keine Rangfolge (offline oder Range-Requests fehlgeschlagen; siehe Substufen-Bericht).")
+                else:
+                    rk = rk.sort_values("rank")
+                    fig, ax = plt.subplots(figsize=(7, 0.35 * len(rk) + 1.5))
+                    y = np.arange(len(rk))
+                    ax.barh(y, rk["mean_nll"], xerr=[(rk["mean_nll"] - rk["ci_low"]).clip(lower=0), (rk["ci_high"] - rk["mean_nll"]).clip(lower=0)],
+                            color=["C3" if s == "protein_misfolding" else "C0" for s in rk["subfield"]], capsize=2)
+                    ax.set_yticks(y)
+                    ax.set_yticklabels([f"{s} (n={n})" for s, n in zip(rk["subfield"], rk["n_seqs"])], fontsize=8)
+                    ax.invert_yaxis()
+                    ax.set_xlabel("mittlere Token-NLL [nats] (Bootstrap-CI über Sequenzen)")
+                    ax.set_title(f"Schwierigkeitsrangfolge aus {len(pile)} Pile-Sequenzen (rot: protein_misfolding)", fontsize=9)
+                    savefig("pile_difficulty_ranking")
+                    plt.show()
+                    show(chk)
+                    if len(chk):
+                        c = chk.iloc[0]
+                        print(f"Gegenpol laut Ersetzungsregel: {c['counterpole']} (protein_misfolding: Rang {c['rank']} von {c['n_subfields']}, "
+                              f"im schwersten Drittel: {c['in_hardest_third']})")
+                    if "subfield_lexicon" in pile.columns:
+                        print("Teilgebiet (Marker) × Lexikon-Domäne derselben Sequenzen:")
+                        show(pd.crosstab(pile["subfield"], pile["subfield_lexicon"].fillna("")))
+            """
+        ),
+        code(
+            """
+            # --- Kontrast 15: RDX — erklärter Anteil von ‖Δ‖² pro Kontrast × Basis × Layer, z gegen Zufallsbasen --
+            with guarded("RDX"):
+                rdx = table("J", "rdx")
+                rs = table("J", "rdx_summary")
+                pooled = rdx[(rdx["unit"] == "pooled") & (rdx["readout"] == "last")]
+                contrasts = list(dict.fromkeys(pooled["contrast"]))
+                bases = [b for b in ["domain_axes", "sae", "heads", "pca"] if b in set(pooled["basis"])]
+                fig, axes = plt.subplots(1, len(contrasts), figsize=(4.5 * len(contrasts), 3.6), squeeze=False)
+                im = None
+                for ax, cn in zip(axes[0], contrasts):
+                    piv = pooled[pooled["contrast"] == cn].pivot_table(index="basis", columns="layer", values="z").reindex(bases)
+                    im = ax.imshow(piv.to_numpy(dtype=float), cmap="viridis", aspect="auto", vmin=-2, vmax=6)
+                    ax.set_xticks(range(piv.shape[1]))
+                    ax.set_xticklabels([f"L{l}" for l in piv.columns])
+                    ax.set_yticks(range(piv.shape[0]))
+                    ax.set_yticklabels(piv.index)
+                    for i in range(piv.shape[0]):
+                        for j in range(piv.shape[1]):
+                            if np.isfinite(piv.iat[i, j]):
+                                ax.text(j, i, f"{piv.iat[i, j]:+.1f}", ha="center", va="center", fontsize=7, color="w")
+                    ax.set_title(cn, fontsize=9)
+                fig.suptitle("z des erklärten Anteils gegen Zufallsbasen gleicher Größe (Last-Token; z ≥ 2 = Mindesteffekt)", fontsize=10)
+                if im is not None:
+                    fig.colorbar(im, ax=axes[0].tolist(), shrink=0.8, label="z")
+                savefig("rdx_z")
+                plt.show()
+                show(rs.sort_values(["preregistered", "contrast", "basis"], ascending=[False, True, True]), n=60)
+                if "culture_politics_vs_misfolding" not in contrasts:
+                    print("Hinweis: der präregistrierte Kontrast Kultur/Politik ↔ Fehlfaltung braucht die Familien F13–F16 und F19–F20 (FAMILIES = None).")
+                print("Erklärter Anteil (nicht z) der Domänenachsen-Basis pro Layer:")
+                show(pooled[pooled["basis"] == "domain_axes"].pivot_table(index="contrast", columns="layer", values="explained"))
+                stab = table("J", "rdx_stability")
+                if len(stab):
+                    print("Stabilität der Erklärung über Familien / Familienpaare:")
+                    show(stab, n=40)
+            """
+        ),
+        code(
+            """
+            # --- Sharing-Index und Netzwerkaktivität (DESIGN §4.8c) -------------------------------------
+            with guarded("Sharing"):
+                sh = table("J", "sharing")
+                if sh.empty:
+                    print("Keine Sharing-Tabelle (kein SAE: USE_SAE=True auf step143000; im Rauchtest ein Platzhalter-SAE).")
+                else:
+                    print("SAE-Quelle:", sh["sae_source"].iloc[0], "(synthetic_random = Platzhalter: Funktionstest, kein Befund)")
+                    js = sh[sh["kind"] == "sharing"]
+                    conds = sorted((set(js["a"]) | set(js["b"].dropna())) - {"global"})
+                    M = pd.DataFrame(np.nan, index=conds, columns=conds, dtype=float)
+                    for _, r in js.iterrows():
+                        if r["a"] in conds and r["b"] in conds:
+                            M.loc[r["a"], r["b"]] = float(r["jaccard"])
+                            M.loc[r["b"], r["a"]] = float(r["jaccard"])
+                    act = sh[sh["kind"] == "activity"].set_index("a")[["frac_active", "mean_mass", "participation_ratio"]].astype(float)
+                    fig, (a1, a2) = plt.subplots(1, 2, figsize=(12, 4))
+                    im = a1.imshow(M.to_numpy(dtype=float), cmap="Blues", vmin=0, vmax=1)
+                    a1.set_xticks(range(len(conds)))
+                    a1.set_xticklabels(conds, rotation=45, ha="right", fontsize=8)
+                    a1.set_yticks(range(len(conds)))
+                    a1.set_yticklabels(conds, fontsize=8)
+                    for i in range(len(conds)):
+                        for j in range(len(conds)):
+                            if np.isfinite(M.iat[i, j]):
+                                a1.text(j, i, f"{M.iat[i, j]:.2f}", ha="center", va="center", fontsize=7)
+                    a1.set_title("Sharing-Index S = Jaccard der aktiven TopK-Features (paarweise)", fontsize=9)
+                    fig.colorbar(im, ax=a1, shrink=0.8)
+                    (act / act.max()).plot(kind="bar", ax=a2, width=0.8)
+                    a2.set_title("Netzwerkaktivität A pro Bedingung (relativ zum Maximum der Spalte)", fontsize=9)
+                    a2.set_xlabel("Bedingung")
+                    a2.legend(fontsize=7)
+                    savefig("sharing_activity")
+                    plt.show()
+                    show(act)
+                    glob = js[js["a"] == "global"]
+                    if len(glob):
+                        print("Globaler Sharing-Index (alle Bedingungen):", float(glob["jaccard"].iloc[0]))
+                    hp = sh[sh["kind"] == "heads"]
+                    if len(hp):
+                        print("Kosinus der Head-Beitragsprofile zwischen Bedingungen (Layer-Raster):")
+                        show(hp.pivot_table(index=["a", "b"], columns="layer", values="cosine"), n=40)
+            """
+        ),
+        summary_cell(),
+    ]
+
+
+# ======================================================================================
+# 10 test-time training (stage K)
+# ======================================================================================
+def nb_10() -> list[tuple[str, str]]:
+    return [
+        header_cell(
+            "10_ttt_injection", "K", "Test-Time-Training als strukturelle Injektion",
+            purpose=("`docs/DESIGN.md` §4.8 d: fortgesetztes Training eines eingefrorenen Checkpoints auf einem kleinen "
+                     "Kontrastkorpus (Ethereum/DAO-Fork 2016, vom Auftraggeber unter `data/ttt/dao_fork` bereitzustellen) "
+                     "mit drei Kontrollarmen gleichen Budgets (`neutral`: thematisch neutral, gleiche Größe; `nofork`: "
+                     "gleiche Ära ohne Spaltungsnarrativ; `permuted`: Tokens des DAO-Korpus permutiert). Gemessen werden "
+                     "(i) die Memorisationsgeschwindigkeit pro Textstück (Schritte bis zur NLL-Schwelle) über Checkpoints, "
+                     "(ii) Δ Sharing-Index und Δ Netzwerkaktivität und (iii) Δ T(K=8), Δ B(x) sowie Head- und Geometrie-Maße "
+                     "vor/nach dem Training auf demselben Stimulusraster. Das übergebene Modell bleibt unverändert "
+                     "(Kopien); ein Effekt zählt nur, wenn er über allen drei Kontrollarmen liegt."),
+            inputs=("`data/ttt/dao_fork`, `data/ttt/neutral`, `data/ttt/nofork` (*.txt / *.jsonl, siehe `data/ttt/README.md`; "
+                    "fehlen sie, läuft der gemeinfreie Platzhalter mit `is_placeholder = True` — Funktionstest, kein Befund), "
+                    "Stimulusbank, Richtungsbank, SAE (oder Platzhalter), optional Stufe G/I derselben Sitzung "
+                    "(Wolken, schlechtester Head)."),
+            outputs="Tabellen `ttt_corpora`, `ttt_memorisation`, `ttt_memorisation_boot`, `ttt_training`, `ttt_before_after`, `ttt_effects`.",
+            steps=("Setup → Drive → Konfiguration → Stufe-K-Parameter (Korpus, Checkpoints) → Modell → [Stufen G, I] → Stufe K → "
+                   "Korpora → Memorisation → Trainingsverlauf → Vorher/Nachher-Effekte → Zusammenfassung."),
+            prereg=("Kontrast 17: (i) `ttt_memorisation_boot`, `arm = injection-<Kontrolle>`, `quantity = steps_to_threshold` "
+                    "(zweiseitig); (ii) `ttt_effects`, `measure ∈ {sharing_jaccard, activity_*}`; (iii) `ttt_effects`, "
+                    "`measure ∈ {T_K8, B_lang_dom}` — jeweils `exceeds_all_controls`. Explorativ auf Entwicklungsfamilien; "
+                    "Bestätigung auf Testfamilien mit eingefrorener Schrittzahl und Lernrate."),
+        ),
+        setup_cell(),
+        tnco_cell(False),
+        drive_cell(),
+        config_cell("10_ttt_injection", "K"),
+        code(
+            """
+            # --- Stufe-K-Parameter: Korpus, Kontrollarme, Checkpoints ------------------------------------
+            TTT_INPUTS = None            # z. B. "/content/drive/MyDrive/LSNE/inputs/ttt": Ordner dao_fork/, neutral/, nofork/ werden nach data/ttt/ kopiert
+            TTT_CORPUS = None            # Injektionskorpus (Standard data/ttt/dao_fork; Platzhalter mit is_placeholder=True, wenn leer)
+            TTT_CHECKPOINTS = None       # z. B. ["step4000", "step98000", "step143000"]: Memorisationstabelle über Checkpoints (Shard 7)
+            WITH_CONTEXT_STAGES = False  # True: Stufen G und I vorher in dieser Sitzung rechnen (Wolken, schlechtester Head -> Vorher/Nachher-Maße)
+            RUNS_SUBDIR = None           # z. B. "runs_ttt" (Shard 7): eigenes Laufverzeichnis <OUT_ROOT>/runs_ttt statt RUNS_ROOT
+
+            import shutil
+            from dataclasses import replace
+
+            if RUNS_SUBDIR:
+                _old = RUNS_ROOT
+                RUNS_ROOT = os.path.join(OUT_ROOT, RUNS_SUBDIR)
+                os.makedirs(RUNS_ROOT, exist_ok=True)
+                cfg = replace(cfg, out_root=RUNS_ROOT)
+                CLI_COMMAND = CLI_COMMAND.replace(f"--out {_old}", f"--out {RUNS_ROOT}")
+                print("Laufverzeichnis:", RUNS_ROOT)
+            if TTT_INPUTS:
+                for arm in ("dao_fork", "neutral", "nofork"):
+                    src_dir = os.path.join(TTT_INPUTS, arm)
+                    if os.path.isdir(src_dir):
+                        shutil.copytree(src_dir, os.path.join("data", "ttt", arm), dirs_exist_ok=True)
+                        print("kopiert:", src_dir, "-> data/ttt/" + arm)
+            for arm, p in (("injection", TTT_CORPUS or limits.k_corpus), ("neutral", "data/ttt/neutral"), ("nofork", "data/ttt/nofork")):
+                files = [f for f in (os.listdir(p) if os.path.isdir(p) else []) if f.endswith((".txt", ".jsonl"))]
+                print(f"{arm:9s} {p}: {len(files)} Datei(en)" + ("" if files else "  -> PLATZHALTER (Funktionstest, kein Befund)"))
+            if SMOKE:
+                TTT_CHECKPOINTS = None
+            print(f"Training: {limits.k_train_steps} Schritte × Batch {limits.k_train_batch}, lr {limits.k_train_lr}; "
+                  f"Memorisation: {limits.k_mem_steps} Schritte, lr {limits.k_mem_lr}, Schwelle {limits.k_threshold} nats, "
+                  f"{limits.k_max_snippets} Stücke/Arm; Checkpoints: {TTT_CHECKPOINTS or 'nur ' + REVISION}; B(x)-Dosis {limits.k_eps}")
+            if TTT_CORPUS:
+                CLI_COMMAND += f" --ttt-corpus {TTT_CORPUS}"
+            if TTT_CHECKPOINTS:
+                CLI_COMMAND += f" --ttt-checkpoints {','.join(TTT_CHECKPOINTS)}"
+            """
+        ),
+        model_cell(),
+        runner_cell(),
+        substages_cell(),
+        code(
+            """
+            # --- Stufe K ausführen (optional nach G und I für die Kontext-Maße) ------------------------------
+            # CLI-Äquivalent:
+            #   python -m lsne.cli run --stage K --model EleutherAI/pythia-160m --revision step98000 --out <RUNS_ROOT> \\
+            #       --ttt-corpus data/ttt/dao_fork [--ttt-checkpoints step4000,step98000,step143000]
+            # (--stage G,I,K additionally yields log_volume / participation_ratio of the clouds and the
+            # head_delta of the worst head in ttt_before_after, because K reads them from ctx)
+            if WITH_CONTEXT_STAGES:
+                run_stage("G", reuse=False)
+                run_stage("I", reuse=False)
+            res_K = run_stage("K", ttt_corpus=TTT_CORPUS, ttt_checkpoints=TTT_CHECKPOINTS)
+            print({k: len(v) for k, v in res_K.items()})
+            manifest_K = substage_report("K")
+            """
+        ),
+        code(
+            """
+            # --- Korpora der vier Arme (Platzhalter werden laut markiert) ---------------------------------
+            with guarded("Korpora"):
+                corp = table("K", "ttt_corpora")
+                show(corp)
+                if len(corp) and truthy(corp["is_placeholder"]).any():
+                    print("ACHTUNG: mindestens ein Arm läuft auf dem gemeinfreien Platzhalter (is_placeholder = True) -> Funktionstest, "
+                          "kein Befund. DAO-Fork-Korpus und Kontrollkorpora unter data/ttt/ ablegen (data/ttt/README.md) oder TTT_INPUTS setzen.")
+            """
+        ),
+        code(
+            """
+            # --- Kontrast 17 (i): Memorisationsgeschwindigkeit — Schritte bis NLL ≤ Schwelle pro Arm und Checkpoint --
+            with guarded("Memorisation"):
+                mem = table("K", "ttt_memorisation")
+                mbt = table("K", "ttt_memorisation_boot")
+                arms = [a for a in ["injection", "neutral", "nofork", "permuted"] if a in set(mbt["arm"])]
+                titles = {"steps_to_threshold": f"Schritte bis NLL ≤ {limits.k_threshold} (nur erreichte Stücke)",
+                          "auc_drop": "AUC des NLL-Abfalls", "final_nll": "NLL nach dem Training"}
+                fig, axes = plt.subplots(1, 3, figsize=(15, 3.8))
+                for ax, q in zip(axes, ["steps_to_threshold", "auc_drop", "final_nll"]):
+                    sub = mbt[(mbt["quantity"] == q) & (mbt["arm"].isin(arms))]
+                    ck = list(dict.fromkeys(sub["checkpoint"]))
+                    x = np.arange(len(ck))
+                    w = 0.8 / max(1, len(arms))
+                    for i, arm in enumerate(arms):
+                        g = sub[sub["arm"] == arm].set_index("checkpoint").reindex(ck)
+                        ax.bar(x + (i - (len(arms) - 1) / 2) * w, g["mean"], w,
+                               yerr=[(g["mean"] - g["ci_low"]).clip(lower=0).fillna(0), (g["ci_high"] - g["mean"]).clip(lower=0).fillna(0)],
+                               capsize=2, label=arm)
+                    ax.set_xticks(x)
+                    ax.set_xticklabels(ck)
+                    ax.set_title(titles[q], fontsize=9)
+                axes[0].legend(fontsize=7)
+                savefig("ttt_memorisation")
+                plt.show()
+                diff = mbt[mbt["arm"].astype(str).str.startswith("injection-")]
+                if len(diff):
+                    print("Injektion minus Kontrolle (gepaart über Stücke, Bootstrap-CI; negativ bei steps_to_threshold = schneller memorisiert):")
+                    show(diff)
+                if len(mem):
+                    print("Anteil der Stücke, die die Schwelle erreichen, NLL am Start und am Ende pro Arm:")
+                    show(mem.assign(reached=truthy(mem["reached_threshold"]).astype(float)).groupby(["checkpoint", "arm"])
+                         .agg(n=("snippet", "count"), reached=("reached", "mean"), nll_start=("nll_start", "mean"), final_nll=("final_nll", "mean")))
+            """
+        ),
+        code(
+            """
+            # --- Trainingsverlauf der vier Arme (gleiches Budget: Schritte, Lernrate, Batch, Seed) ----------
+            with guarded("Trainingsverlauf"):
+                tr = table("K", "ttt_training")
+                fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 3.6))
+                for arm, g in tr.groupby("arm"):
+                    g = g.sort_values("step")
+                    a1.plot(g["step"], g["loss"], label=arm)
+                    a2.plot(g["step"], g["grad_norm"], label=arm)
+                a1.set_xlabel("Schritt")
+                a1.set_ylabel("Verlust [nats/Token]")
+                a1.set_title("Test-Time-Training (AdamW, Gradienten-Clipping 1,0, FP32)", fontsize=9)
+                a2.set_xlabel("Schritt")
+                a2.set_ylabel("Gradientennorm")
+                a2.set_yscale("log")
+                a1.legend(fontsize=7)
+                savefig("ttt_training")
+                plt.show()
+            """
+        ),
+        code(
+            """
+            # --- Kontrast 17 (ii)+(iii): Δ nach TTT pro Arm — ein Effekt zählt nur über allen drei Kontrollarmen --
+            with guarded("Vorher/Nachher"):
+                eff = table("K", "ttt_effects")
+                corp = table("K", "ttt_corpora")
+                arms = [a for a in ["injection", "neutral", "nofork", "permuted"] if a in set(eff["arm"])]
+                agg = eff.groupby(["measure", "arm"])["delta"].mean().unstack("arm").reindex(columns=arms)
+                order = [m for m in ["T_K8", "B_lang_dom", "logp_target", "sharing_jaccard", "activity_frac_active", "activity_mean_mass",
+                                     "activity_participation_ratio", "head_delta_mean", "log_volume", "participation_ratio"] if m in agg.index]
+                agg = agg.reindex(order)
+                fig, axes = plt.subplots(1, len(order), figsize=(2.4 * len(order) + 1, 3.6), squeeze=False)
+                for ax, m in zip(axes[0], order):
+                    ax.bar(range(len(arms)), agg.loc[m].to_numpy(dtype=float), color=["C3" if a == "injection" else "C7" for a in arms])
+                    ax.set_xticks(range(len(arms)))
+                    ax.set_xticklabels(arms, rotation=60, fontsize=7)
+                    ax.axhline(0, color="k", lw=0.6)
+                    ax.set_title(m, fontsize=8)
+                axes[0, 0].set_ylabel("Δ = nach − vor (Mittel über Bedingungen)")
+                fig.suptitle("Wirkung des Test-Time-Trainings auf alles Übrige (rot: Injektionsarm, grau: Kontrollarme)", fontsize=10)
+                savefig("ttt_effects")
+                plt.show()
+                inj = eff[eff["arm"] == "injection"]
+                if len(inj):
+                    print("Injektionsarm: liegt der Effekt über allen drei Kontrollen?")
+                    show(inj[["measure", "condition", "before", "after", "delta", "exceeds_all_controls"]], n=60)
+                    n_exc = int(truthy(inj["exceeds_all_controls"]).sum())
+                    note = " (Platzhalterkorpora: identische Arme, erwartungsgemäß 0)" if len(corp) and truthy(corp["is_placeholder"]).all() else ""
+                    print(f"{n_exc} von {len(inj)} (Maß, Bedingung)-Zeilen über allen Kontrollen{note}")
+                missing = [m for m in ("head_delta_mean", "log_volume") if m not in set(eff["measure"])]
+                if missing:
+                    print("Nicht gemessen (Stufen G/I nicht in dieser Sitzung; WITH_CONTEXT_STAGES=True oder CLI --stage G,I,K):", missing)
+            """
+        ),
+        summary_cell(),
+    ]
+
+
+# ======================================================================================
+# 11 cross-model transplant (stage L)
+# ======================================================================================
+def nb_11() -> list[tuple[str, str]]:
+    return [
+        header_cell(
+            "11_transplant", "L", "Cross-Modell-Transplantation",
+            purpose=("`docs/DESIGN.md` §4.9: modellagnostische Maschinerie mit steckbarem Quelladapter (`lsne.transplant`), "
+                     "validiert mit einem Stand-in-Quellmodell, bevor ein BlockGPT-artiges Spurenmodell eingehängt wird "
+                     "(`docs/BLOCKGPT_FEASIBILITY.md`: es gibt keine BlockGPT-Gewichte; empfohlen ist ein eigenes Modell auf "
+                     "Xatu-2016-Traces, `docs/TRACE_SOURCE_SPEC.md`). Schritte: gepaarte Eingaben (englische/deutsche "
+                     "Einheitssätze der Familien), lineare Abbildung Quelle → Ziel (Procrustes nach PCA) mit Permutations-Null, "
+                     "Layer-Matching, Transfer der im Quellmodell bestimmten Sprachachse und **funktionaler Transfertest** "
+                     "(Kosinus zur nativen Achse, Verschiebung des deutschen Anteils in Fortsetzungen), dann Injektion A "
+                     "(Residual-Substitution, kein Addieren), B (KV-Cache-Pflanzung über ein virtuelles Präfix auf allen Layern) "
+                     "und C (beides) gegen Zufalls-, Identitäts- und Permutationskontrollen."),
+            inputs=("Stimulusbank (Satzpaare, K=0-Prompts), Quellmodell `TRANSPLANT_SOURCE` (`rotated_self`: Standard-Stand-in, "
+                    "`self`, oder ein HF-Modell wie `EleutherAI/pythia-70m@step143000`; ein Spurenmodell über dieselbe "
+                    "`SourceModel`-Schnittstelle), Generierungsbudget `cfg.gen_n_new × cfg.gen_n_samples`."),
+            outputs="Tabellen `transfer_test`, `transfer_summary`, `layer_matching`, `alignments`, `transplant`, `transplant_summary`.",
+            steps=("Setup → Drive → Konfiguration → Stufe-L-Parameter → Modell → Stufe L → Transfertest pro Layer → Layer-Matching → "
+                   "Transplantation A/B/C gegen Kontrollen → Zusammenfassung."),
+            prereg=("Kontrast 18 (`transfer_summary`: Alignment-R² Hold-out − permutiert ≥ 0,2 `r2_gap_ok`, Kosinus transferierte "
+                    "vs. native Sprachachse ≥ 0,3 im besten Layer `cos_ok`, Vorzeichengleichheit der f_D-Verschiebung "
+                    "`sign_agreement`, zusammen `validated`; `transplant_summary.sign_agrees_with_native` pro Modus). Erst nach "
+                    "bestandener Stand-in-Validierung wird ein Spurenmodell als Quelle gewertet; dessen „Teilen“-Merkmal wird "
+                    "vorab im Quellmodell definiert und eingefroren."),
+        ),
+        setup_cell(),
+        tnco_cell(False),
+        drive_cell(),
+        config_cell("11_transplant", "L"),
+        code(
+            """
+            # --- Stufe-L-Parameter: Quellmodell ------------------------------------------------------------
+            TRANSPLANT_SOURCE = None   # "rotated_self" (Standard: Stand-in, das Alignment muss eine Isometrie rückgängig machen) | "self" | "EleutherAI/pythia-70m@step143000"
+            print("Quellmodell:", TRANSPLANT_SOURCE or limits.l_source, "| Satzpaare je Sprache:", limits.l_n_texts, "| Prompts:", limits.l_n_prompts,
+                  "| KV-Präfix:", limits.l_n_prefix, "| Dosis:", limits.l_eps, "| Permutations-Null:", limits.l_n_null)
+            try:
+                import lsne.transplant  # noqa: F401
+                print("lsne.transplant verfügbar")
+            except Exception as e:   # the stage then writes a manifest with stub=True and no tables
+                print("lsne.transplant NICHT importierbar -> Stufe L schreibt nur ein Manifest (stub):", repr(e))
+            if TRANSPLANT_SOURCE:
+                CLI_COMMAND += f" --transplant-source {TRANSPLANT_SOURCE}"
+            """
+        ),
+        model_cell(),
+        runner_cell(),
+        substages_cell(),
+        code(
+            """
+            # --- Stufe L ausführen ----------------------------------------------------------------
+            # CLI-Äquivalent:
+            #   python -m lsne.cli run --stage L --model EleutherAI/pythia-160m --revision step98000 --out <RUNS_ROOT> \\
+            #       [--transplant-source EleutherAI/pythia-70m@step143000]
+            res_L = run_stage("L", transplant_source=TRANSPLANT_SOURCE)
+            print({k: len(v) for k, v in res_L.items()})
+            manifest_L = substage_report("L")
+            if manifest_L:
+                print("Quelle:", manifest_L.get("source"), "| Satzpaare:", manifest_L.get("n_texts"), "| validiert:", manifest_L.get("validated"))
+            """
+        ),
+        code(
+            """
+            # --- Kontrast 18: funktionaler Transfertest pro Layer des Rasters (Stand-in-Validierung) -------
+            with guarded("Funktionaler Transfertest"):
+                tt = table("L", "transfer_test")
+                ts = table("L", "transfer_summary")
+                if tt.empty:
+                    print("Keine Transfer-Tabelle (Stub oder Substufe fehlgeschlagen; siehe Substufen-Bericht).")
+                else:
+                    tt = tt.sort_values("layer_tgt")
+                    fig, axes = plt.subplots(1, 3, figsize=(16, 3.8))
+                    axes[0].plot(tt["layer_tgt"], tt["cos_transferred_vs_native"], "o-", label="transferierte vs. native Sprachachse")
+                    axes[0].errorbar(tt["layer_tgt"], tt["cos_null_vs_native"], yerr=tt["cos_null_std"].fillna(0), fmt="s--", color="grey",
+                                     capsize=2, label="permutierte Paare (Null)")
+                    axes[0].plot(tt["layer_tgt"], tt["cos_null_max"], ":", color="grey", label="Null-Maximum")
+                    axes[0].axhline(0.3, color="r", lw=0.8, ls="--", label="Mindesteffekt cos ≥ 0,3")
+                    axes[0].set_title("Kosinus im Zielmodell", fontsize=9)
+                    axes[1].plot(tt["layer_tgt"], tt["r2_holdout"], "o-", label="R² Hold-out")
+                    axes[1].plot(tt["layer_tgt"], tt["r2_permuted"], "s--", color="grey", label="R² permutierte Paare")
+                    axes[1].plot(tt["layer_tgt"], tt["r2_gap"], "^:", color="C2", label="Differenz (Mindestabstand 0,2)")
+                    axes[1].axhline(0.2, color="r", lw=0.8, ls="--")
+                    axes[1].set_title("Alignment-Güte (Procrustes nach PCA)", fontsize=9)
+                    w = 0.4
+                    axes[2].bar(tt["layer_tgt"] - w / 2, tt["delta_fD_transferred"], w, label="Δf_D transferierte Achse")
+                    axes[2].bar(tt["layer_tgt"] + w / 2, tt["delta_fD_native"], w, label="Δf_D native Achse")
+                    axes[2].axhline(0, color="k", lw=0.6)
+                    axes[2].set_title("Verschiebung des deutschen Anteils in Fortsetzungen", fontsize=9)
+                    for ax in axes:
+                        ax.set_xlabel("Ziel-Layer (Block-Eingang)")
+                        ax.legend(fontsize=7)
+                    savefig("transfer_test")
+                    plt.show()
+                    show(tt[["layer_tgt", "layer_src", "cos_transferred_vs_native", "z_cos_vs_null", "r2_holdout", "r2_permuted", "r2_gap",
+                             "sign_agreement", "readout_alive", "r2_gap_ok", "cos_ok", "validated"]])
+                    if len(ts):
+                        s = ts.iloc[0]
+                        print(f"Bester Layer {s['best_layer']}: validiert = {s['validated']} ({s['n_validated_layers']} von {s['n_layers']} Layern). "
+                              "Erst nach bestandener Validierung wird ein Spurenmodell als Quelle gewertet.")
+            """
+        ),
+        code(
+            """
+            # --- Layer-Matching: R² Hold-out über Quell- × Ziel-Layer; Alignments je Ziel-Layer (KV-Pflanzung) --
+            with guarded("Layer-Matching"):
+                lm = table("L", "layer_matching")
+                al = table("L", "alignments")
+                piv = lm.pivot_table(index="layer_src", columns="layer_tgt", values="r2_holdout")
+                fig, ax = plt.subplots(figsize=(0.6 * piv.shape[1] + 3, 0.5 * piv.shape[0] + 2))
+                im = ax.imshow(piv.to_numpy(dtype=float), cmap="viridis", vmin=0, vmax=1, aspect="auto")
+                ax.set_xticks(range(piv.shape[1]))
+                ax.set_xticklabels(piv.columns)
+                ax.set_yticks(range(piv.shape[0]))
+                ax.set_yticklabels(piv.index)
+                ax.set_xlabel("Ziel-Layer (Pythia)")
+                ax.set_ylabel("Quell-Layer")
+                ax.set_title("R² (Hold-out) der linearen Abbildung Quelle → Ziel", fontsize=9)
+                fig.colorbar(im, ax=ax, shrink=0.8)
+                savefig("layer_matching")
+                plt.show()
+                if len(al):
+                    print("Alignments je Ziel-Layer (pflanzen das KV-Präfix auf jedem Layer):")
+                    show(al)
+            """
+        ),
+        code(
+            """
+            # --- Transplantation: Residual-Substitution (A), KV-Pflanzung (B), beides (C) gegen die Kontrollen --
+            with guarded("Transplantation"):
+                tp = table("L", "transplant")
+                tsum = table("L", "transplant_summary")
+                modes = [m for m in ["residual", "kv", "both"] if m in set(tp["mode"])]
+                controls = [c for c in ["none", "random", "identity", "permuted_alignment"] if c in set(tp["control"])]
+                fig, axes = plt.subplots(1, 2, figsize=(12, 3.8))
+                for ax, q, lab in zip(axes, ["fD", "logp_target"], ["f_D: deutscher Anteil der Fortsetzung", "ln p(Ziel)"]):
+                    piv = tp.groupby(["mode", "control"])[q].mean().unstack("control").reindex(modes)[controls]
+                    piv.plot(kind="bar", ax=ax, width=0.8)
+                    ax.set_title(lab, fontsize=9)
+                    ax.set_xlabel("Modus (none = Transplantat; Kontrollen: random, identity, permuted_alignment)")
+                    ax.legend(fontsize=7)
+                savefig("transplant_modes")
+                plt.show()
+                if len(tsum):
+                    show(tsum)
+                    print("Vorzeichen der f_D-Verschiebung gegen die Identitätskontrolle stimmt mit der nativen Achse überein:",
+                          dict(zip(tsum["mode"], tsum["sign_agrees_with_native"])))
+            """
+        ),
+        summary_cell(),
+    ]
+
+
 BUILDERS = {
     "00_setup_and_anchor": nb_00,
     "01_baseline_and_directions": nb_01,
@@ -1604,6 +2852,12 @@ BUILDERS = {
     "03_nonequilibrium": nb_03,
     "04_tn_linear_response": nb_04,
     "05_scale_and_checkpoints": nb_05,
+    "06_geometry_trajectory": nb_06,
+    "07_lambda_dynamics": nb_07,
+    "08_compass_heads": nb_08,
+    "09_rdx_sharing": nb_09,
+    "10_ttt_injection": nb_10,
+    "11_transplant": nb_11,
 }
 
 

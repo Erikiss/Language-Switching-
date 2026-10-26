@@ -1,18 +1,21 @@
 """Command-line entry point.
 
-    python -m lsne.cli run --stage A|B|C|D|E|F|all[,...] --model EleutherAI/pythia-160m \\
+    python -m lsne.cli run --stage A|B|...|L|all[,...] --model EleutherAI/pythia-160m \\
         --revision step98000 --dtype float32 --device auto --families F01,F02 --out runs \\
         [--limit-variants N] [--limit-families N] [--smoke] [--use-sae] [--seed S] \\
-        [--pairs model@rev,...|trace|self] [--f-stages B,C,D] [--shard-index I --shard-count N]
+        [--pairs model@rev,...|trace|self] [--f-stages B,C,D] [--shard-index I --shard-count N] \\
+        [--ttt-corpus DIR] [--ttt-checkpoints step4000,step98000,step143000] \\
+        [--transplant-source rotated_self|self|model@rev] [--atlas-dir DIR]
     python -m lsne.cli merge --root runs --out merged/
 
-``run`` loads the model once, runs the requested stages in order (``all`` = A B C D E F)
-and shares the stimulus bank / direction bank between them.  Every stage is wrapped in
-``try/except``: a failing stage writes ``error.txt`` and a manifest with
-``status='error'`` into its run directory and the next stage still runs, so a Colab run
-always yields partial results.  ``--smoke`` sets every limit for a < 3 min CPU run with
-pythia-14m (one family, three variants, tiny generation budgets; stage F re-runs the
-same model/revision only).
+``run`` loads the model once, runs the requested stages in order (``all`` = A B C D E F
+G H I J K L, see docs/STAGES.md) and shares the stimulus bank / direction bank between
+them.  Every stage is wrapped in ``try/except``: a failing stage writes ``error.txt`` and
+a manifest with ``status='error'`` into its run directory and the next stage still runs,
+so a Colab run always yields partial results; stages G-L additionally capture failures
+per substage.  ``--smoke`` sets every limit for a short CPU run with pythia-14m (one
+family, three variants, tiny generation / path / training budgets; stage F re-runs the
+same model/revision only); the per-stage durations are printed at the end.
 
 ``merge`` concatenates all same-named csv files below ``--root`` (any depth, including
 the stage-F sub-run directories of all shards) into ``<out>/<name>.csv`` with the
@@ -48,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     r = sub.add_parser("run", help="run experiment stages")
-    r.add_argument("--stage", default="all", help="A|B|C|D|E|F|all or a comma-separated list (default: all)")
+    r.add_argument("--stage", default="all", help="A|B|C|D|E|F|G|H|I|J|K|L|all or a comma-separated list (default: all)")
     r.add_argument("--model", default=RunConfig().model.name)
     r.add_argument("--revision", default=RunConfig().model.revision)
     r.add_argument("--dtype", default="float32", choices=("float32", "bfloat16", "float16"))
@@ -76,6 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--f-stages", default=None, help="stage F: stages per pair (default B,C,D)")
     r.add_argument("--shard-index", type=int, default=0)
     r.add_argument("--shard-count", type=int, default=1)
+    r.add_argument("--ttt-corpus", default=None, help="stage K: corpus directory/file (default data/ttt/dao_fork; placeholder if missing)")
+    r.add_argument("--ttt-checkpoints", default=None,
+                   help="stage K: extra revisions of the memorisation table, e.g. step4000,step98000,step143000 (default: current only)")
+    r.add_argument("--transplant-source", default=None,
+                   help="stage L: rotated_self (default) | self | model@revision (HF causal LM, e.g. EleutherAI/pythia-70m@step143000)")
+    r.add_argument("--atlas-dir", default=None, help="stage I: directory with the stored atlas extraction (default data/atlas)")
     r.add_argument("--no-progress", action="store_true")
 
     m = sub.add_parser("merge", help="merge csv tables of several run directories")
@@ -156,13 +165,27 @@ def run_stages(cfg: RunConfig, limits: C.Limits, stages: Sequence[str], mb=None,
             report[st] = dict(status="error", run_dir=str(rd.path), seconds=time.perf_counter() - t0, tables=[],
                               error=repr(e))
             print(f"[lsne] stage {st} FAILED: {e!r} (see {rd.file('error.txt')})", file=sys.stderr, flush=True)
+    print(duration_summary(report), flush=True)
     return report
+
+
+def duration_summary(report: dict[str, dict]) -> str:
+    """One line per stage with its wall time and status, plus the total."""
+    lines = ["[lsne] durations:"]
+    total = 0.0
+    for st, r in report.items():
+        total += float(r.get("seconds", 0.0))
+        lines.append(f"[lsne]   {st}  {r.get('seconds', 0.0):7.1f} s  {r.get('status', '')}")
+    lines.append(f"[lsne]   total {total:5.1f} s")
+    return "\n".join(lines)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     cfg, limits = make_config(args)
     stages = parse_stages(args.stage)
-    kw = dict(axis_npz=args.axis_npz, shard_index=int(args.shard_index), shard_count=int(args.shard_count))
+    kw = dict(axis_npz=args.axis_npz, shard_index=int(args.shard_index), shard_count=int(args.shard_count),
+              ttt_corpus=args.ttt_corpus, transplant_source=args.transplant_source, atlas_dir=args.atlas_dir,
+              ttt_checkpoints=([s.strip() for s in args.ttt_checkpoints.split(",") if s.strip()] if args.ttt_checkpoints else None))
     if args.pairs:
         kw["pairs"] = parse_pairs(args.pairs, cfg)
     elif args.smoke:

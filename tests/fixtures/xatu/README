@@ -1,0 +1,61 @@
+Xatu test fixture (lsne.chain, tests/test_chain_data.py)
+=========================================================
+
+Attribution and licence
+-----------------------
+Data: ethPandaOps Xatu (https://ethpandaops.io/posts/xatu-execution-layer/), Ethereum
+mainnet canonical execution tables, licensed under the Creative Commons Attribution 4.0
+International licence (CC BY 4.0, https://creativecommons.org/licenses/by/4.0/).
+Attribution: "ethPandaOps Xatu".
+Changes: the files below are row subsets of the original chunks (pyarrow Table.filter,
+original Arrow schemas kept, re-written with zstd compression); no values were modified.
+
+Source chunks (downloaded 25.10.2026)
+-------------------------------------
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_traces/1000/1718000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_native_transfers/1000/1718000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_logs/1000/1718000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_storage_diffs/1000/1718000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_traces/1000/1920000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_transaction/1000/1920000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_native_transfers/1000/1920000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_erc20_transfers/1000/1920000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_logs/1000/1920000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_storage_diffs/1000/1920000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_storage_reads/1000/1920000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_block/1000/1920000.parquet
+
+File layout is the lsne.chain.xatu cache layout
+(canonical_execution_<table>_<start>.parquet), so
+lsne.chain.xatu.load_chunk_rows(<start>, "tests/fixtures/xatu") reads it directly.
+Chunk 1718000 has no transaction / erc20_transfers / storage_reads / block files on
+purpose: it exercises the "no transaction row" path of build_records
+(gas_source = "trace_estimate").
+
+Selected rows
+-------------
+Chunk 1718000 (eras: block >= 1 718 497 is "drain_crisis"):
+  0x0ec3f2488a93839524add10ea229e773f6bc891b4eb4794c3337d4495263790b  DAO drain, block 1718497:
+      81 trace nodes, call depth 28, 81 native transfer rows (6 senders, 9 receivers,
+      2 597.76 ETH), 31 logs, 32 storage diffs
+  0x61db76fc3fe109ad548d91d321daf76dc2ef2f683dc3c4006377d1da8629e274  plain ETH transfer (block 1718497)
+  0x877db25210ca8be928280112b8b3b4a3afced1d35eb8cd795ac730c7e89d88a3  plain ETH transfer (block 1718497)
+  0x6cfc521f930715518e1aba42d0c414d099bec56bd719649c263c0d2b68be2da2  contract call with log + storage (1718591)
+  0x124532e6294dc3e2ad55d0bdb6039ad562d1874f36cbc4610e9c0dab43e79af0  19 nodes, fan-out 7 (1718786)
+
+Chunk 1920000 (fork block 1 920 000; "fork" era 1920000-1920009, "post_fork" after):
+  0x6f75b64d9364b71b43cde81a889f95df72e6be004b28477f9083ed0ee471a7f9  plain transfer in the fork block
+  0xf088dda9ba4a859d73a2ab760be508a6859b493685ff58ffd7f7e45b316caf50  WithdrawDAO.withdraw(), 164 ETH refund (1920010)
+  0x2fffeca979da48f1cf416b136ebf966c2319e55470700e9271df356c6e9b71c6  WithdrawDAO.withdraw(), fails (1920013)
+  0x21d7e78b330072bffe43e26d8d5571bc45691b7d14a454f4d7871c61a58b4414  out of gas (1920032)
+  0x3de72d0e7a6d07ca735b85c0d099f351b8da3d52be0f200417dd9aa3a350e9c5  contract creation (1920036)
+  0x9ab5dcb1ee22a97e6e81987e199939e36576b59ca1d009d79294c66d599b5891  ERC-20 transfer (1920073)
+  0x29c0938e0933990d9965c64130c89189501b6a531d5a53ad4d907c9c698052f6  call_code (1920122)
+  0x798af2597c979e2a218d7a7b8067fa48913c88cfa82e7bafa2dc3120317310e7  suicide (1920137)
+  0xa1fafc6fd9351e7921147d8ddbac1fe169d34cd7baadb2f5cbee69a5f527cd2b  13 nodes, fan-out 5 (1920247)
+  block-level reward row of block 1920000 (traces + native_transfers; transaction_hash is
+  "0x" followed by 64 zero bytes)
+  block rows of the 9 blocks above (block 1920000 has extra_data_string "dao-hard-fork")
+
+Regenerate with
+  python -I tests/fixtures/xatu/cut_fixture.py <dir with the full chunks> tests/fixtures/xatu

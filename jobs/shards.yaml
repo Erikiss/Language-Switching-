@@ -5,8 +5,14 @@
 # with `python -m lsne.cli merge --root <out> --out <out>/merged`.
 #
 # Conventions
-#   * `--stage A,B,C,D,E` (not `all`) for the core arms: `all` would also run stage F,
-#     which re-runs B/C/D over the State-2143 checkpoints that shards 1-2 cover already.
+#   * `--stage A,B,C,D,E,G,H,I,J,K,L` (not `all`) for the core arms: `all` would also run
+#     stage F, which re-runs B/C/D over the State-2143 checkpoints that shards 1-2 cover
+#     already.  Stages G-L (docs/STAGES.md): local geometry / trajectory, lambda
+#     dynamics, domain compass + heads, RDX + Pile difficulty + sharing, test-time
+#     training, cross-model transplant.  Stage K reads the client's DAO-fork corpus from
+#     `data/ttt/dao_fork` (controls `data/ttt/neutral`, `data/ttt/nofork`; placeholder +
+#     flag when absent), stage I the atlas extraction from `data/atlas` (optional), stage L
+#     uses the rotated-self stand-in unless `--transplant-source model@rev` is given.
 #   * Stage F partitions the (model, revision, family) triples deterministically with
 #     `--shard-index/--shard-count`; shard 4 and shard 6 use it with count 1 (one GPU
 #     each) - split them further by raising `--shard-count` if more GPUs become free.
@@ -24,8 +30,11 @@
 #     EleutherAI/sae-pythia-160m-32k (hookpoint layers.10 = block input 11).  FVU is
 #     measured and recorded (certified only for FVU <= 0.4, DESIGN section 3).
 #
-# Estimated wall time per shard on one A100 (DESIGN section 7): 1-3 h for shards 1-3 and
-# 5, 2-4 h for shard 4 (27 checkpoints x B/D limited), 3-6 h for shard 6.
+# Estimated wall time per shard on one A100 (DESIGN section 7): 1-3 h for the stages A-E
+# of shards 1-3 and 5 plus 1-2 h for G-L (stage H dominates: ~110k forward/backward
+# passes of the lambda paths at the full budget; stage J fetches 2 000 Pile sequences by
+# range request, cached under LSNE_CACHE/pile_nll), 2-4 h for shard 4 (27 checkpoints x
+# B/D limited), 3-6 h for shard 6, 1-2 h for shard 7 (three checkpoints x TTT).
 
 version: 1
 package: lsne
@@ -45,36 +54,39 @@ shards:
   - id: 1
     account: colab-A
     gpu: A100-1
-    purpose: core arm, State-2143 intervention checkpoint step98000, all stages A-E
+    purpose: core arm, State-2143 intervention checkpoint step98000, stages A-E and G-L
     model: EleutherAI/pythia-160m
     revision: step98000
-    stages: [A, B, C, D, E]
+    stages: [A, B, C, D, E, G, H, I, J, K, L]
     command: >-
-      python -m lsne.cli run --stage A,B,C,D,E --model EleutherAI/pythia-160m --revision step98000
+      python -m lsne.cli run --stage A,B,C,D,E,G,H,I,J,K,L --model EleutherAI/pythia-160m --revision step98000
       --dtype float32 --device auto --out /content/drive/MyDrive/LSNE/runs --seed 0
+      --ttt-corpus data/ttt/dao_fork --transplant-source EleutherAI/pythia-70m@step143000
 
   - id: 2
     account: colab-A
     gpu: A100-2
-    purpose: core arm, State-2143 intervention checkpoint step99000, all stages A-E
+    purpose: core arm, State-2143 intervention checkpoint step99000, stages A-E and G-L
     model: EleutherAI/pythia-160m
     revision: step99000
-    stages: [A, B, C, D, E]
+    stages: [A, B, C, D, E, G, H, I, J, K, L]
     command: >-
-      python -m lsne.cli run --stage A,B,C,D,E --model EleutherAI/pythia-160m --revision step99000
+      python -m lsne.cli run --stage A,B,C,D,E,G,H,I,J,K,L --model EleutherAI/pythia-160m --revision step99000
       --dtype float32 --device auto --out /content/drive/MyDrive/LSNE/runs --seed 0
+      --ttt-corpus data/ttt/dao_fork --transplant-source EleutherAI/pythia-70m@step143000
 
   - id: 3
     account: colab-A
     gpu: A100-3
-    purpose: SAE arm, final checkpoint step143000 with SAE feature directions (sae_D*/sae_E*), stages A-E
+    purpose: SAE arm, final checkpoint step143000 with SAE feature directions (sae_D*/sae_E*), stages A-E and G-L (stages H/J/K use the SAE)
     model: EleutherAI/pythia-160m
     revision: step143000
-    stages: [A, B, C, D, E]
+    stages: [A, B, C, D, E, G, H, I, J, K, L]
     sae: EleutherAI/sae-pythia-160m-32k (layers.10)
     command: >-
-      python -m lsne.cli run --stage A,B,C,D,E --model EleutherAI/pythia-160m --revision step143000
+      python -m lsne.cli run --stage A,B,C,D,E,G,H,I,J,K,L --model EleutherAI/pythia-160m --revision step143000
       --dtype float32 --device auto --out /content/drive/MyDrive/LSNE/runs --seed 0 --use-sae
+      --ttt-corpus data/ttt/dao_fork --transplant-source EleutherAI/pythia-70m@step143000
 
   - id: 4
     account: colab-B
@@ -119,7 +131,20 @@ shards:
       --pairs EleutherAI/pythia-1b@step143000,EleutherAI/pythia-1.4b@step143000
       --f-stages B,C,D --c-levels C1 --shard-index 0 --shard-count 1
 
-# Smoke test of the whole pipeline on a CPU (same command the test suite runs; < 3 min):
+  - id: 7
+    account: colab-B
+    gpu: any free A100 (after shard 4 or 6)
+    purpose: test-time training over the dossier checkpoints (memorisation speed at 4k / 98k / 143k, DESIGN 4.8d), stage K only
+    model: EleutherAI/pythia-160m
+    revision: step98000
+    stages: [K]
+    command: >-
+      python -m lsne.cli run --stage K --model EleutherAI/pythia-160m --revision step98000
+      --dtype float32 --device auto --out /content/drive/MyDrive/LSNE/runs_ttt --seed 0
+      --ttt-corpus data/ttt/dao_fork --ttt-checkpoints step4000,step98000,step143000
+
+# Smoke test of the whole pipeline on a CPU (same command the test suite runs; A-L in
+# ~2 min unloaded on a 4-core box, < 10 min budget):
 smoke:
   command: >-
     python -m lsne.cli run --stage all --model EleutherAI/pythia-14m --revision step98000

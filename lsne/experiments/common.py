@@ -90,7 +90,7 @@ SMOKE_GL: dict = dict(
     h_discriminants=("target_logit", "probe", "sae_feature"),
     i_doses=(0.1,), i_n_templates=1, i_max_words=6, i_head_eps=(0.5,), i_n_random_profile=4,
     j_n_pile=3, j_pile_max_len=64, j_n_random_bases=4, j_n_pca=4, j_max_variants_per_group=4, j_max_sites=2,
-    k_seq_len=32, k_max_docs=4, k_max_snippets=2, k_mem_steps=3, k_mem_lr=1e-3, k_train_steps=3, k_train_lr=1e-3,
+    k_seq_len=32, k_max_docs=4, k_max_snippets=2, k_mem_steps=3, k_mem_lr=1e-3, k_train_steps=3, k_train_lr=3e-4,
     k_train_batch=2, k_checkpoints=None, k_eps=0.1,
     l_source="rotated_self", l_n_texts=12, l_n_prompts=1, l_n_prefix=2, l_eps=1.0, l_n_null=3,
     synthetic_sae_if_missing=True, synthetic_sae_latents=64,

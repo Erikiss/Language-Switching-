@@ -5,7 +5,15 @@ valid nbformat v4 document with at least six cells, that every code cell compile
 the shared skeleton (setup / Drive / configuration / stage run / summary) is present, and
 that the committed notebooks are identical to the regenerated ones (normalised JSON:
 outputs and execution counts ignored) so that they can never drift from the generator.
-No notebook is executed here (they clone the repository and load models).
+
+The stage G-L notebooks (06-11) must additionally carry the pre-registration paragraph,
+the substage report and the stage-specific keyword arguments of their ``run()``.
+
+``test_notebook_runs_headless_in_smoke_mode`` (marked ``slow``) executes notebooks 00 and
+06 with ``SMOKE = True`` (pythia-14m, DEV01) through nbclient inside this checkout: every
+cell must run without an uncaught error, the stage manifest must say ``ok`` and the
+summary json / figures must be written below ``$LSNE_RUNS``.  It is skipped when no
+Jupyter kernel can be started.
 """
 from __future__ import annotations
 
@@ -28,7 +36,28 @@ EXPECTED = [
     "03_nonequilibrium",
     "04_tn_linear_response",
     "05_scale_and_checkpoints",
+    "06_geometry_trajectory",
+    "07_lambda_dynamics",
+    "08_compass_heads",
+    "09_rdx_sharing",
+    "10_ttt_injection",
+    "11_transplant",
 ]
+STAGE_OF = {"00": "A", "01": "B", "02": "C", "03": "D", "04": "E", "05": "F",
+            "06": "G", "07": "H", "08": "I", "09": "J", "10": "K", "11": "L"}
+#: stage-specific keyword arguments every G-L notebook passes to run_stage()
+STAGE_KWARGS = {"08": ["atlas_dir="], "10": ["ttt_corpus=", "ttt_checkpoints="], "11": ["transplant_source="]}
+#: tables of the stage that the notebook's plot cells must read (docs/STAGES.md)
+STAGE_TABLES = {
+    "G": ["g0_gate", "pair_ordering", "depth_trajectory", "contraction_boot", "position_traj", "steering", "steering_boot", "coupling"],
+    "H": ["lambda_paths", "lambda_steps", "lambda_boot", "lambda_features_summary", "lambda_original"],
+    "I": ["compass", "compass_summary", "atlas_overlap", "domain_axes", "direction_domain", "direction_domain_boot", "head_effects",
+          "worst_head", "head_steering", "head_steering_boot"],
+    "J": ["pile_ranking", "pile_rank_check", "rdx", "rdx_summary", "rdx_stability", "sharing"],
+    "K": ["ttt_corpora", "ttt_memorisation", "ttt_memorisation_boot", "ttt_training", "ttt_effects"],
+    "L": ["transfer_test", "transfer_summary", "layer_matching", "alignments", "transplant", "transplant_summary"],
+}
+HEADLESS = ["00_setup_and_anchor", "06_geometry_trajectory"]
 
 
 @pytest.fixture(scope="module")
@@ -58,10 +87,15 @@ def _normalised(nb: nbformat.NotebookNode) -> dict:
     return d
 
 
+def _code(nb: nbformat.NotebookNode) -> str:
+    return "\n".join(c.source for c in nb.cells if c.cell_type == "code")
+
+
 def test_generator_covers_all_notebooks(builder):
     assert list(builder.NOTEBOOKS) == EXPECTED
     assert set(builder.BUILDERS) == set(EXPECTED)
-    assert [builder.NOTEBOOKS[s][0] for s in EXPECTED] == ["A", "B", "C", "D", "E", "F"]
+    assert [builder.NOTEBOOKS[s][0] for s in EXPECTED] == list("ABCDEFGHIJKL")
+    assert [STAGE_OF[s[:2]] for s in EXPECTED] == list("ABCDEFGHIJKL")
 
 
 @pytest.mark.parametrize("stem", EXPECTED)
@@ -80,6 +114,7 @@ def test_regenerated_notebook_is_valid(regenerated, stem):
         assert c.outputs == [] and c.execution_count is None
     ids = [c["id"] for c in nb.cells]
     assert ids == [f"cell-{i:02d}" for i in range(len(nb.cells))]   # deterministic ids
+    assert nb.metadata["lsne"]["stage"] == STAGE_OF[stem[:2]]
 
 
 @pytest.mark.parametrize("stem", EXPECTED)
@@ -89,7 +124,7 @@ def test_notebook_skeleton(regenerated, stem):
     head = nb.cells[0]
     assert head.cell_type == "markdown"
     assert "Dossier-Stufe" in head.source and "Zweck" in head.source and "Ausgaben" in head.source
-    src = "\n".join(c.source for c in nb.cells if c.cell_type == "code")
+    src = _code(nb)
     assert "https://github.com/Erikiss/Language-Switching-.git" in src
     assert "claude/language-switching-non-equilibrium-ejpz0q" in src
     assert "/content/lsne-repo" in src and "requirements.txt" in src and "pip install -q -e ." in src
@@ -98,13 +133,38 @@ def test_notebook_skeleton(regenerated, stem):
     assert "SMOKE" in src and "FAMILIES" in src and "DTYPE" in src
     assert "traceback" in src and "summary_" in src and "json.dump" in src
     assert "python -m lsne.cli run" in src
-    stage = {"00": "A", "01": "B", "02": "C", "03": "D", "04": "E", "05": "F"}[stem[:2]]
+    stage = STAGE_OF[stem[:2]]
     if stage != "F":
         assert f'run_stage("{stage}"' in src
-        assert "cluster_bootstrap" in src or stage in ("A", "B", "E")
+        assert "cluster_bootstrap" in src or stage in ("A", "B", "E") or stage in "GHIJKL"
+        assert "savefig(" in src and "plt.show()" in src
     else:
         assert "shards.yaml" in src and "SHARD" in src and "manifest_ok" in src and "merge_runs" in src
     assert "MODEL" in src or stage == "F"
+
+
+@pytest.mark.parametrize("stem", EXPECTED[6:])
+def test_stage_g_to_l_notebooks(regenerated, stem):
+    """06-11: pre-registration paragraph, docs/STAGES.md reference, substage report, the
+    stage's own keyword arguments and every key table of docs/STAGES.md read by a cell."""
+    nb = nbformat.read(regenerated / f"{stem}.ipynb", as_version=4)
+    stage = STAGE_OF[stem[:2]]
+    head = nb.cells[0].source
+    assert "**Präregistrierung.**" in head and "docs/STAGES.md" in head and "Kontrast" in head
+    src = _code(nb)
+    assert "def substage_report(" in src and f'substage_report("{stage}")' in src and "def truthy(" in src
+    assert f"--stage {stage} " in src                     # the CLI equivalent of the stage run
+    for kw in STAGE_KWARGS.get(stem[:2], []):
+        assert kw in src, f"{stem}: run_stage() must pass {kw}"
+    for name in STAGE_TABLES[stage]:
+        assert f'table("{stage}", "{name}")' in src, f"{stem}: table {name!r} of stage {stage} is never read"
+    # the parameter cell of the user-supplied inputs (docs/STAGES.md "Inputs the user supplies")
+    if stage == "I":
+        assert "ATLAS_DIR" in src and "data/atlas" in "\n".join(c.source for c in nb.cells)
+    if stage == "K":
+        assert "TTT_CORPUS" in src and "TTT_CHECKPOINTS" in src and "is_placeholder" in src and "WITH_CONTEXT_STAGES" in src
+    if stage == "L":
+        assert "TRANSPLANT_SOURCE" in src and "rotated_self" in src and "stub" in src
 
 
 def test_committed_notebooks_equal_regenerated(builder, regenerated):
@@ -135,3 +195,76 @@ def test_check_mode_detects_drift(builder, tmp_path):
     r = subprocess.run([sys.executable, str(SCRIPT), "--check", "--out", str(tmp_path)], capture_output=True,
                        text=True, cwd=str(REPO), timeout=120)
     assert r.returncode == 1
+
+
+# --------------------------------------------------------------------------------------
+# headless execution (slow)
+# --------------------------------------------------------------------------------------
+def _cell_text(cell) -> str:
+    parts = []
+    for o in cell.get("outputs", []):
+        if o.get("output_type") == "stream":
+            parts.append(o.get("text", ""))
+        elif o.get("output_type") == "error":
+            parts.append("\n".join(o.get("traceback", [])))
+        elif "data" in o:
+            parts.append(o["data"].get("text/plain", ""))
+    return "\n".join(parts)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("stem", HEADLESS)
+def test_notebook_runs_headless_in_smoke_mode(regenerated, stem, tmp_path, monkeypatch):
+    """Execute the notebook with SMOKE = True through nbclient (kernel cwd = this checkout)."""
+    nbclient = pytest.importorskip("nbclient")
+    pytest.importorskip("ipykernel")
+    from nbclient.exceptions import CellExecutionError, CellTimeoutError
+
+    nb = nbformat.read(regenerated / f"{stem}.ipynb", as_version=4)
+    n_sub = 0
+    for c in nb.cells:
+        if c.cell_type == "code" and "SMOKE = False" in c.source:
+            c.source = c.source.replace("SMOKE = False", "SMOKE = True")
+            n_sub += 1
+    assert n_sub == 1, f"{stem}: the configuration cell must set SMOKE once"
+    out_root = tmp_path / "lsne_out"
+    monkeypatch.setenv("LSNE_RUNS", str(out_root))                 # drive_root() outside Colab
+    monkeypatch.setenv("LSNE_CACHE", str(REPO / "cache"))          # anchor / unigram caches of the checkout
+    monkeypatch.delenv("LSNE_REPO_DIR", raising=False)
+    client = nbclient.NotebookClient(nb, timeout=1800, kernel_name="python3", allow_errors=False,
+                                     resources={"metadata": {"path": str(REPO)}})
+    started = False
+    try:
+        with client.setup_kernel():
+            started = True
+            client.reset_execution_trackers()
+            for i, cell in enumerate(nb.cells):
+                client.execute_cell(cell, i)
+    except (CellExecutionError, CellTimeoutError) as e:
+        pytest.fail(f"{stem}: {e}")
+    except Exception as e:  # noqa: BLE001 - no kernel on this machine
+        if not started:
+            pytest.skip(f"no Jupyter kernel could be started: {e!r}")
+        raise
+
+    stage = STAGE_OF[stem[:2]]
+    text = "\n".join(_cell_text(c) for c in nb.cells if c.cell_type == "code")
+    assert "FEHLGESCHLAGEN" not in text, text[-3000:]       # run_stage() reports a stage failure that way
+    assert "Vorhandener Checkout" in text and "SMOKE: True" in text
+    manifest = out_root / "runs" / stage / "pythia-14m@step98000" / "manifest.json"
+    assert manifest.exists(), f"{stem}: no manifest for stage {stage} below {out_root}"
+    m = json.loads(manifest.read_text(encoding="utf-8"))
+    assert m["status"] == "ok" and m["tables"]
+    if stage in "GHIJKL":
+        assert m["substages"]["n_failed"] == 0, m["substages"]["errors"]
+        assert "übersprungen" not in text, text[-3000:]      # every plot cell must work on the smoke tables
+    summaries = list(out_root.glob(f"summary_{stem}_*.json"))
+    assert len(summaries) == 1, f"{stem}: summary json missing below {out_root}"
+    s = json.loads(summaries[0].read_text(encoding="utf-8"))
+    assert s["smoke"] is True and s["stage"] == stage and s["report"][stage]["status"] == "ok"
+    assert s["tables"][stage] == m["tables"]
+    figures = sorted(p.name for p in (out_root / "figures" / stem).glob("*.png"))
+    assert figures and figures == s["figures"]
+    n_png = sum(1 for c in nb.cells if c.cell_type == "code"
+                for o in c.get("outputs", []) if "data" in o and "image/png" in o["data"])
+    assert n_png >= len(figures)
