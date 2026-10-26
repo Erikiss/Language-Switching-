@@ -346,7 +346,10 @@ def test_smoke_stage_g_geometry(smoke_run):
     cp = _csv(out, "G", "coupling")
     assert set(cp["partner"]) == {"lambda", "kl"} and (cp["n"] >= 3).all() and cp["rho"].dropna().between(-1, 1).all()
     gm = _manifest(out, "G")
-    assert gm["stage_d_available"] and gm["g0_gate"]["degenerate"] and set(gm["steering_sites"]) == {"L5.block_input", "L2.block_input"}
+    # the manifest mirrors the gate row (rank capped at (N-1)//4; a degenerate gate has no verdict)
+    g0 = gm["g0_gate"]
+    assert gm["stage_d_available"] and set(gm["steering_sites"]) == {"L5.block_input", "L2.block_input"}
+    assert int(g0["r"]) == max(1, (int(g0["n_states"]) - 1) // 4) and (g0["pass_all"] is None) == bool(g0["degenerate"])
 
 
 def test_smoke_stage_h_lambda(smoke_run):
