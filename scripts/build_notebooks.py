@@ -232,13 +232,23 @@ def drive_cell() -> tuple[str, str]:
     return code(
         """
         # --- Google Drive einbinden (außerhalb von Colab wird lokal geschrieben) ---------------
+        # On Colab the results MUST go to Drive: a refused or failed mount stops the notebook
+        # here (the local disk of the runtime is deleted with the session).  Outside Colab, or
+        # with LSNE_ALLOW_LOCAL=1, the outputs go to $LSNE_RUNS or ./runs.
         import os
+        import pathlib
 
         try:
             from google.colab import drive            # type: ignore
-            drive.mount("/content/drive")
-        except Exception as e:                        # not on Colab, or the mount was refused
-            print("Kein Colab-Drive:", repr(e).split("(")[0], "-> lokale Ausgabe")
+        except ImportError:                           # not on Colab
+            drive = None
+            print("Kein Colab -> lokale Ausgabe")
+        if drive is not None and os.environ.get("LSNE_ALLOW_LOCAL") != "1":
+            drive.mount("/content/drive")             # confirm the permission dialog in this tab
+            if not pathlib.Path("/content/drive/MyDrive").is_dir():
+                raise RuntimeError("Google Drive ist nicht eingebunden: die Ergebnisse würden nur auf der "
+                                   "Laufzeit liegen und mit ihr gelöscht. Diese Zelle erneut ausführen und den "
+                                   "Drive-Zugriff im Dialog erlauben.")
 
         from lsne.io import drive_root
 
