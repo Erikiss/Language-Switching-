@@ -17,19 +17,36 @@ yields fewer than ``min_pairs`` pairs the matching falls back to era only, and t
 table records which matching was used and the standardized mean difference of gas
 (``gas_smd``, ``log_gas_smd``) between the matched positives and negatives.
 
+**Length-matched probe sets** (round 2, docs/TRACE_SOURCE.md "Kontrollierte Sonden"):
+``probe_sets(..., match="length")`` pairs every positive with a negative of the same era
+whose ITR token count lies within a factor ``length_ratio`` (default 1.25, i.e.
+``|log n_pos - log n_neg| <= log 1.25``), nearest length first, without replacement.  The
+first run showed that gas-decile matching leaves the high fan-out positives 12x longer than
+their negatives, so a fan-out "direction" was a length direction.  Balance is reported as
+standardized mean differences (``length_smd`` on log token count, ``n_tokens_smd``,
+``gas_smd``, ``log_gas_smd``; all available covariates in ``match_table.attrs["balance"]``).
+
+**Identity masking** (:func:`mask_tokens`): the DAO probe separated the sets through the
+DAO address tokens themselves (always in the vocabulary).  ``mask_tokens(tokens, "dao")``
+replaces the four DAO identities (DAO, extraBalance, creator, WithdrawDAO) by ``[A_OOV]``
+before encoding, in *both* sets, so the separation has to come from context;
+``"all_addresses"`` replaces every address token (stricter: also removes the ``[A_OOV]``
+count difference the DAO masking itself creates).
+
 **Surface baseline** (:func:`surface_baseline_auc`): split-half AUC of trivial length /
 count statistics of the token sequence (token count, ``[CALL]`` count, ``V:`` token count,
-value-carrying calls), with exactly the split of :func:`lsne.chain.source.holdout_auc`, so a
-sharing direction can be compared with what length and counts alone achieve.
+value-carrying calls; optionally the ``[A_OOV]`` count), with exactly the split of
+:func:`lsne.chain.source.holdout_auc`, so a sharing direction can be compared with what
+length and counts alone achieve.
 """
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Iterable, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
 
-from .itr import TxRecord, iter_nodes
+from .itr import TxRecord, iter_nodes, serialize
 
 DAO_ADDRESSES = {"dao": "0xbb9bc244d798123fde783fcc1c72d3bb8c189413",
                  "extra_balance": "0x807640a13483f8ac783c557fcdf27be11ea4ac7a",
@@ -42,7 +59,16 @@ ERAS = tuple(ERA_BOUNDS)
 LABELS = ("distribution", "pooling", "many_to_many", "single", "none", "other")
 FAN_DEFINITION = "value_gt_0"
 SURFACE_FEATURES = ("n_tokens", "n_call", "n_value_tokens", "n_value_calls_nonzero")
+#: surface features for masked probes: the ``[A_OOV]`` count is a shortcut masking can create
+SURFACE_FEATURES_OOV = SURFACE_FEATURES + ("n_a_oov",)
+LENGTH_RATIO = 1.25
+MATCH_KINDS = ("gas", "length")
+MASKS = ("none", "dao", "all_addresses")
+MASK_TOKEN = "[A_OOV]"
+#: covariates whose balance (SMD) is reported for matched probe sets when available
+BALANCE_COVARIATES = ("n_tokens", "gas_used", "n_nodes", "n_value_calls", "max_depth", "n_state_writes")
 _DAO_SET = frozenset(DAO_ADDRESSES.values())
+_DAO_TOKENS = frozenset(f"A:{a}" for a in DAO_ADDRESSES.values())
 
 
 def era_of(block: int) -> str:
@@ -199,9 +225,76 @@ def _match_pairs(pool: pd.DataFrame, gas_bins: int, rng: np.random.Generator) ->
     return pairs
 
 
+def _match_pairs_length(pool: pd.DataFrame, ratio: float, rng: np.random.Generator, length_col: str) -> tuple:
+    """1:1 nearest-length matching within era with a caliper ``|log n_pos - log n_neg| <= log ratio``.
+
+    Negatives of equal length form one bucket whose members are drawn in a seeded random
+    order (many simple transactions share a token count); positives are processed in order
+    of increasing number of admissible negatives (hardest first, ties in seeded random
+    order), each takes a member of the nearest non-empty length bucket inside the caliper.
+    Returns ``(pairs, n_unmatched)`` with pairs ``(era, -1, pos_index, neg_index)``."""
+    caliper = float(np.log(float(ratio))) + 1e-12
+    pairs, n_unmatched = [], 0
+    for era, grp in pool.groupby("era", sort=True):
+        P = grp[grp["_pos"]]
+        Q = grp[~grp["_pos"]]
+        if P.empty:
+            continue
+        if Q.empty:
+            n_unmatched += len(P)
+            continue
+        qlen = np.maximum(Q[length_col].to_numpy(float), 1.0)
+        uniq, inv = np.unique(qlen, return_inverse=True)
+        log_u = np.log(uniq)
+        qidx = Q.index.to_numpy()
+        counts = np.bincount(inv, minlength=len(uniq))
+        cum = np.concatenate([[0], np.cumsum(counts)])
+        grouped = qidx[np.argsort(inv, kind="stable")]
+        buckets = [list(rng.permutation(grouped[cum[j]:cum[j + 1]])) for j in range(len(uniq))]
+        plog = np.log(np.maximum(P[length_col].to_numpy(float), 1.0))
+        lo = np.searchsorted(log_u, plog - caliper, side="left")
+        hi = np.searchsorted(log_u, plog + caliper, side="right")
+        n_cand = cum[hi] - cum[lo]
+        order = np.lexsort((rng.permutation(len(P)), n_cand))      # fewest candidates first, random ties
+        pidx = P.index.to_numpy()
+        for i in order:
+            js = np.arange(lo[i], hi[i])
+            best = None
+            for j in js[np.argsort(np.abs(log_u[js] - plog[i]), kind="stable")]:
+                if buckets[j]:
+                    best = j
+                    break
+            if best is None:
+                n_unmatched += 1
+                continue
+            pairs.append((era, -1, int(pidx[i]), int(buckets[best].pop())))
+    return pairs, n_unmatched
+
+
+def balance_table(pos_df: pd.DataFrame, neg_df: pd.DataFrame,
+                  covariates: Sequence[str] = BALANCE_COVARIATES) -> dict:
+    """Standardized mean differences (positives minus negatives) of matched sets for every
+    available covariate, plus the log-scale SMD for the heavy-tailed counts
+    (``log_<cov>`` = SMD of ``log(max(x, 1))``) and the means of both sides."""
+    out = {}
+    for c in covariates:
+        if c not in pos_df.columns or c not in neg_df.columns:
+            continue
+        a = pos_df[c].to_numpy(float)
+        b = neg_df[c].to_numpy(float)
+        out[c] = dict(smd=standardized_mean_difference(a, b),
+                      log_smd=standardized_mean_difference(np.log(np.maximum(a, 1.0)), np.log(np.maximum(b, 1.0))),
+                      mean_pos=float(np.mean(a)) if len(a) else float("nan"),
+                      mean_neg=float(np.mean(b)) if len(b) else float("nan"),
+                      median_pos=float(np.median(a)) if len(a) else float("nan"),
+                      median_neg=float(np.median(b)) if len(b) else float("nan"))
+    return out
+
+
 def probe_sets(records: Sequence[TxRecord], labels_df: Optional[pd.DataFrame], kind: str, n: int,
                seed: int = 0, k: int = 5, eras: Optional[Sequence[str]] = None, gas_bins: int = 10,
-               min_pairs: Optional[int] = None):
+               min_pairs: Optional[int] = None, match: str = "gas", length_ratio: float = LENGTH_RATIO,
+               length_col: str = "n_tokens", length_cap: Optional[int] = None):
     """Matched positive / negative record sets for a sharing probe.
 
     * ``kind="fanout"``: positives ``fan_out_eth >= k``, negatives ``fan_out_eth == 1``
@@ -209,21 +302,39 @@ def probe_sets(records: Sequence[TxRecord], labels_df: Optional[pd.DataFrame], k
     * ``kind="dao"``: positives ``dao_involved``, negatives not, restricted to ``eras``
       (default ``("drain_crisis", "post_fork")``).
 
-    Pairs are matched 1:1 within (era, gas_used decile) strata (deciles over the candidate
-    pool; inside a stratum the sampled members are paired by gas rank).  When that yields
-    fewer than ``min_pairs`` pairs (default ``min(n, 20)``) the matching falls back to era
-    only (``gas_bins=1`` requests era-only matching directly).  At most ``n`` pairs, sampled
-    with ``seed``.  Returns ``(positive, negative, match_table)``; ``match_table`` columns:
-    pair, era, gas_decile, pos_tx, neg_tx, pos_gas, neg_gas, pos_fan_out_eth,
-    neg_fan_out_eth, pos_dao_involved, neg_dao_involved, matching ("era+gas_decile" or
-    "era_only"), gas_smd and log_gas_smd (standardized mean difference of gas_used resp.
-    log gas_used, positives minus negatives, over all matched pairs; the same value in every
-    row; also in ``match_table.attrs``).
+    ``match="gas"`` (default, the spec): pairs are matched 1:1 within (era, gas_used decile)
+    strata (deciles over the candidate pool; inside a stratum the sampled members are paired
+    by gas rank).  When that yields fewer than ``min_pairs`` pairs (default ``min(n, 20)``)
+    the matching falls back to era only (``gas_bins=1`` requests era-only matching directly).
+
+    ``match="length"``: 1:1 within era on the log ITR token count (column ``length_col`` of
+    ``labels_df``, computed by serialising the records when absent; ``length_cap`` matches
+    on ``min(n_tokens, cap)``, the length the model sees), caliper
+    ``|log n_pos - log n_neg| <= log(length_ratio)``, nearest length first, without
+    replacement (:func:`_match_pairs_length`); positives without an admissible negative stay
+    unmatched (counted in ``attrs["n_pos_unmatched"]``) -- there is no silent fallback.
+
+    At most ``n`` pairs, sampled with ``seed``.  Returns ``(positive, negative,
+    match_table)``; ``match_table`` columns: pair, era, gas_decile (-1 for length matching),
+    pos_tx, neg_tx, pos_gas, neg_gas, pos_fan_out_eth, neg_fan_out_eth, pos_dao_involved,
+    neg_dao_involved, matching ("era+gas_decile", "era_only" or "era+log_length"), gas_smd
+    and log_gas_smd (standardized mean difference of gas_used resp. log gas_used, positives
+    minus negatives, over all matched pairs; the same value in every row), and when token
+    counts are available pos_n_tokens, neg_n_tokens, length_smd (SMD of log token count) and
+    n_tokens_smd.  ``match_table.attrs`` repeats the summary values and holds ``balance``
+    (:func:`balance_table` over the available covariates), the pool sizes and the matching
+    parameters.
     """
+    if match not in MATCH_KINDS:
+        raise ValueError(f"match must be one of {MATCH_KINDS}, got {match!r}")
     records = list(records)
     df = labels_frame(records, k=k) if labels_df is None else labels_df.copy()
     if len(df) != len(records):
         raise ValueError("labels_df must have one row per record (same order)")
+    if match == "length" and length_col not in df.columns:
+        if not all(isinstance(r, TxRecord) for r in records):
+            raise ValueError(f"length matching needs a {length_col!r} column in labels_df (or TxRecord records)")
+        df[length_col] = [len(serialize(r)) for r in records]
     if "n_call_targets" not in df.columns and "fan_out_eth_pos" in df.columns:
         raise ValueError("labels_df comes from an older serialisation whose fan_out_eth counted zero-value call "
                          "rows; re-run `python -m lsne.chain.cli serialize ... --overwrite`")
@@ -255,34 +366,95 @@ def probe_sets(records: Sequence[TxRecord], labels_df: Optional[pd.DataFrame], k
     min_pairs = min(int(n), 20) if min_pairs is None else int(min_pairs)
     rng = np.random.default_rng(int(seed))
     gas_bins = max(1, int(gas_bins))
-    matching = "era+gas_decile" if gas_bins > 1 else "era_only"
-    pairs = _match_pairs(pool, gas_bins, rng)
-    if gas_bins > 1 and len(pairs) < min_pairs:
-        era_pairs = _match_pairs(pool, 1, np.random.default_rng(int(seed)))
-        if len(era_pairs) > len(pairs):
-            pairs, matching = era_pairs, "era_only"
+    n_unmatched = None
+    if match == "length":
+        matching = "era+log_length"
+        if length_cap is not None:
+            pool["_len"] = np.minimum(pool[length_col].to_numpy(float), float(length_cap))
+        else:
+            pool["_len"] = pool[length_col].to_numpy(float)
+        pairs, n_unmatched = _match_pairs_length(pool, float(length_ratio), rng, "_len")
+    else:
+        matching = "era+gas_decile" if gas_bins > 1 else "era_only"
+        pairs = _match_pairs(pool, gas_bins, rng)
+        if gas_bins > 1 and len(pairs) < min_pairs:
+            era_pairs = _match_pairs(pool, 1, np.random.default_rng(int(seed)))
+            if len(era_pairs) > len(pairs):
+                pairs, matching = era_pairs, "era_only"
+    n_matched_total = len(pairs)
     if len(pairs) > int(n):
         idx = np.sort(rng.choice(len(pairs), size=int(n), replace=False))
         pairs = [pairs[i] for i in idx]
+    has_len = length_col in df.columns
     rows, pos_recs, neg_recs = [], [], []
     for i, (era, dec, a, b) in enumerate(pairs):
         ra, rb = df.loc[a], df.loc[b]
         pos_recs.append(records[int(ra["_rec"])])
         neg_recs.append(records[int(rb["_rec"])])
-        rows.append(dict(pair=i, era=era, gas_decile=dec, pos_tx=ra.get("tx_hash"), neg_tx=rb.get("tx_hash"),
-                         pos_gas=int(ra["gas_used"]), neg_gas=int(rb["gas_used"]),
-                         pos_fan_out_eth=int(ra["fan_out_eth"]), neg_fan_out_eth=int(rb["fan_out_eth"]),
-                         pos_dao_involved=bool(ra["dao_involved"]), neg_dao_involved=bool(rb["dao_involved"])))
+        row = dict(pair=i, era=era, gas_decile=dec, pos_tx=ra.get("tx_hash"), neg_tx=rb.get("tx_hash"),
+                   pos_gas=int(ra["gas_used"]), neg_gas=int(rb["gas_used"]),
+                   pos_fan_out_eth=int(ra["fan_out_eth"]), neg_fan_out_eth=int(rb["fan_out_eth"]),
+                   pos_dao_involved=bool(ra["dao_involved"]), neg_dao_involved=bool(rb["dao_involved"]))
+        if has_len:
+            row.update(pos_n_tokens=int(ra[length_col]), neg_n_tokens=int(rb[length_col]))
+        rows.append(row)
     cols = ["pair", "era", "gas_decile", "pos_tx", "neg_tx", "pos_gas", "neg_gas", "pos_fan_out_eth",
-            "neg_fan_out_eth", "pos_dao_involved", "neg_dao_involved", "matching", "gas_smd", "log_gas_smd"]
-    mt = pd.DataFrame(rows, columns=cols[:-3])
+            "neg_fan_out_eth", "pos_dao_involved", "neg_dao_involved"]
+    len_cols = ["pos_n_tokens", "neg_n_tokens"] if has_len else []
+    mt = pd.DataFrame(rows, columns=cols + len_cols)
     pg, ng = mt["pos_gas"].to_numpy(float), mt["neg_gas"].to_numpy(float)
     smd = standardized_mean_difference(pg, ng)
     log_smd = standardized_mean_difference(np.log(np.maximum(pg, 1.0)), np.log(np.maximum(ng, 1.0)))
-    mt = mt.assign(matching=matching, gas_smd=smd, log_gas_smd=log_smd)[cols]
-    mt.attrs.update(matching=matching, gas_smd=smd, log_gas_smd=log_smd, n_pairs=len(mt), min_pairs=min_pairs,
-                    gas_bins=gas_bins)
+    mt = mt.assign(matching=matching, gas_smd=smd, log_gas_smd=log_smd)
+    summary = dict(matching=matching, gas_smd=smd, log_gas_smd=log_smd)
+    if has_len:
+        pl, nl = mt["pos_n_tokens"].to_numpy(float), mt["neg_n_tokens"].to_numpy(float)
+        summary.update(length_smd=standardized_mean_difference(np.log(np.maximum(pl, 1.0)), np.log(np.maximum(nl, 1.0))),
+                       n_tokens_smd=standardized_mean_difference(pl, nl))
+        mt = mt.assign(length_smd=summary["length_smd"], n_tokens_smd=summary["n_tokens_smd"])
+        if len(mt):
+            lr = np.abs(np.log(np.maximum(pl, 1.0)) - np.log(np.maximum(nl, 1.0)))
+            summary.update(length_abs_log_ratio_median=float(np.median(lr)), length_ratio_max=float(np.exp(lr.max())))
+    pos_rows = df.loc[[p[2] for p in pairs]] if pairs else df.iloc[:0]
+    neg_rows = df.loc[[p[3] for p in pairs]] if pairs else df.iloc[:0]
+    mt.attrs.update(summary)
+    mt.attrs.update(n_pairs=len(mt), min_pairs=min_pairs, gas_bins=gas_bins, match=match,
+                    length_ratio=float(length_ratio) if match == "length" else None,
+                    length_cap=None if length_cap is None else int(length_cap),
+                    pool_pos=int(pool["_pos"].sum()), pool_neg=int((~pool["_pos"]).sum()),
+                    n_matched_total=int(n_matched_total), n_pos_unmatched=n_unmatched,
+                    eras=mt["era"].value_counts().to_dict(),
+                    balance=balance_table(pos_rows, neg_rows))
     return pos_recs, neg_recs, mt
+
+
+# ======================================================================================
+# identity masking
+# ======================================================================================
+def mask_tokens(tokens: Sequence[str], mask: Union[str, Iterable[str], None] = "dao",
+                replacement: str = MASK_TOKEN) -> list:
+    """Replace identity tokens of an ITR token list (raw or vocabulary-mapped) by ``[A_OOV]``.
+
+    * ``"none"`` / ``None``: unchanged copy;
+    * ``"dao"``: the four DAO identities of :data:`DAO_ADDRESSES` (DAO, extraBalance,
+      creator, WithdrawDAO) wherever they occur (call endpoints, arguments, state writes /
+      reads, log emitters);
+    * ``"all_addresses"``: every address token ``A:0x…`` (``A:none`` -- no address -- stays);
+    * an iterable of addresses (``0x…``, any case) or ``A:``-tokens: exactly those.
+
+    Masking is applied to positives and negatives alike, before encoding."""
+    toks = [str(t) for t in tokens]
+    if mask is None or (isinstance(mask, str) and mask == "none"):
+        return toks
+    if isinstance(mask, str) and mask == "dao":
+        targets = _DAO_TOKENS
+    elif isinstance(mask, str) and mask == "all_addresses":
+        return [replacement if (t.startswith("A:") and t != "A:none") else t for t in toks]
+    elif isinstance(mask, str):
+        raise ValueError(f"mask must be one of {MASKS} or an iterable of addresses, got {mask!r}")
+    else:
+        targets = frozenset("A:" + (str(a)[2:] if str(a).startswith("A:") else str(a)).lower() for a in mask)
+    return [replacement if t in targets else t for t in toks]
 
 
 # ======================================================================================
@@ -292,12 +464,15 @@ def surface_features(tokens: Sequence[str], max_len: Optional[int] = None) -> di
     """Trivial length / count statistics of an ITR token list (raw or vocabulary-mapped;
     ``max_len``: only the first ``max_len`` tokens, i.e. what the model sees): ``n_tokens``,
     ``n_call`` (``[CALL]``), ``n_value_tokens`` (every ``V:`` token: calls, state writes and
-    reads) and ``n_value_calls_nonzero`` (``[CALL]`` entries whose ``V:`` token is not ``V:N0``)."""
+    reads), ``n_value_calls_nonzero`` (``[CALL]`` entries whose ``V:`` token is not ``V:N0``)
+    and ``n_a_oov`` (``[A_OOV]`` tokens; 0 for raw tokens unless masked)."""
     toks = list(tokens)[: int(max_len)] if max_len is not None else list(tokens)
-    n_call = n_val = n_nz = 0
+    n_call = n_val = n_nz = n_oov = 0
     in_call = False
     for t in toks:
-        if t == "[CALL]":
+        if t == MASK_TOKEN:
+            n_oov += 1
+        elif t == "[CALL]":
             n_call += 1
             in_call = True
         elif t == "[END]" or t == "[START]":
@@ -307,7 +482,8 @@ def surface_features(tokens: Sequence[str], max_len: Optional[int] = None) -> di
             if in_call and t != "V:N0":
                 n_nz += 1
             in_call = False
-    return dict(n_tokens=len(toks), n_call=n_call, n_value_tokens=n_val, n_value_calls_nonzero=n_nz)
+    return dict(n_tokens=len(toks), n_call=n_call, n_value_tokens=n_val, n_value_calls_nonzero=n_nz,
+                n_a_oov=n_oov)
 
 
 def _auc(p: np.ndarray, q: np.ndarray) -> float:

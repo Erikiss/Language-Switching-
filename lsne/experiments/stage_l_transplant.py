@@ -32,6 +32,62 @@ transplant        :func:`transplant_experiment` per prompt (K=0 contexts with th
 transplant_summary per mode: fD and logp_target of the transplant arm minus each control
                   (mean over prompts), the sign of the fD shift vs the identity control and
                   whether it agrees with the native axis's shift (contrast 18, last clause)
+
+Trace source (``trace:<model_dir>``, :class:`lsne.chain.source.TraceLMSource`)
+------------------------------------------------------------------------------
+DESIGN 4.9 proper: a "sharing" direction of the trace LM, transplanted into Pythia, and its
+effect on the language-switching task and on representational sharing.  Inputs: the ITR
+shards (``trace_shards`` keyword = ``--trace-shards``, else ``Limits.l_trace_shards`` when
+that field exists, else the ``data`` entry of the model's ``manifest.json``) and optionally
+a ``sharing_directions.pt`` of ``python -m lsne.chain.cli probe`` (``trace_direction``
+keyword, ``Limits.l_trace_direction``, or ``<model_dir>/sharing_directions.pt``).  Further
+keywords (each also read as ``Limits.l_trace_<name>`` when present): ``trace_layer`` (frozen
+source snapshot of the direction and of every alignment, default the last, ``n_layers``),
+``trace_k`` (fan-out threshold, 5), ``trace_n_probe`` (max matched pairs, 500 / smoke 50),
+``trace_n_pairs`` (alignment pairs, ``4 * l_n_texts``), ``trace_length_ratio`` (1.25),
+``trace_limit`` (transactions read from the shards), ``trace_n_substitute`` (positions of
+the residual substitution, default ``l_n_prefix``).  Helpers: :mod:`lsne.chain.pairs`.
+
+1. *Probe* (``trace_probe``, ``trace_probe_match``): the length-matched fan-out probe
+   (``fan_out_eth >= k`` vs ``== 1``, 1:1 within era on the visible ITR length) under the
+   trained model and its untrained twin; per source snapshot the probe criterion
+   (:func:`lsne.chain.source.criterion_table`: split-half AUC trained minus untrained, paired
+   bootstrap CI, permutation / random-direction nulls, ``counts``), ``frozen`` marks the
+   frozen layer, ``feature_frozen`` whether the pre-specified probe was used (a relaxed
+   fallback never supports a claim).  The direction ``v_src`` = difference of means at the
+   frozen layer (or the saved file; ``direction_source``).
+2. *Alignment* (``layer_matching``, ``alignments``, ``trace_alignment_controls``): paired
+   ``(shard row, its English text)`` items (label-balanced sample); Procrustes maps fitted on
+   pooled states residualised on the length covariates of :mod:`lsne.chain.source`
+   (:func:`lsne.chain.pairs.residualised_alignment`: ``r2_*`` beyond length, intercept from
+   the raw means, ``r2_holdout_raw`` for comparison); ``alignments`` = one map per target
+   layer 0..L from the frozen source layer; the controls table (ridge) adds raw /
+   residualised R² of the untrained twin, the length-only R² and the trained-minus-untrained
+   gains with bootstrap CIs (:func:`lsne.chain.source.alignment_controls`).
+3. *Transplant* (``transplant``, ``transplant_summary``): prompt pairs (carrier transaction,
+   stimulus variant) for the K=0 variants (``l_n_prompts``) and their K=8/C1 partners; the
+   carrier is a matched probe negative (fan-out 1), the same for both variants of a
+   formulation; residual substitution (last ``trace_n_substitute`` positions), KV planting at
+   every layer, both; controls random / identity / permuted_alignment; site = the grid layer
+   nearest the middle; ``cos_native`` against Pythia's own length-residualised direction
+   between the English texts of the probe's positives and negatives.
+4. *Readouts* (``trace_bt``, ``trace_effects``, ``trace_sharing``): ``logp_target`` and
+   ``B = logp_target - logp_plain`` per variant, ``T = logp(K8C1) - logp(K0)`` per formulation
+   (``trace_bt``); per mode x control the transplant-minus-control differences of B (per K and
+   pooled), T, fD and entropy with family cluster-bootstrap CIs (``trace_effects``); the
+   sharing index (Jaccard of active SAE latents K0 vs K8C1) and network activity
+   (:mod:`lsne.sharing`) at the dossier site per arm and for the plain model
+   (``trace_sharing``; ``sae_source`` marks a synthetic SAE in smoke runs).
+5. ``trace_verdict``: one row per mode.  ``sharing_effect_claimed`` = ``probe_ok``
+   (``feature_frozen`` AND the probe criterion ``counts`` at the frozen layer: CI of trained
+   minus untrained above 0) AND ``align_ok`` (residualised R² gap >= 0.2 at the site) AND
+   ``transplant_effect`` (B or T differs from both the random and the permuted-alignment
+   control with CIs excluding 0 in the same direction, >= 3 families); it is **never**
+   True without the probe criterion.  ``claim`` states the reasons.
+
+The functional transfer test (contrast 18, ``transfer_test`` / ``transfer_summary``) needs
+paired language texts in both models and is skipped for a trace source (empty tables,
+manifest ``functional_transfer.skipped``); ``verdict`` then holds one explanatory row.
 """
 from __future__ import annotations
 
@@ -45,7 +101,7 @@ import torch
 
 from ..config import ModelSpec, RunConfig, HookSite
 from ..directions import cosine, diff_of_means
-from ..model import ModelBundle
+from ..model import ModelBundle, run_with_cache
 from . import common as C
 
 try:
@@ -63,8 +119,16 @@ PREREG_R2_GAP, PREREG_MIN_COS = 0.2, 0.3
 # source
 # --------------------------------------------------------------------------------------
 def make_source(mb: ModelBundle, spec: str, seed: int):
-    """``(source, kind)`` for ``Limits.l_source``: rotated_self | self | model@revision."""
+    """``(source, kind)`` for ``Limits.l_source``: rotated_self | self | model@revision |
+    ``trace:<model_dir>`` (a trace LM directory written by :func:`lsne.chain.train.train`,
+    loaded as :class:`lsne.chain.source.TraceLMSource` on the target's device; kind ``"trace"``)."""
     spec = str(spec or "rotated_self")
+    if spec.startswith("trace:"):
+        from ..chain.source import TraceLMSource
+        model_dir = spec[len("trace:"):]
+        if not model_dir:
+            raise ValueError("trace source needs a model directory: trace:<model_dir>")
+        return TraceLMSource(model_dir, device=str(mb.device)), "trace"
     base = TP.HFSourceModel.from_bundle(mb)
     if spec == "self":
         return base, "self"
@@ -134,6 +198,12 @@ def transplant_tables(mb: ModelBundle, src, aligns: dict, v_src: torch.Tensor, n
                                   gen_kw=dict(n_new=cfg.gen_n_new, n_samples=cfg.gen_n_samples, temperature=cfg.gen_temperature),
                                   native_axis=native_axis, seed=cfg.seed)
     df["source"] = getattr(src, "name", "")
+    return df, summarise_transplant(df, delta_fD_native)
+
+
+def summarise_transplant(df: pd.DataFrame, delta_fD_native: float) -> pd.DataFrame:
+    """``transplant_summary``: per mode the transplant arm minus each control (fD, logp) and the
+    sign of the fD shift vs the identity control against the native axis's shift."""
     rows = []
     for mode, g in df.groupby("mode", sort=True):
         arm = g[g["control"] == "none"]
@@ -149,7 +219,7 @@ def transplant_tables(mb: ModelBundle, src, aligns: dict, v_src: torch.Tensor, n
         row["sign_native"] = int(np.sign(delta_fD_native)) if np.isfinite(delta_fD_native) and abs(delta_fD_native) > 1e-6 else 0
         row["sign_agrees_with_native"] = bool(row["sign_fD_vs_identity"] != 0 and row["sign_fD_vs_identity"] == row["sign_native"])
         rows.append(row)
-    return df, pd.DataFrame(rows)
+    return pd.DataFrame(rows)
 
 
 def contrast18_verdict(tt_summary: pd.DataFrame, tp_summary: pd.DataFrame, source_kind: str) -> pd.DataFrame:

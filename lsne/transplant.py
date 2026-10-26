@@ -33,6 +33,19 @@ a direction ``v_S`` maps to ``W^T v_S`` (no bias, unit-normalised).  "Layer ``l`
 residual snapshot means the block input of block ``l`` for ``0 <= l < L`` and the output
 of the last block for ``l == L`` (the :func:`lsne.model.all_block_inputs` convention).
 Nothing here hard-codes ``d_model``/``n_layers``; everything is read from the models.
+
+**Prompt pairs** (:class:`PromptPair`, :func:`as_prompt_pair`).  With a language source
+both models read the same string; a trace source reads a *transaction* while Pythia reads
+a *text*.  Every prompt argument of :func:`transplant_experiment` and of the one-prompt
+helpers (:func:`transplanted_states`, :func:`transplant_residual`, :func:`transplant_kv`;
+:func:`substitute_residual` / :func:`plant_kv_prefix` / :func:`plant_kv_cache` take the
+target side of a pair as ``input_ids``) is therefore one of: a plain string (the old
+behaviour: the same text on both sides), ``(text, target)`` with a string first element
+(the old prompt-with-target form), a :class:`PromptPair` ``(source, text, target, ids)``,
+``(source_item, text[, target])`` with a non-string first element (e.g. a
+:class:`lsne.chain.itr.TxRecord`), or a dict with ``"text"`` (an ITR shard / pair-file row
+is its own source item through its ``"tokens"``).  The source encodes ``pair.source``,
+the target ``pair.text`` (or ``pair.ids``).
 """
 from __future__ import annotations
 
@@ -41,7 +54,7 @@ import math
 import warnings
 import zlib
 from dataclasses import dataclass, field
-from typing import Optional, Protocol, Sequence, Union, runtime_checkable
+from typing import Any, Optional, Protocol, Sequence, Union, runtime_checkable
 
 import numpy as np
 import pandas as pd
@@ -84,6 +97,120 @@ def _as_ids(item, device=None) -> torch.Tensor:
     if ids.dim() != 2 or ids.shape[0] != 1:
         raise ValueError(f"ids must be [1,T] (or [T]), got {tuple(ids.shape)}")
     return ids.to(device) if device is not None else ids
+
+
+# ======================================================================================
+# prompt pairs: the source encodes one item, the target another
+# ======================================================================================
+@dataclass
+class PromptPair:
+    """One transplant prompt with (possibly) different items for the two models.
+
+    ``source`` is what the source model encodes (``src.encode(source)``: a trace record, ITR
+    tokens or a shard row for :class:`lsne.chain.source.TraceLMSource`, token ids, or a text
+    for a language source); ``text`` is what the target encodes (``mb.encode(text)``, or
+    ``ids`` when given, e.g. the curated token ids of a stimulus variant); ``target`` is the
+    target-side next token (id or string; optional); ``name`` labels the source item in the
+    result tables (default: its ``tx_hash`` when it has one)."""
+    source: Any
+    text: str
+    target: Optional[Union[int, str]] = None
+    ids: Optional[Sequence[int]] = None
+    name: Optional[str] = None
+
+    @property
+    def paired(self) -> bool:
+        """True when the two sides encode different items (not one plain string)."""
+        return not (isinstance(self.source, str) and self.source == self.text)
+
+
+def _is_ids(x) -> bool:
+    """Token ids (tensor / nested int sequence) as opposed to a prompt."""
+    if isinstance(x, torch.Tensor):
+        return True
+    if isinstance(x, (str, bytes, dict, PromptPair)) or x is None:
+        return False
+    try:
+        a = np.asarray(x)
+    except (ValueError, TypeError):
+        return False
+    return a.size > 0 and np.issubdtype(a.dtype, np.integer)
+
+
+def as_prompt_pair(prompt, target=None) -> PromptPair:
+    """Normalise a prompt to a :class:`PromptPair` (see the module docstring).
+
+    * ``str`` -> the same text on both sides (the old behaviour);
+    * ``(text, target)`` / ``[text]`` with a **string** first element -> the old prompt with
+      a target (a raw ITR string as source item therefore needs an explicit PromptPair);
+    * ``(source_item, text[, target])`` with a non-string first element -> a pair;
+    * ``dict`` with ``"text"`` -> source ``d["source"]`` / ``d["source_item"]`` / ``d["record"]``
+      or the dict itself (a shard / pair-file row carries ``"tokens"``), target
+      ``d["target"]`` / ``d["target_id"]``, ids ``d["ids"]``;
+    * a :class:`PromptPair` is returned as is.
+    ``target`` (if not None) overrides the prompt's own target."""
+    if isinstance(prompt, PromptPair):
+        pp = prompt
+    elif isinstance(prompt, str):
+        pp = PromptPair(source=prompt, text=prompt)
+    elif isinstance(prompt, dict):
+        if "text" not in prompt:
+            raise ValueError("a dict prompt needs a 'text' entry (the target side)")
+        src_item = prompt
+        for k in ("source", "source_item", "record"):
+            if prompt.get(k) is not None:
+                src_item = prompt[k]
+                break
+        tgt = prompt.get("target", prompt.get("target_id"))
+        pp = PromptPair(source=src_item, text=str(prompt["text"]), target=tgt, ids=prompt.get("ids"),
+                        name=prompt.get("name") or prompt.get("tx_hash"))
+    elif isinstance(prompt, (tuple, list)) and len(prompt) >= 1:
+        if isinstance(prompt[0], str):
+            pp = PromptPair(source=prompt[0], text=prompt[0], target=prompt[1] if len(prompt) > 1 else None)
+        else:
+            if len(prompt) < 2 or not isinstance(prompt[1], str):
+                raise ValueError("a (source_item, text[, target]) prompt needs the target text as second element")
+            pp = PromptPair(source=prompt[0], text=prompt[1], target=prompt[2] if len(prompt) > 2 else None)
+    else:
+        raise TypeError(f"cannot read a prompt from {type(prompt).__name__}")
+    if target is not None:
+        pp = PromptPair(source=pp.source, text=pp.text, target=target, ids=pp.ids, name=pp.name)
+    return pp
+
+
+def source_name(item, max_chars: int = 60) -> str:
+    """Short label of a source item: its ``tx_hash`` when it has one, else the text (cut)."""
+    h = item.get("tx_hash") if isinstance(item, dict) else getattr(item, "tx_hash", None)
+    if h:
+        return str(h)
+    if isinstance(item, str):
+        return item if len(item) <= max_chars else item[: max_chars - 3] + "..."
+    if _is_ids(item):
+        return f"ids[{int(torch.as_tensor(item).numel())}]"
+    return type(item).__name__
+
+
+def _target_ids(mb: ModelBundle, x) -> torch.Tensor:
+    """Target-side ``LongTensor[1, T]`` of ids or of a prompt (pair): ``pair.ids`` or
+    ``mb.encode(pair.text)``."""
+    if _is_ids(x):
+        return _as_ids(x, mb.device)
+    pp = as_prompt_pair(x)
+    if pp.ids is not None:
+        return _as_ids(list(pp.ids), mb.device)
+    return mb.encode(pp.text)
+
+
+def _resolve_prompt(prompt, targets, i: int, mb: ModelBundle) -> tuple[PromptPair, torch.Tensor, Optional[int]]:
+    """``(pair, target ids [1, T], target token id or None)`` of prompt ``i``; ``targets[i]``
+    (when given) overrides the prompt's own target (the old ``_split_prompt`` rule)."""
+    pp = as_prompt_pair(prompt)
+    target = pp.target
+    if targets is not None and i < len(targets):
+        target = targets[i]
+    if isinstance(target, str):
+        target = int(mb.tokenizer(target, add_special_tokens=False)["input_ids"][0])
+    return pp, _target_ids(mb, pp), (None if target is None else int(target))
 
 
 def _snapshot_site(n_layers: int, layer: int) -> HookSite:
@@ -419,14 +546,22 @@ def _pool_rows(H: torch.Tensor, readout: str) -> torch.Tensor:
 def paired_states(src: SourceModel, mb_tgt: ModelBundle, pairs: Sequence[tuple], layers_src: Sequence[int],
                   layers_tgt: Sequence[int], readout: str = "mean") -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
     """Pooled residual states of paired items: ``({layer_src: [N, d_S]}, {layer_tgt: [N, d_T]})``.
-    ``pairs`` are ``(item_src, text_tgt)``; the same text in both models for a stand-in."""
+    ``pairs`` are ``(item_src, text_tgt)`` tuples (always read as source item / target text,
+    also when the item is a string; the same text in both models for a stand-in), or
+    :class:`PromptPair` objects / dicts with ``"text"`` (:func:`as_prompt_pair`)."""
     S = {l: [] for l in layers_src}
     Tt = {l: [] for l in layers_tgt}
-    for item_src, text_tgt in pairs:
+    for p in pairs:
+        if isinstance(p, (PromptPair, dict)):
+            pp = as_prompt_pair(p)
+            item_src, ids_tgt = pp.source, _target_ids(mb_tgt, pp)
+        else:
+            item_src, text_tgt = p
+            ids_tgt = _target_ids(mb_tgt, text_tgt) if _is_ids(text_tgt) else mb_tgt.encode(text_tgt)
         hs = src.residuals(src.encode(item_src), list(layers_src))
         for l in layers_src:
             S[l].append(_pool_rows(hs[l], readout))
-        ht = target_residuals(mb_tgt, mb_tgt.encode(text_tgt), list(layers_tgt))
+        ht = target_residuals(mb_tgt, ids_tgt, list(layers_tgt))
         for l in layers_tgt:
             Tt[l].append(_pool_rows(ht[l], readout))
     return {l: torch.stack(v) for l, v in S.items()}, {l: torch.stack(v) for l, v in Tt.items()}
@@ -508,8 +643,9 @@ def substitute_residual(mb: ModelBundle, input_ids: torch.Tensor, site: HookSite
     """Replace the target's residual at ``site`` and ``positions`` by ``H_new [len(positions), d_T]``
     (``Injector(mode="replace")``, no addition) and return the last-position logits ``[V]``.
     With ``return_info=True`` returns ``(logits, info)`` where ``info`` carries the Injector
-    audit (written norm), the full logits ``[T, V]`` and the positions."""
-    ids = _as_ids(input_ids, mb.device)
+    audit (written norm), the full logits ``[T, V]`` and the positions.  ``input_ids`` may
+    also be a text or a prompt pair (its target side is encoded, :func:`as_prompt_pair`)."""
+    ids = _target_ids(mb, input_ids)
     T = ids.shape[1]
     pos = _norm_positions(positions, T)
     H = torch.as_tensor(H_new).detach().float()
@@ -569,8 +705,9 @@ def plant_kv_prefix(mb: ModelBundle, input_ids: torch.Tensor, H_by_layer: dict, 
     layer come from the transplanted states (rotary applied at the prefix positions) while
     the real tokens' own residual stream is untouched.  Returns
     ``dict(logits_last [V], logits [T, V], n_prefix, audits, layers)`` for the real tokens.
+    ``input_ids`` may also be a text or a prompt pair (its target side is encoded).
     """
-    ids = _as_ids(input_ids, mb.device)
+    ids = _target_ids(mb, input_ids)
     sel, n = _prefix_states(mb, H_by_layer, layers)
     if n == 0:
         return _plain_forward(mb, ids)
@@ -602,9 +739,10 @@ def plant_kv_cache(mb: ModelBundle, input_ids: torch.Tensor, H_by_layer: dict, p
     length-``n`` forward here vs. inside the length-``n+T`` forward there, which differs by
     the cache API's own fp32 noise (~1e-3 in the logits on CPU, the same as a plain
     uninjected two-pass forward).  If the cache API fails, falls back to
-    :func:`plant_kv_prefix` with a warning (``strict=True`` raises instead).
+    :func:`plant_kv_prefix` with a warning (``strict=True`` raises instead).  ``input_ids``
+    may also be a text or a prompt pair (its target side is encoded).
     """
-    ids = _as_ids(input_ids, mb.device)
+    ids = _target_ids(mb, input_ids)
     sel, n = _prefix_states(mb, H_by_layer, layers)
     if n == 0:
         return _plain_forward(mb, ids)
@@ -712,28 +850,97 @@ def _dose_rows(H: torch.Tensor, v: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 def _split_prompt(prompt, targets, i: int, mb: ModelBundle) -> tuple[str, Optional[int]]:
-    target = None
-    if isinstance(prompt, (tuple, list)):
-        prompt, target = prompt[0], prompt[1]
-    if targets is not None and i < len(targets):
-        target = targets[i]
-    if isinstance(target, str):
-        target = int(mb.tokenizer(target, add_special_tokens=False)["input_ids"][0])
-    return str(prompt), (None if target is None else int(target))
+    """``(target text, target id)`` of prompt ``i`` (kept for callers of the old helper)."""
+    pp, _ids, target = _resolve_prompt(prompt, targets, i, mb)
+    return str(pp.text), target
+
+
+# --------------------------------------------------------------------------------------
+# one-prompt helpers (prompt pairs: the source encodes pair.source, the target pair.text)
+# --------------------------------------------------------------------------------------
+def source_states(src: SourceModel, prompt, layers: Sequence[int]) -> dict[int, torch.Tensor]:
+    """Source residuals ``{layer: [T_S, d_S]}`` of the *source side* of a prompt (pair)."""
+    pp = as_prompt_pair(prompt)
+    return src.residuals(src.encode(pp.source), [int(l) for l in layers])
+
+
+def transplanted_states(src: SourceModel, align: Union[Alignment, dict], prompt, v_src=None, eps: float = 0.0,
+                        layers_tgt: Optional[Sequence[int]] = None) -> dict[int, torch.Tensor]:
+    """Transferred states ``{layer_tgt: [T_S, d_T]}`` of the source side of ``prompt``: the
+    source residuals at each alignment's source layer, dosed along ``v_src`` (``eps``
+    relative RMS per position, :func:`transplant_experiment` convention; no dose when
+    ``v_src`` is None or ``eps == 0``) and mapped with ``H_S W + b``.  ``align``: one
+    :class:`Alignment` (keyed by its ``layer_tgt``) or a ``{layer_tgt: Alignment}`` dict."""
+    aligns = {int(align.layer_tgt): align} if isinstance(align, Alignment) else {int(k): a for k, a in align.items()}
+    if layers_tgt is not None:
+        aligns = {int(l): aligns[int(l)] for l in layers_tgt}
+    if not aligns:
+        raise ValueError("no alignment")
+    H_S = source_states(src, prompt, sorted({int(a.layer_src) for a in aligns.values()}))
+    v = None if v_src is None else torch.as_tensor(v_src).detach().float().cpu().reshape(-1)
+    out = {}
+    for l, a in aligns.items():
+        H = torch.as_tensor(H_S[int(a.layer_src)]).detach().float().cpu()
+        if v is not None and float(eps) != 0.0:
+            H = _dose_rows(H, v, float(eps))
+        out[l] = transfer_states(a, H)
+    return out
+
+
+def transplant_residual(mb: ModelBundle, src: SourceModel, align: Union[Alignment, dict], prompt, site: HookSite,
+                        v_src=None, eps: float = 0.0, n_substitute: Optional[int] = None, return_info: bool = False):
+    """Injection A for one prompt (pair): the transferred states of the source side
+    (:func:`transplanted_states`) replace the target's residual at ``site`` on the last
+    ``k = min(n_substitute or T_S, T_S, T)`` positions of the target side (last source rows
+    paired with the last target positions).  ``align``: one Alignment or a dict holding the
+    site's snapshot layer.  Returns :func:`substitute_residual`'s result."""
+    layer = _snapshot_layer(site, mb.n_layers)
+    if isinstance(align, Alignment):
+        a = align
+    else:
+        if int(layer) not in {int(k) for k in align}:
+            raise KeyError(f"no alignment for target layer {layer} (site {site.key})")
+        a = {int(k): v for k, v in align.items()}[int(layer)]
+    H_T = next(iter(transplanted_states(src, a, prompt, v_src, eps).values()))
+    ids = _target_ids(mb, prompt)
+    T = int(ids.shape[1])
+    k = min(T, int(H_T.shape[0]), int(n_substitute) if n_substitute else T)
+    return substitute_residual(mb, ids, site, list(range(T - k, T)), H_T[-k:], return_info=return_info)
+
+
+def transplant_kv(mb: ModelBundle, src: SourceModel, aligns: Union[Alignment, dict], prompt, v_src=None, eps: float = 0.0,
+                  n_prefix: int = 8, placeholder_id: int = 0, use_cache_api: bool = False) -> dict:
+    """Injection B for one prompt (pair): the last ``n = min(n_prefix, T_S)`` transferred rows
+    of the source side are planted as a virtual prefix at every target layer of ``aligns``
+    (:func:`plant_kv_prefix`, or :func:`plant_kv_cache` with ``use_cache_api``) in front of
+    the target side's tokens."""
+    if isinstance(aligns, Alignment) and not 0 <= int(aligns.layer_tgt) <= mb.n_layers:
+        raise ValueError(f"the alignment's layer_tgt ({aligns.layer_tgt}) must name a target layer 0..{mb.n_layers}")
+    H = transplanted_states(src, aligns, prompt, v_src, eps)
+    n = min(int(n_prefix), min(int(h.shape[0]) for h in H.values()))
+    H = {l: h[-n:] for l, h in H.items()} if n > 0 else {}
+    fn = plant_kv_cache if use_cache_api else plant_kv_prefix
+    return fn(mb, _target_ids(mb, prompt), H, placeholder_id=placeholder_id)
 
 
 def transplant_experiment(mb: ModelBundle, src: SourceModel, align: Union[Alignment, dict], v_src, prompts: Sequence,
                           site: HookSite, eps: float, n_prefix: int = 8,
                           modes: Sequence[str] = ("residual", "kv", "both"),
                           controls: Sequence[str] = ("random", "identity", "permuted_alignment"),
-                          gen_kw: Optional[dict] = None, native_axis=None, targets=None, seed: int = 0) -> pd.DataFrame:
+                          gen_kw: Optional[dict] = None, native_axis=None, targets=None, seed: int = 0,
+                          n_substitute: Optional[int] = None, state_sites: Optional[Sequence[HookSite]] = None):
     """Transplant the source feature ``v_src`` into the target per prompt x mode x control.
 
+    ``prompts``: plain strings (the same text in both models, the old behaviour),
+    ``(text, target)`` tuples, or prompt *pairs* whose source side differs from the target
+    side (:class:`PromptPair`, ``(source_item, text[, target])``, dicts with ``"text"``;
+    :func:`as_prompt_pair`): the source encodes ``pair.source`` (e.g. a trace record), the
+    target ``pair.text`` (or ``pair.ids``).
     Per prompt the source states ``H_S`` (at the alignment's source layer) are *dosed* along
     ``v_src`` in the source space (``eps`` relative RMS per position, the State-2143
     convention) and transferred, ``H_T = (H_S + dose) W + b``.  Modes: ``"residual"``
     substitutes ``H_T`` on the last ``k = min(T_S, T)`` real positions at ``site``
-    (injection A, no addition); ``"kv"`` plants the last ``n_prefix`` transferred rows as a
+    (``n_substitute`` caps ``k``; injection A, no addition); ``"kv"`` plants the last ``n_prefix`` transferred rows as a
     virtual prefix (injection B) at every target layer that has an alignment; ``"both"``
     combines them.  DESIGN 4.9 specifies injection B at **all** layers, which needs a
     ``{target_layer: Alignment}`` dict covering ``0..L`` (:func:`layer_alignments`); a
@@ -751,7 +958,14 @@ def transplant_experiment(mb: ModelBundle, src: SourceModel, align: Union[Alignm
     direction with ``native_axis`` (if given) and the alignment's ``r2_holdout`` /
     ``r2_permuted``.  ``gen_kw``: ``n_new`` (16), ``n_samples`` (4), ``temperature`` (1.0).
     Position-wise pairing of source and target states is exact only when both models
-    share the tokenisation; otherwise the last positions are paired.
+    share the tokenisation; otherwise the last positions are paired.  Every row also
+    records ``paired`` (the two sides encode different items), ``source_item``
+    (:func:`source_name`), ``n_src_tokens`` and ``n_tgt_tokens``.
+
+    ``state_sites``: when given, the forward pass of every row also records the target's
+    residual at these sites at the last real position, and the function returns
+    ``(df, states)`` with ``states[i] = {site.key: ndarray[d_T]}`` for row ``i`` of ``df``
+    (the input of the sharing / network-activity readouts).
     """
     gk = dict(n_new=16, n_samples=4, temperature=1.0)
     gk.update(gen_kw or {})
@@ -783,12 +997,15 @@ def transplant_experiment(mb: ModelBundle, src: SourceModel, align: Union[Alignm
     layers_src = sorted({a.layer_src for a in aligns.values()})
     if any(l < 0 for l in layers_src):
         raise ValueError("every Alignment needs layer_src >= 0 (the source snapshot it was fitted on)")
-    rows = []
+    rec_sites = list(state_sites or [])
+    rows, states = [], []
     for i, p in enumerate(prompts):
-        text, target = _split_prompt(p, targets, i, mb)
-        ids_T = mb.encode(text)
+        pp, ids_T, target = _resolve_prompt(p, targets, i, mb)
+        text = pp.text
         T = ids_T.shape[1]
-        H_S = src.residuals(src.encode(text), layers_src)
+        H_S = src.residuals(src.encode(pp.source), layers_src)
+        T_S = int(next(iter(H_S.values())).shape[0])
+        src_label = pp.name or source_name(pp.source)
         own = target_residuals(mb, ids_T, sorted(set(aligns) | {site_layer}))
         for ci, control in enumerate(arms):
             v_dose = v_src
@@ -814,6 +1031,8 @@ def transplant_experiment(mb: ModelBundle, src: SourceModel, align: Union[Alignm
                     raise ValueError(f"unknown mode {mode!r}")
                 n = min(int(n_prefix), min(h.shape[0] for h in H_T.values())) if mode in ("kv", "both") else 0
                 k = min(T, H_T[site_layer].shape[0]) if mode in ("residual", "both") else 0
+                if k and n_substitute is not None:
+                    k = min(k, max(1, int(n_substitute)))
                 ids = ids_T
                 if n > 0:
                     ids = torch.cat([torch.zeros(1, n, dtype=torch.long, device=mb.device), ids_T], 1)
@@ -824,11 +1043,17 @@ def transplant_experiment(mb: ModelBundle, src: SourceModel, align: Union[Alignm
                 if k > 0:
                     specs.append((site, [n + T - k + j for j in range(k)], H_T[site_layer][-k:]))
                 with torch.no_grad(), replacements(mb, specs) as reps:
-                    logits = mb.model(input_ids=ids, use_cache=False).logits.float()[:, -1].cpu()
+                    if rec_sites:
+                        co = run_with_cache(mb, ids, rec_sites)
+                        logits = co.logits[:, -1].cpu()
+                        states.append({s.key: co.resid[s.key][0, -1].detach().float().cpu().numpy() for s in rec_sites})
+                    else:
+                        logits = mb.model(input_ids=ids, use_cache=False).logits.float()[:, -1].cpu()
                 written = float(sum(r.written_norm for r in reps))
                 st = next_token_stats(logits, target if target is not None else 0)
                 gen = _generate_fraction(mb, ids, specs, gk["n_new"], gk["n_samples"], seed + i, gk["temperature"], site)
-                rows.append(dict(prompt_idx=i, prompt=text, mode=mode, control=control, eps=float(eps),
+                rows.append(dict(prompt_idx=i, prompt=text, paired=bool(pp.paired), source_item=src_label,
+                                 n_src_tokens=T_S, n_tgt_tokens=int(T), mode=mode, control=control, eps=float(eps),
                                  n_prefix=n, n_substituted=k, site=site.key,
                                  kv_layers=kv_layers_str if n > 0 else "", n_kv_layers=len(kv_layers) if n > 0 else 0,
                                  entropy=float(st["entropy"][0]),
@@ -838,7 +1063,8 @@ def transplant_experiment(mb: ModelBundle, src: SourceModel, align: Union[Alignm
                                  written_norm=written, cos_native=cos_native,
                                  r2_holdout=align_res.r2_holdout, r2_permuted=align_res.r2_permuted,
                                  layer_src=align_res.layer_src, method=align_res.method))
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    return (df, states) if rec_sites else df
 
 
 # ======================================================================================

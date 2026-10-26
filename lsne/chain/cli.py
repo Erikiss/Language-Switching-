@@ -9,7 +9,26 @@
     python -m lsne.chain.cli probe     --model runs/trace_lm --in data/traces/itr --kind fanout|dao \\
         --layer all --out runs/trace_probe
     python -m lsne.chain.cli pair      --in data/traces/itr --n 2000 --out runs/trace_pairs.jsonl
+    python -m lsne.chain.cli align     --model runs/trace_lm --pairs runs/trace_pairs.jsonl \\
+        --target EleutherAI/pythia-14m@step98000 --out runs/trace_align
     python -m lsne.chain.cli bench     --sizes tiny,small --block-size 512 --batch-size 8
+
+Controlled probes (round 2, docs/TRACE_SOURCE.md "Kontrollierte Sonden"):
+
+    python -m lsne.chain.cli probe --model runs/trace_lm --in data/traces/itr --kind fanout \\
+        --match length --length-ratio 1.25 --k 5 --out runs/trace_probe_fanout_len
+    python -m lsne.chain.cli probe --model runs/trace_lm --in data/traces/itr --kind dao \\
+        --match length --mask dao --out runs/trace_probe_dao_masked
+
+``probe`` always writes ``match_table.csv``, ``probe_summary.csv``, ``sharing_directions.pt``
+and ``probe_report.json`` (matching balance as standardized mean differences, surface
+baseline); unless ``--untrained none`` it also encodes the same (masked) sequences with the
+untrained twin (same config, vocabulary and initialisation seed) and writes
+``criterion.csv``: split-half AUC trained / untrained, their difference with a bootstrap CI
+over matched pairs, permutation and random-direction nulls; a layer *counts* only if the
+CI of the difference lies above 0.  ``align`` fits the ridge alignment raw, after
+residualising both sides on length covariates, for the length covariates alone and for
+the untrained source (``align_controls.csv``, ``align_summary.json``).
 
 ITR shards: one gzipped JSON-lines file per 1 000-block chunk, ``<out>/itr-<start>.jsonl.gz``
 (``--plain``: uncompressed ``.jsonl``; about 16 MB per DAO-era chunk uncompressed, 1.6 MB
@@ -330,16 +349,50 @@ def _features_frame(in_path: str, limit: Optional[int]) -> pd.DataFrame:
         f = dict(r["features"])
         f["tx_hash"] = r["tx_hash"]
         f["label"] = r.get("label")
+        f["n_tokens"] = int(r["n_tokens"]) if r.get("n_tokens") is not None else len(r.get("tokens") or [])
         feats.append(f)
     return pd.DataFrame(feats)
+
+
+def _jsonable(x):
+    """numpy / pandas scalars and containers -> plain JSON types (NaN -> None)."""
+    if isinstance(x, dict):
+        return {str(k): _jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_jsonable(v) for v in x]
+    if isinstance(x, (np.bool_, bool)):
+        return bool(x)
+    if isinstance(x, (np.integer,)):
+        return int(x)
+    if isinstance(x, (np.floating, float)):
+        return None if not np.isfinite(x) else float(x)
+    return x
+
+
+def _control_source(src, spec: str, init_seed: Optional[int], model_dir: str, device: str, max_len: int):
+    """The untrained control of the same architecture and vocabulary: ``"auto"`` = the
+    in-memory twin (:func:`lsne.chain.source.untrained_twin`, seed from the model manifest
+    unless ``init_seed``), else a model directory (checked for the same vocabulary / shape)."""
+    from .source import TraceLMSource, init_seed_of, untrained_twin
+
+    if spec == "none":
+        return None, None
+    if spec == "auto":
+        seed = init_seed_of(model_dir) if init_seed is None else int(init_seed)
+        return untrained_twin(src, seed=seed), f"auto(seed={seed})"
+    src0 = TraceLMSource(spec, device=device, max_len=max_len)
+    if src0.vocab.tokens != src.vocab.tokens or (src0.d_model, src0.n_layers) != (src.d_model, src.n_layers):
+        raise SystemExit(f"untrained control {spec} differs from {model_dir} in vocabulary or shape")
+    return src0, spec
 
 
 def cmd_probe(a) -> int:
     import torch
 
     from ..io import write_manifest
-    from .labels import probe_sets
-    from .source import TraceLMSource, direction_from_states, pooled_states
+    from .labels import SURFACE_FEATURES_OOV, balance_table, probe_sets, standardized_mean_difference, \
+        surface_baseline_auc
+    from .source import TraceLMSource, criterion_table, direction_from_states, masked_items, pooled_states
 
     df = _features_frame(a.inp, a.limit)
     if df.empty:
@@ -347,38 +400,162 @@ def cmd_probe(a) -> int:
         return 1
     recs = [SimpleNamespace(tx_hash=h) for h in df["tx_hash"]]
     eras = a.eras.split(",") if a.eras else None
-    pos, neg, mt = probe_sets(recs, df, a.kind, a.n, seed=a.seed, k=a.k, eras=eras, gas_bins=a.gas_bins)
+    pos, neg, mt = probe_sets(recs, df, a.kind, a.n, seed=a.seed, k=a.k, eras=eras, gas_bins=a.gas_bins,
+                              match=a.match, length_ratio=a.length_ratio,
+                              length_cap=a.length_cap if a.length_cap and a.length_cap > 0 else None)
+    os.makedirs(a.out, exist_ok=True)
+    mt.to_csv(os.path.join(a.out, "match_table.csv"), index=False)
+    settings = dict(kind=a.kind, k=a.k, match=a.match, length_ratio=a.length_ratio if a.match == "length" else None,
+                    gas_bins=a.gas_bins if a.match == "gas" else None, mask=a.mask, readout=a.readout, n_max=a.n,
+                    seed=a.seed, eras=eras, model=a.model, data=a.inp, max_len=a.max_len)
+    matching = {k: v for k, v in mt.attrs.items()}
     if len(pos) < 2:
-        _say(f"probe: only {len(pos)} matched pairs for kind={a.kind}; need >= 2")
+        with open(os.path.join(a.out, "probe_report.json"), "w", encoding="utf-8") as fh:
+            json.dump(_jsonable(dict(settings=settings, matching=matching, verdict=dict(n_pairs=len(pos)))), fh, indent=1)
+        _say(f"probe: only {len(pos)} matched pairs for kind={a.kind} (match={a.match}, pool "
+             f"{matching.get('pool_pos')} pos / {matching.get('pool_neg')} neg); need >= 2")
         return 1
     want = {r.tx_hash for r in pos + neg}
     rows = {r["tx_hash"]: r for r in iter_rows(a.inp, hashes=want)}
     src = TraceLMSource(a.model, device=a.device, max_len=a.max_len)
     layers = _parse_layers(a.layer, src.n_layers)
-    items = [rows[r.tx_hash] for r in pos] + [rows[r.tx_hash] for r in neg]
+    # vocabulary-mapped, truncated, identity-masked token lists (the same masking for both sets)
+    items = masked_items(src, [rows[r.tx_hash] for r in pos] + [rows[r.tx_hash] for r in neg], a.mask)
+    n = len(pos)
     t0 = time.time()
     S = pooled_states(src, items, layers, a.readout)
-    n = len(pos)
-    os.makedirs(a.out, exist_ok=True)
+    t_enc = time.time() - t0
     summary, saved = [], {}
     for l in layers:
         d = direction_from_states(S[l][:n], S[l][n:], l, src.n_layers, denoise_pcs=a.denoise_pcs,
                                   name=f"sharing_{a.kind}", seed=a.seed,
-                                  meta=dict(kind=a.kind, readout=a.readout, source=src.name))
+                                  meta=dict(kind=a.kind, readout=a.readout, source=src.name, mask=a.mask,
+                                            match=a.match))
         m = {k: v for k, v in d.meta.items() if k not in ("vec_denoised", "layer")}
         summary.append(dict(layer=l, site=d.site.key, **m))
         saved[l] = dict(vec=d.vec, vec_denoised=d.meta.get("vec_denoised"), site=d.site.key)
     sm = pd.DataFrame(summary)
     sm.to_csv(os.path.join(a.out, "probe_summary.csv"), index=False)
-    mt.to_csv(os.path.join(a.out, "match_table.csv"), index=False)
     torch.save(dict(layers=saved, kind=a.kind, readout=a.readout, model=a.model, n_pairs=n, d_model=src.d_model,
-                    n_layers=src.n_layers), os.path.join(a.out, "sharing_directions.pt"))
+                    n_layers=src.n_layers, mask=a.mask, match=a.match), os.path.join(a.out, "sharing_directions.pt"))
+    # balance of the visible (truncated, masked) sequences and the surface baseline on them
+    vis_p, vis_q = [len(t) for t in items[:n]], [len(t) for t in items[n:]]
+    matching["visible_length_smd"] = standardized_mean_difference(np.log(vis_p), np.log(vis_q))
+    matching["visible_n_tokens_mean"] = dict(pos=float(np.mean(vis_p)), neg=float(np.mean(vis_q)))
+    surf = surface_baseline_auc(items[:n], items[n:], seed=a.seed, max_len=a.max_len, features=SURFACE_FEATURES_OOV)
+    report = dict(settings=settings, matching=matching, surface_baseline=surf, probe_summary=sm.to_dict("records"))
+    crit = None
+    src0, src0_name = _control_source(src, a.untrained, a.init_seed, a.model, a.device, a.max_len)
+    if src0 is not None:
+        t1 = time.time()
+        S0 = pooled_states(src0, items, layers, a.readout)
+        t_enc0 = time.time() - t1
+        crit = criterion_table(S, S0, n, layers, surface=surf, seed=a.seed, n_boot=a.n_boot, n_perm=a.n_perm,
+                               n_random=a.n_random, ci=a.ci)
+        crit.to_csv(os.path.join(a.out, "criterion.csv"), index=False)
+        report.update(untrained=src0_name, criterion=crit.to_dict("records"),
+                      verdict=dict(n_pairs=n, layers_counting=[int(l) for l in crit.loc[crit["counts"], "layer"]],
+                                   layers_counting_bonferroni=[int(l) for l in crit.loc[crit.get("counts_adj", crit["counts"]).astype(bool), "layer"]],
+                                   any_counts=bool(crit["counts"].any()),
+                                   rule="delta CI lower bound > 0 and trained AUC > permutation p95"),
+                      seconds=dict(encode_trained=round(t_enc, 1), encode_untrained=round(t_enc0, 1),
+                                   controls=round(time.time() - t1 - t_enc0, 1)))
+    with open(os.path.join(a.out, "probe_report.json"), "w", encoding="utf-8") as fh:
+        json.dump(_jsonable(report), fh, indent=1)
     write_manifest(a.out, kind="trace_probe", probe_kind=a.kind, model=a.model, data=a.inp, n_pairs=n,
-                   layers=layers, readout=a.readout, denoise_pcs=a.denoise_pcs, k=a.k, seed=a.seed,
-                   seconds=round(time.time() - t0, 1))
-    best = sm.sort_values("auc_holdout", ascending=False, na_position="last").iloc[0]
-    _say(f"probe: {n} matched pairs ({a.kind}), {len(layers)} layers; best split-half AUC "
-         f"{best['auc_holdout']:.3f} at layer {int(best['layer'])} -> {a.out}")
+                   layers=layers, readout=a.readout, denoise_pcs=a.denoise_pcs, k=a.k, seed=a.seed, match=a.match,
+                   mask=a.mask, untrained=src0_name, seconds=round(time.time() - t0, 1))
+    bal = matching.get("balance", {})
+    _say(f"probe: {n} matched pairs ({a.kind}, match={matching.get('matching')}, mask={a.mask}; pool "
+         f"{matching.get('pool_pos')} pos / {matching.get('pool_neg')} neg, {matching.get('n_matched_total')} matchable); "
+         f"SMD log length {matching.get('length_smd', float('nan')):.3f}, log gas {matching.get('log_gas_smd'):.3f}, "
+         f"n_nodes {bal.get('n_nodes', {}).get('smd', float('nan')):.3f}; surface AUC {surf['combined']:.3f} "
+         f"(best single {surf['best_single']})")
+    if crit is not None:
+        cols = ["layer", "auc_trained", "auc_untrained", "delta", "delta_ci_lo", "delta_ci_hi", "perm_auc_p95",
+                "random_dir_auc_p95", "counts"]
+        _say(crit[cols].round(3).to_string(index=False))
+    else:
+        best = sm.sort_values("auc_holdout", ascending=False, na_position="last").iloc[0]
+        _say(f"probe: best split-half AUC {best['auc_holdout']:.3f} at layer {int(best['layer'])}")
+    _say(f"probe: -> {a.out}")
+    return 0
+
+
+def cmd_align(a) -> int:
+    from ..io import write_manifest
+    from ..model import load_model
+    from ..transplant import paired_states
+    from .source import (TraceLMSource, alignment_controls, covariate_matrix, length_covariates, load_pairs,
+                         pooled_states)
+    from ..config import ModelSpec
+
+    pairs = load_pairs(a.pairs)
+    if a.max_pairs:
+        pairs = pairs[: a.max_pairs]
+    if len(pairs) < 5:
+        _say(f"align: only {len(pairs)} pairs")
+        return 1
+    t0 = time.time()
+    src = TraceLMSource(a.model, device=a.device, max_len=a.max_len)
+    src0, src0_name = _control_source(src, a.untrained, a.init_seed, a.model, a.device, a.max_len)
+    if src0 is None:
+        _say("align: the controls need an untrained source (--untrained auto or a directory)")
+        return 1
+    name, _, rev = a.target.partition("@")
+    mb = load_model(ModelSpec(name=name, revision=a.target_rev or rev or None, device=a.device))
+    layers_src = _parse_layers(a.layers_src, src.n_layers)
+    layers_tgt = _parse_layers(a.layers_tgt, mb.n_layers)
+    S, T = paired_states(src, mb, pairs, layers_src, layers_tgt, a.readout)
+    S0 = pooled_states(src0, [p[0] for p in pairs], layers_src, a.readout)
+    t_states = time.time() - t0
+    cov = length_covariates([p[0] for p in pairs], texts=[p[1] for p in pairs], tokenizer=mb.tokenizer,
+                            max_len=src.max_len)
+    covsets = {"len3": False, "len3+text": True}
+    frames = []
+    for cname, with_text in covsets.items():
+        Z, znames = covariate_matrix(cov, text=with_text)
+        for alpha in [float(x) for x in a.alphas.split(",")]:
+            df = alignment_controls(S, S0, T, Z, layers_src, layers_tgt, alpha=alpha, holdout=a.holdout, seed=a.seed,
+                                    n_boot=a.n_boot, ci=a.ci)
+            frames.append(df.assign(covariates=cname))
+    res = pd.concat(frames, ignore_index=True)
+    os.makedirs(a.out, exist_ok=True)
+    res.to_csv(os.path.join(a.out, "align_controls.csv"), index=False)
+    cov.to_csv(os.path.join(a.out, "length_covariates.csv"), index=False)
+    summ = []
+    for (cname, alpha), g in res.groupby(["covariates", "alpha"], sort=False):
+        b = g.sort_values("r2_raw", ascending=False).iloc[0]          # the cell the plain alignment would pick
+        r = g.sort_values("r2_resid", ascending=False).iloc[0]
+        gr = g.sort_values("gain_resid", ascending=False).iloc[0]
+        summ.append(dict(covariates=cname, alpha=alpha,
+                         best_raw=b[["layer_src", "layer_tgt", "r2_raw", "r2_raw_untrained", "gain_raw", "gain_raw_ci_lo",
+                                     "gain_raw_ci_hi", "r2_permuted", "r2_length_only", "r2_resid", "r2_resid_untrained",
+                                     "gain_resid", "gain_resid_ci_lo", "gain_resid_ci_hi"]].to_dict(),
+                         best_resid=r[["layer_src", "layer_tgt", "r2_resid", "r2_resid_untrained", "gain_resid",
+                                       "gain_resid_ci_lo", "gain_resid_ci_hi"]].to_dict(),
+                         best_gain_resid=gr[["layer_src", "layer_tgt", "r2_resid", "r2_resid_untrained", "gain_resid",
+                                             "gain_resid_ci_lo", "gain_resid_ci_hi"]].to_dict(),
+                         max_r2_length_only=float(g["r2_length_only"].max()),
+                         n_cells_gain_resid_ci_above_0=int((g["gain_resid_ci_lo"] > 0).sum()),
+                         n_cells=int(len(g))))
+    out = dict(pairs=a.pairs, n_pairs=len(pairs), target=a.target, target_rev=a.target_rev, model=a.model,
+               untrained=src0_name, readout=a.readout, holdout=a.holdout, seed=a.seed, n_boot=a.n_boot,
+               covariates={k: covariate_matrix(cov, text=v)[1] for k, v in covsets.items()},
+               covariate_means=cov.mean().to_dict(), summary=summ,
+               seconds=dict(states=round(t_states, 1), total=round(time.time() - t0, 1)))
+    with open(os.path.join(a.out, "align_summary.json"), "w", encoding="utf-8") as fh:
+        json.dump(_jsonable(out), fh, indent=1)
+    write_manifest(a.out, kind="trace_align_controls", model=a.model, pairs=a.pairs, n_pairs=len(pairs),
+                   target=a.target, untrained=src0_name, alphas=a.alphas, holdout=a.holdout, seed=a.seed)
+    for s in summ:
+        b = s["best_raw"]
+        _say(f"align [{s['covariates']}, alpha={s['alpha']:g}] best raw cell L{int(b['layer_src'])}->L{int(b['layer_tgt'])}: "
+             f"r2 raw {b['r2_raw']:.3f} (untrained {b['r2_raw_untrained']:.3f}, gain {b['gain_raw']:+.3f} "
+             f"[{b['gain_raw_ci_lo']:+.3f}, {b['gain_raw_ci_hi']:+.3f}]), length-only {b['r2_length_only']:.3f}, "
+             f"resid {b['r2_resid']:.3f} (untrained {b['r2_resid_untrained']:.3f}, gain {b['gain_resid']:+.3f} "
+             f"[{b['gain_resid_ci_lo']:+.3f}, {b['gain_resid_ci_hi']:+.3f}])")
+    _say(f"align: {len(pairs)} pairs, {len(res)} rows -> {a.out} ({time.time() - t0:.0f}s)")
     return 0
 
 
@@ -529,6 +706,19 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--k", type=int, default=5)
     q.add_argument("--eras", default=None, help="comma-separated eras (default: kind-specific)")
     q.add_argument("--gas-bins", type=int, default=10)
+    q.add_argument("--match", default="gas", choices=["gas", "length"],
+                   help="gas: era + gas-decile strata (spec); length: era + log ITR length within --length-ratio")
+    q.add_argument("--length-ratio", type=float, default=1.25)
+    q.add_argument("--length-cap", type=int, default=0, help="match on min(n_tokens, cap) (0: raw length)")
+    q.add_argument("--mask", default="none", choices=["none", "dao", "all_addresses"],
+                   help="replace identity tokens by [A_OOV] in both sets before encoding")
+    q.add_argument("--untrained", default="auto",
+                   help="untrained control: 'auto' (in-memory twin, same config/vocab/seed), a model dir, or 'none'")
+    q.add_argument("--init-seed", type=int, default=None, help="seed of the auto twin (default: training seed)")
+    q.add_argument("--n-boot", type=int, default=1000)
+    q.add_argument("--n-perm", type=int, default=200)
+    q.add_argument("--n-random", type=int, default=200)
+    q.add_argument("--ci", type=float, default=0.95)
     q.add_argument("--readout", default="mean", choices=["mean", "last", "call"])
     q.add_argument("--denoise-pcs", type=int, default=0)
     q.add_argument("--max-len", type=int, default=512)
@@ -536,6 +726,27 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--seed", type=int, default=0)
     q.add_argument("--device", default="auto")
     q.set_defaults(func=cmd_probe)
+
+    al = sub.add_parser("align", help="alignment trace LM -> target LM with length / untrained controls")
+    al.add_argument("--model", default="runs/trace_lm")
+    al.add_argument("--pairs", default="runs/trace_pairs.jsonl")
+    al.add_argument("--target", default="EleutherAI/pythia-14m", help="HF model name, optionally name@revision")
+    al.add_argument("--target-rev", default=None)
+    al.add_argument("--untrained", default="auto")
+    al.add_argument("--init-seed", type=int, default=None)
+    al.add_argument("--alphas", default="1,100", help="comma-separated ridge penalties")
+    al.add_argument("--holdout", type=float, default=0.2)
+    al.add_argument("--n-boot", type=int, default=1000)
+    al.add_argument("--ci", type=float, default=0.95)
+    al.add_argument("--layers-src", default="all")
+    al.add_argument("--layers-tgt", default="all")
+    al.add_argument("--readout", default="mean", choices=["mean", "last"])
+    al.add_argument("--max-pairs", type=int, default=None)
+    al.add_argument("--max-len", type=int, default=512)
+    al.add_argument("--seed", type=int, default=0)
+    al.add_argument("--device", default="auto")
+    al.add_argument("--out", default="runs/trace_align")
+    al.set_defaults(func=cmd_align)
 
     r = sub.add_parser("pair", help="(ITR, English text) pairs for the alignment with Pythia")
     r.add_argument("--in", dest="inp", default="data/traces/itr")
