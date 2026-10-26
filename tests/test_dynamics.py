@@ -6,7 +6,7 @@ import torch
 from lsne.config import HookSite
 from lsne.model import run_with_cache
 from lsne.dynamics import (CA_MASS_FLOOR_FACTOR, DamageMap, ca_complexity, ca_marker_mass, ca_mass_floor,
-                           ca_symbolize, damage_spreading, growth_exponent, lexicon_from_axis,
+                           ca_symbolize, damage_spreading, damage_spreading_batch, growth_exponent, lexicon_from_axis,
                            logit_lens_trajectory, lz76, nonmonotonicity_index, spreading_front,
                            symbolize_masses, update_norm_profile)
 
@@ -66,6 +66,66 @@ def test_damage_spreading_zero_dose_and_block_output(mb, sample_ids, cache, dire
         vec = direction
     dm3 = damage_spreading(mb, sample_ids, site, 3, Dir(), 0.02, ref_cache=cache)
     assert np.allclose(dm3.D, damage_spreading(mb, sample_ids, site, 3, direction, 0.02, ref_cache=cache).D)
+
+
+def test_damage_spreading_batch_matches_sequential(mb, sample_ids, cache, direction):
+    """N (direction, dose) pairs in chunked forwards with the reference as row 0 of every
+    chunk = N calls of damage_spreading (D, cos, log p(target), delta norm, Soll/Ist audit),
+    with exact zeros before the injection layer and before the injection position."""
+    L, T = mb.n_layers, sample_ids.shape[1]
+    g = torch.Generator().manual_seed(11)
+    dirs = [direction] + [torch.randn(mb.d_model, generator=g) for _ in range(2)]
+    doses = [0.0, 0.01, 0.1, 1.0]
+    pairs = [(d, e) for d in dirs for e in doses]
+    # 12 pairs: chunks of 5+5+2 perturbed rows / one chunk / one row per forward
+    cases = [(HookSite(1, "block_input"), T // 2, 6), (HookSite(2, "block_output"), 3, 64),
+             (HookSite(1, "mlp_output"), T - 1, 2), (HookSite(L - 1, "block_input"), T - 1, 13)]
+    for site, pos, bs in cases:
+        maps = damage_spreading_batch(mb, sample_ids, site, pos, [d for d, _ in pairs], [e for _, e in pairs],
+                                      target_id=5, batch_size=bs)
+        assert len(maps) == len(pairs)
+        for (d, e), b in zip(pairs, maps):
+            s = damage_spreading(mb, sample_ids, site, pos, d, e, ref_cache=cache, target_id=5)
+            assert isinstance(b, DamageMap) and b.D.shape == s.D.shape == (L + 1, T) and b.cos.shape == (L + 1, T)
+            assert b.layers == s.layers and b.inject_layer == s.inject_layer and b.inject_pos == pos
+            assert b.eps == e and b.site == site.key
+            # nothing upstream of the injection moves: exact zeros, exact unit overlap
+            assert np.all(b.D[:b.inject_layer] == 0.0) and np.all(b.cos[:b.inject_layer] == 1.0)
+            assert np.all(b.D[:, :pos] == 0.0) and np.all(b.cos[:, :pos] == 1.0)
+            big = s.D > 1e-6
+            assert np.allclose(b.D[big], s.D[big], rtol=1e-4, atol=0.0), (site.key, e)
+            assert np.all(np.abs(b.D[~big] - s.D[~big]) <= 1e-6)
+            assert np.allclose(b.cos, s.cos, rtol=0.0, atol=1e-6)
+            assert b.logp_target_ref == pytest.approx(s.logp_target_ref, abs=1e-4)
+            assert b.logp_target_pert == pytest.approx(s.logp_target_pert, abs=1e-4)
+            assert b.delta_norm == pytest.approx(s.delta_norm, rel=1e-5, abs=1e-12)
+            assert {"intended_norm", "written_norm", "rel_err", "dtype"} <= set(b.audit)
+            assert b.audit["intended_norm"] == pytest.approx(s.audit["intended_norm"], rel=1e-5, abs=1e-12)
+            assert b.audit["rel_err"] < 1e-4 and b.audit["dtype"] == s.audit["dtype"]
+            if e == 0.0:
+                assert np.all(b.D == 0.0) and np.all(b.cos == 1.0) and b.logp_target_pert == b.logp_target_ref
+        if site.site == "block_input":
+            # at the injection snapshot only the injected position moves, by the relative dose
+            for (d, e), b in zip(pairs, maps):
+                assert b.D[site.layer, pos] == pytest.approx(e, rel=1e-3, abs=1e-12)
+                assert np.all(b.D[site.layer, pos + 1:] == 0.0)
+    # input forms: [N, d] tensor + one dose for all rows == Direction-like objects + a dose list
+    site, pos = HookSite(1, "block_input"), T // 2
+
+    class Dir:  # noqa: D401 - duck type
+        def __init__(self, v):
+            self.vec = v
+    m1 = damage_spreading_batch(mb, sample_ids, site, pos, torch.stack(dirs), 0.1, batch_size=3)
+    m2 = damage_spreading_batch(mb, sample_ids, site, pos, [Dir(d) for d in dirs], [0.1] * 3)
+    assert len(m1) == len(m2) == 3 and all(np.allclose(a.D, b.D, rtol=1e-4, atol=1e-7) for a, b in zip(m1, m2))
+    assert np.isnan(m1[0].logp_target_ref) and np.isnan(m1[0].logp_target_pert)
+    assert damage_spreading_batch(mb, sample_ids, site, pos, [], []) == []
+    with pytest.raises(ValueError):
+        damage_spreading_batch(mb, sample_ids, site, pos, dirs, [0.1, 0.2])
+    with pytest.raises(ValueError):
+        damage_spreading_batch(mb, sample_ids, site, pos, dirs, 0.1, batch_size=1)
+    with pytest.raises(ValueError):
+        damage_spreading_batch(mb, sample_ids, site, T, dirs, 0.1)
 
 
 def test_growth_exponent_and_front(mb, sample_ids, cache, direction):

@@ -154,6 +154,10 @@ def grad_x_act(mb, ids, site, target_id) -> Tensor[T]
 ```python
 @dataclass DamageMap: D: ndarray[L+1, T] (relative L2), cos: ndarray[L+1,T], layers: list[str], inject_layer:int, inject_pos:int, eps:float
 def damage_spreading(mb, input_ids, site, position, direction: Tensor[d], eps, ref_cache: CacheOut|None=None) -> DamageMap
+def damage_spreading_batch(mb, input_ids, site, position, directions: Tensor[N,d]|list, eps: float|list[N], target_id=None, batch_size=64) -> list[DamageMap]
+    # N (direction, dose) pairs of one input in forwards of batch_size rows; row 0 of every forward is the unperturbed
+    # reference (same kernels -> exact D = 0 upstream of the injection); D/cos reduced per snapshot on the device,
+    # LM head on the last position only (logits_to_keep=1); stage D1 uses it for all pairs of one injection
 def growth_exponent(dm: DamageMap, positions: list[int], layer_from:int|None=None) -> dict(lam, intercept, r2, per_position: ndarray)   # OLS of ln D over layer index, layers > inject_layer; D clipped at 1e-12
 def spreading_front(dm, threshold) -> ndarray[L+1]   # per layer: max distance (in positions) from inject_pos where D > threshold
 def logit_lens_trajectory(mb, cache: CacheOut, positions=None) -> dict(kl [L+1,T], target_rank [L+1,T], target_logp [L+1,T])

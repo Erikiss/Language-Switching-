@@ -574,6 +574,60 @@ def test_load_variants_and_smoke_config(mb):
     assert [f.tag for f in fams] == ["DEV01B"]
 
 
+def test_damage_tables_batched_and_nothing_retained(mb, tok, monkeypatch):
+    """D1 runs all (direction, dose) pairs of an injection through damage_spreading_batch and
+    keeps nothing per variant (field report: a full reference cache with [1, T, V] logits per
+    variant on the GPU ran a 40 GB A100 out of memory after ~450 pythia-160m variants).
+    The tables equal those of the sequential per-pair path."""
+    import gc
+    import warnings
+    from lsne.directions import Direction
+    from lsne.dynamics import damage_spreading
+    from lsne.experiments import stage_d_noneq as SD
+
+    vs = C.apply_variant_limit(_dev01a(tok), 3)
+    site, dsite = C.dossier_site(mb), C.depth_site(mb)
+    g = torch.Generator().manual_seed(0)
+    banks = {s.key: C.DirectionBank(site=s, dirs={n: Direction(n, torch.randn(mb.d_model, generator=g), s) for n in names})
+             for s, names in ((site, ("lang_dom", "rand_00", "rand_01")), (dsite, ("lang_dom", "rand_00")))}
+    names, doses = ["lang_dom", "rand_00", "rand_01"], (0.01, 0.5)
+    calls = []
+    real_rwc = SD.run_with_cache
+    monkeypatch.setattr(SD, "run_with_cache", lambda *a, **k: calls.append(1) or real_rwc(*a, **k))
+
+    def n_tensors():
+        gc.collect()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return sum(1 for o in gc.get_objects() if isinstance(o, torch.Tensor))
+
+    with pytest.warns(UserWarning, match="rand_01"):     # missing at the depth site: skipped there
+        SD.damage_tables(mb, vs[:1], banks, names, doses, enabled=False, batch_size=4)    # warm-up
+    n0 = n_tensors()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out = SD.damage_tables(mb, vs, banks, names, doses, enabled=False, batch_size=4)
+    assert isinstance(out, tuple) and len(out) == 2          # (damage, damage_profile): no cache dict
+    assert all(isinstance(t, pd.DataFrame) for t in out)
+    assert n_tensors() == n0 and not calls                     # no tensor survives, no reference cache built
+    dmg, prof = out
+    assert len(dmg) == len(vs) * (3 + 2) * len(doses) and len(prof) == len(dmg) * (mb.n_layers + 1)
+    assert (dmg["audit_rel_err"] < 1e-4).all() and (dmg[dmg["inject"] == "dossier"]["direction"] == "rand_01").any()
+    # same tables as the sequential path (one damage_spreading per pair)
+    def sequential(mb_, ids, site_, pos, dirs, eps, target_id=None, batch_size=None):
+        return [damage_spreading(mb_, ids, site_, pos, d, e, target_id=target_id) for d, e in zip(dirs, eps)]
+    monkeypatch.setattr(SD, "damage_spreading_batch", sequential)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        dmg_s, prof_s = SD.damage_tables(mb, vs, banks, names, doses, enabled=False)
+    for a, b in ((dmg, dmg_s), (prof, prof_s)):
+        assert list(a.columns) == list(b.columns) and a.shape == b.shape
+        num = [c for c in a.columns if a[c].dtype.kind == "f"]
+        rest = [c for c in a.columns if c not in num]
+        assert a[rest].equals(b[rest])
+        assert np.allclose(a[num].to_numpy(), b[num].to_numpy(), rtol=1e-4, atol=1e-5, equal_nan=True)
+
+
 def test_plan_triples_partition():
     pairs = [("m", "r1"), ("m", "r2"), ("n", "r1")]
     fams = ["F01", "F02", "F03", "DEV01"]

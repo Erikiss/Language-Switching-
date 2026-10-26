@@ -122,6 +122,7 @@ class Limits:
     n_boot: int = 2000              # cluster-bootstrap resamples
     # stage D
     damage_doses: tuple = (0.01, 0.05, 0.1)
+    damage_batch_size: int = 64     # D1 rows per forward incl. the reference (lsne.dynamics.DAMAGE_BATCH_SIZE)
     gen_n_steps: int = 8            # D3 ramp steps
     gen_tokens_per_step: int = 8    # D3 tokens per plateau
     gen_t_on: int = 16              # D4 quench time

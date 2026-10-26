@@ -5,7 +5,9 @@
 the token position. Implemented here:
 
 * D1 damage spreading: a State-2143 dose at one lattice site, the relative perturbation
-  ``D[l, t]`` on every later snapshot, its depth growth exponent and spreading front;
+  ``D[l, t]`` on every later snapshot, its depth growth exponent and spreading front
+  (one map per forward: :func:`damage_spreading`; many (direction, dose) pairs of one
+  input in batched forwards with the reference as row 0: :func:`damage_spreading_batch`);
 * D2 depth monotonicity: logit-lens KL trajectory to the final prediction and a
   non-monotonicity index;
 * update-norm profile between consecutive snapshots;
@@ -17,6 +19,8 @@ All outputs are numpy arrays or plain floats; only the model calls use torch.
 """
 from __future__ import annotations
 
+import contextlib
+import inspect
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
@@ -24,10 +28,24 @@ import numpy as np
 import torch
 
 from .config import HookSite
-from .model import CacheOut, Injector, ModelBundle, all_block_inputs, logit_lens, make_dose_delta, run_with_cache
+from .model import (CacheOut, Injector, ModelBundle, _first_tensor, _get_hidden, all_block_inputs, logit_lens,
+                    make_dose_delta, run_with_cache)
 
 _NORM_EPS = 1e-12
 _D_CLIP = 1e-12
+#: Default rows per forward of :func:`damage_spreading_batch` (the unperturbed reference
+#: row plus up to 63 perturbed copies).  Peak memory of one chunk = the model's forward
+#: activations for ``batch_size x T`` tokens (logits only for the last position) plus two
+#: or three ``[batch_size, T, d]`` float32 temporaries of the per-snapshot D / cos
+#: reduction; no residual snapshot is stored.  Per row at T = 320, float32, eager
+#: attention (the [n_heads, T, T] scores twice, the [T, 4d] MLP intermediate twice, a few
+#: [T, d] buffers): measured 20.5 MiB for pythia-160m and 15 MiB for pythia-70m (CPU peak
+#: RSS slope), estimated ~27 MiB for 410m and ~40 MiB for 1b / 1.4b.  64 rows therefore
+#: need ~1.3 GiB (160m) to ~2.6 GiB (1.4b) on top of the weights (0.65 GB / 5.6 GB): far
+#: below 40 GB on an A100 for every Pythia model up to 1.4b, and 64 x 150-320 tokens keep
+#: the GPU busy even for pythia-160m (the stage-D variants have T = 94..182).  On CPU the
+#: batch size hardly matters (16, 64 and 128 rows give the same throughput).
+DAMAGE_BATCH_SIZE = 64
 #: Symbols of the cellular-automaton view.
 CA_N, CA_E, CA_D = 0, 1, 2
 #: Default absolute marker-mass floor of :func:`ca_symbolize`, as a multiple of the
@@ -185,6 +203,185 @@ def damage_spreading(mb: ModelBundle, input_ids, site: HookSite, position: int, 
     return DamageMap(D=D, cos=cos, layers=list(keys), inject_layer=inject_layer, inject_pos=position,
                      eps=float(eps), site=site.key, logp_target_ref=lp_ref, logp_target_pert=lp_pert,
                      delta_norm=float(delta.float().norm()), audit=dict(inj.audit))
+
+
+class _BatchDose:
+    """Callable delta for :class:`~lsne.model.Injector` used by :func:`damage_spreading_batch`.
+
+    Row 0 of the chunk ``h [B, T, d]`` is the unperturbed reference and stays untouched;
+    row ``1 + i`` receives ``make_dose_delta(h[0, position], vecs[i], eps[i])`` at
+    ``position`` - exactly the delta of :func:`damage_spreading`, built from the reference
+    residual of the same forward.  ``row_audit`` holds the Soll/Ist record of every row
+    (``Injector`` semantics: intended = the delta in the model dtype, written = h_new - h in
+    float32, ``rel_err = ||written - intended|| / ||intended||``); ``audit`` is the record of
+    the whole chunk (adopted by the Injector)."""
+
+    def __init__(self, vecs: torch.Tensor, eps: Sequence[float], position: int):
+        self.vecs = vecs
+        self.eps = [float(e) for e in eps]
+        self.position = int(position)
+        self.audit: dict = {}
+        self.row_audit: list[dict] = []
+        self.delta_norms: list[float] = []
+
+    def __call__(self, h: torch.Tensor) -> torch.Tensor:
+        n = len(self.eps)
+        if h.shape[0] != n + 1:
+            raise RuntimeError(f"chunk of {h.shape[0]} rows for {n} doses + the reference row")
+        p = self.position
+        h_ref = h[0, p].detach()
+        vecs = self.vecs.to(h_ref.device)
+        delta = torch.stack([make_dose_delta(h_ref, vecs[i], self.eps[i]) for i in range(n)]).to(h.dtype)   # [n, d]
+        h_new = h.clone()
+        h_new[1:, p, :] = h_new[1:, p, :] + delta
+        with torch.no_grad():
+            intended = delta.float()
+            written = h_new[1:, p, :].float() - h[1:, p, :].float()
+            i_norm = intended.norm(dim=-1)
+            w_norm = written.norm(dim=-1)
+            err = (written - intended).norm(dim=-1)
+            rel = err / i_norm.clamp_min(1e-30)
+            dt = str(h.dtype)
+            self.delta_norms = [float(x) for x in i_norm.cpu().tolist()]
+            self.row_audit = [dict(intended_norm=float(a), written_norm=float(b), rel_err=float(c), dtype=dt)
+                              for a, b, c in zip(i_norm.cpu().tolist(), w_norm.cpu().tolist(), rel.cpu().tolist())]
+            tot = intended.norm()
+            self.audit = dict(intended_norm=float(tot), written_norm=float(written.norm()),
+                              rel_err=float((written - intended).norm() / tot.clamp_min(1e-30)), dtype=dt, n_rows=n)
+        return h_new
+
+
+@contextlib.contextmanager
+def _damage_recording(mb: ModelBundle, sites: Sequence[HookSite], D_out: torch.Tensor, cos_out: torch.Tensor):
+    """Hooks that reduce every depth snapshot of a chunk on the fly against its row 0:
+    ``D_out[i, l, t]`` / ``cos_out[i, l, t]`` for perturbed row ``1 + i`` (same formulas as
+    :func:`damage_spreading`, float32 on the model device); no snapshot is stored."""
+    handles = []
+
+    def reduce(h: torch.Tensor, l: int):
+        H = h.detach().float()                                   # [B, T, d]
+        ref = H[:1]
+        dn = (H[1:] - ref).norm(dim=-1)                          # [B-1, T]
+        D_out[:, l] = dn / (ref.norm(dim=-1) + _NORM_EPS)
+        c = torch.nn.functional.cosine_similarity(H[1:], ref, dim=-1, eps=_NORM_EPS)
+        cos_out[:, l] = torch.where(dn == 0, torch.ones_like(c), c)
+
+    try:
+        for l, s in enumerate(sites):
+            mod = mb.module_for(s)
+            if s.site == "block_input":
+                def pre(module, args, kwargs, _l=l):
+                    reduce(_get_hidden(args, kwargs), _l)
+                handles.append(mod.register_forward_pre_hook(pre, with_kwargs=True))
+            else:
+                def post(module, args, out, _l=l):
+                    reduce(_first_tensor(out), _l)
+                handles.append(mod.register_forward_hook(post))
+        yield
+    finally:
+        for hd in handles:
+            hd.remove()
+
+
+def _last_logits_kwargs(mb: ModelBundle) -> dict:
+    """Forward kwarg that restricts the LM head to the last position (``logits_to_keep=1``
+    in transformers >= 4.50 incl. 5.x; ``num_logits_to_keep`` in older versions; empty if
+    neither exists, then the full logits are computed and sliced)."""
+    try:
+        params = inspect.signature(mb.model.forward).parameters
+    except (TypeError, ValueError):
+        return {}
+    for name in ("logits_to_keep", "num_logits_to_keep"):
+        if name in params:
+            return {name: 1}
+    return {}
+
+
+def _stack_dirs(directions) -> torch.Tensor:
+    """[N, d] float32 CPU stack of direction objects / vectors / an [N, d] array."""
+    if isinstance(directions, (torch.Tensor, np.ndarray)) and np.ndim(directions) == 2:
+        return torch.as_tensor(directions).detach().float().cpu()
+    vecs = [_as_vec(d) for d in directions]
+    if not vecs:
+        return torch.zeros(0, 0)
+    return torch.stack(vecs, 0)
+
+
+def damage_spreading_batch(mb: ModelBundle, input_ids, site: HookSite, position: int, directions, eps,
+                           target_id: Optional[int] = None, batch_size: int = DAMAGE_BATCH_SIZE) -> list[DamageMap]:
+    """Batched :func:`damage_spreading`: N (direction, dose) pairs of one input.
+
+    ``directions`` is an ``[N, d]`` tensor / array or a sequence of N directions (objects
+    with ``.vec``, tensors or arrays); ``eps`` a float (same dose for every row) or N
+    floats.  The N perturbed copies run in chunks of ``batch_size`` rows (``batch_size - 1``
+    perturbed copies per forward); **row 0 of every chunk is the unperturbed reference**,
+    so reference and perturbed states go through the same kernels: snapshots before the
+    injection layer and, by causality, positions before ``position`` come out exactly
+    ``D = 0``.  Row ``1 + i`` gets ``make_dose_delta(h_ref[position], dir_i, eps_i)`` with
+    ``h_ref`` the residual of row 0 at ``site``.  ``D`` / ``cos`` are reduced per snapshot
+    on the model device while the forward runs (no snapshot is kept) and only the
+    ``[N, L+1, T]`` arrays move to the CPU; the LM head runs on the last position only.
+
+    Returns N :class:`DamageMap` in input order, with the meaning of the sequential maps
+    (``logp_target_ref`` from the reference row of the row's own chunk, ``audit`` = the
+    Soll/Ist record of the row: ``intended_norm``, ``written_norm``, ``rel_err``, ``dtype``,
+    plus ``chunk_rows`` / ``chunk_rel_err`` of its forward).  Agrees with N calls of
+    :func:`damage_spreading` up to float32 round-off (batch-size dependent GEMM blocking).
+    Memory of a chunk: see :data:`DAMAGE_BATCH_SIZE`.
+    """
+    ids = _to_ids(mb, input_ids)
+    T = int(ids.shape[1])
+    position = int(position)
+    if not (0 <= position < T):
+        raise ValueError(f"position {position} outside [0, {T})")
+    batch_size = int(batch_size)
+    if batch_size < 2:
+        raise ValueError(f"batch_size must be >= 2 (reference row + one perturbed row), got {batch_size}")
+    vecs = _stack_dirs(directions)
+    N = int(vecs.shape[0])
+    if np.ndim(eps) == 0:
+        eps_l = [float(eps)] * N
+    else:
+        eps_l = [float(e) for e in np.asarray(eps, dtype=float).reshape(-1)]
+        if len(eps_l) != N:
+            raise ValueError(f"{len(eps_l)} doses for {N} directions")
+    if N == 0:
+        return []
+    if vecs.shape[1] != mb.d_model:
+        raise ValueError(f"directions have dimension {vecs.shape[1]}, model has {mb.d_model}")
+    sites = all_block_inputs(mb)
+    keys = [s.key for s in sites]
+    n_snap = len(sites)
+    inject_layer = int(site.layer) if site.site == "block_input" else int(site.layer) + 1
+    logit_kw = _last_logits_kwargs(mb)
+    vecs = vecs.to(mb.device)
+    out: list[DamageMap] = []
+    step = batch_size - 1
+    for c0 in range(0, N, step):
+        idx = list(range(c0, min(N, c0 + step)))
+        n = len(idx)
+        dose = _BatchDose(vecs[idx[0]:idx[-1] + 1], [eps_l[i] for i in idx], position)
+        D_dev = torch.zeros((n, n_snap, T), dtype=torch.float32, device=mb.device)
+        cos_dev = torch.ones((n, n_snap, T), dtype=torch.float32, device=mb.device)
+        chunk_ids = ids.expand(n + 1, T).contiguous()
+        # injector first: at a shared module its hook runs before the recording hook, so the
+        # snapshot at the injection layer already carries the dose (as in damage_spreading)
+        with torch.no_grad(), Injector(mb, site, dose, mode="add"), _damage_recording(mb, sites, D_dev, cos_dev):
+            res = mb.model(input_ids=chunk_ids, attention_mask=None, use_cache=False, **logit_kw)
+        lp_ref = [float("nan")] * (n + 1)
+        if target_id is not None:
+            lp = torch.log_softmax(res.logits[:, -1].float(), -1)[:, int(target_id)]
+            lp_ref = [float(x) for x in lp.cpu().tolist()]
+        del res
+        D_np = D_dev.cpu().numpy().astype(np.float64)
+        cos_np = cos_dev.cpu().numpy().astype(np.float64)
+        del D_dev, cos_dev
+        for j, i in enumerate(idx):
+            audit = dict(dose.row_audit[j], chunk_rows=n + 1, chunk_rel_err=float(dose.audit.get("rel_err", float("nan"))))
+            out.append(DamageMap(D=D_np[j].copy(), cos=cos_np[j].copy(), layers=list(keys), inject_layer=inject_layer,
+                                 inject_pos=position, eps=eps_l[i], site=site.key, logp_target_ref=lp_ref[0],
+                                 logp_target_pert=lp_ref[1 + j], delta_norm=dose.delta_norms[j], audit=audit))
+    return out
 
 
 def growth_exponent(dm: DamageMap, positions: Sequence[int], layer_from: Optional[int] = None) -> dict:

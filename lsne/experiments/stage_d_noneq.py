@@ -63,8 +63,8 @@ import torch
 from .. import stimuli
 from ..config import RunConfig, HookSite
 from ..directions import Direction, cosine
-from ..dynamics import (ca_complexity, ca_marker_mass, ca_mass_floor, damage_spreading, growth_exponent,
-                        logit_lens_trajectory, nonmonotonicity_index, resolve_markers, spreading_front,
+from ..dynamics import (DAMAGE_BATCH_SIZE, ca_complexity, ca_marker_mass, ca_mass_floor, damage_spreading_batch,
+                        growth_exponent, logit_lens_trajectory, nonmonotonicity_index, resolve_markers, spreading_front,
                         symbolize_masses, update_norm_profile)
 from ..generation import (block_fraction, fdt_ratio, hysteresis, language_trajectory, relaxation, schedule_const,
                           susceptibility, switch_interval_stats)
@@ -144,61 +144,71 @@ def depth_bank(cfg: RunConfig, mb: ModelBundle, variants, site: HookSite, base: 
 
 
 def damage_tables(mb: ModelBundle, variants, banks, dir_names, doses, enabled=True,
-                  ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    """Returns (damage, damage_profile, caches) where caches maps tag -> reference cache.
+                  batch_size: int = DAMAGE_BATCH_SIZE) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Returns (damage, damage_profile).
 
     ``banks`` is a single bank or a mapping ``site.key -> DirectionBank`` (see
     :func:`bank_for_site`): every injection is made with the direction fitted at its own
     site, recorded as ``dir_site``.  A direction missing from a site's bank is skipped
-    for that injection (one warning per name and site)."""
+    for that injection (one warning per name and site).
+
+    All (direction, dose) pairs of one injection run through
+    :func:`lsne.dynamics.damage_spreading_batch` in forwards of ``batch_size`` rows (the
+    unperturbed reference is row 0 of every forward).  Nothing is kept across variants:
+    the damage maps of an injection are reduced to table rows before the next one starts,
+    and no reference cache is retained (stage D used to hold one ``all_block_inputs``
+    cache with the full ``[1, T, V]`` logits per variant on the device until
+    :func:`lens_tables`, ~36 MiB per pythia-160m variant, which ran the full 1153-variant
+    run out of memory on a 40 GB A100)."""
     rows, prof = [], []
-    caches: dict = {}
     missing: set = set()
     for v in C.progress(variants, "D1 damage", enabled=enabled):
         ids = C.ids_tensor(mb, v)
         T = int(v.n_tokens)
-        ref = run_with_cache(mb, ids, "all_block_inputs")
-        caches[v.tag] = ref
         tail = C.tail_positions(v)
         for inj_name, site, pos in injections(mb, v):
             bank = bank_for_site(banks, site)
             info = position_info(v, pos)
             positions = [p for p in tail if p >= pos] or [T - 1]
+            todo = []
             for name in dir_names:
                 if name not in bank:
                     if (name, site.key) not in missing:
                         warnings.warn(f"direction {name!r} has no version at {site.key}; skipped for the {inj_name} injection")
                         missing.add((name, site.key))
                     continue
+                todo.extend((name, float(eps)) for eps in doses)
+            if not todo:
+                continue
+            maps = damage_spreading_batch(mb, ids, site, pos, [bank[name].vec for name, _ in todo],
+                                          [eps for _, eps in todo], target_id=int(v.target_id), batch_size=batch_size)
+            for (name, eps), dm in zip(todo, maps):
                 d = bank[name]
-                vec = d.vec
-                for eps in doses:
-                    dm = damage_spreading(mb, ids, site, pos, vec, float(eps), ref_cache=ref, target_id=int(v.target_id))
-                    ge = growth_exponent(dm, positions)
-                    fronts = {thr: spreading_front(dm, thr) for thr in FRONT_THRESHOLDS}
-                    D_tail = dm.D[:, positions].mean(axis=1)                      # [L+1]
-                    after = list(range(pos, T))
-                    rows.append(dict(C.variant_row(v), inject=inj_name, site=site.key, dir_site=d.site.key,
-                                     inject_layer=int(dm.inject_layer), inject_pos=int(pos), **info,
-                                     direction=name, dir_family=C.dir_family(name), eps=float(eps),
-                                     lam=float(ge["lam"]), intercept=float(ge["intercept"]), r2=float(ge["r2"]),
-                                     n_fit_layers=int(len(ge["layers"])),
-                                     D_final_tail=float(D_tail[-1]), D_final_last=float(dm.D[-1, T - 1]),
-                                     D_max=float(dm.D.max()), cos_final_last=float(dm.cos[-1, T - 1]),
-                                     front01_final=int(fronts[0.01][-1]), front1_final=int(fronts[0.1][-1]),
-                                     front01_max=int(fronts[0.01].max()), front1_max=int(fronts[0.1].max()),
-                                     n_spread01_final=int((dm.D[-1, after] > 0.01).sum()),
-                                     n_spread1_final=int((dm.D[-1, after] > 0.1).sum()),
-                                     n_after=len(after), logp_target_ref=float(dm.logp_target_ref),
-                                     logp_target_pert=float(dm.logp_target_pert),
-                                     B=float(dm.logp_target_pert - dm.logp_target_ref), delta_norm=float(dm.delta_norm),
-                                     audit_rel_err=float(dm.audit.get("rel_err", float("nan")))))
-                    for l, key in enumerate(dm.layers):
-                        prof.append(dict(tag=v.tag, family=v.family_id, formulation=v.formulation, K=int(v.K), C=str(v.C),
-                                         inject=inj_name, direction=name, dir_family=C.dir_family(name), eps=float(eps),
-                                         layer=l, snapshot=key, D_tail=float(D_tail[l]), D_last=float(dm.D[l, T - 1]),
-                                         D_after_mean=float(dm.D[l, after].mean()),
-                                         front01=int(fronts[0.01][l]), front1=int(fronts[0.1][l])))
+                ge = growth_exponent(dm, positions)
+                fronts = {thr: spreading_front(dm, thr) for thr in FRONT_THRESHOLDS}
+                D_tail = dm.D[:, positions].mean(axis=1)                      # [L+1]
+                after = list(range(pos, T))
+                rows.append(dict(C.variant_row(v), inject=inj_name, site=site.key, dir_site=d.site.key,
+                                 inject_layer=int(dm.inject_layer), inject_pos=int(pos), **info,
+                                 direction=name, dir_family=C.dir_family(name), eps=float(eps),
+                                 lam=float(ge["lam"]), intercept=float(ge["intercept"]), r2=float(ge["r2"]),
+                                 n_fit_layers=int(len(ge["layers"])),
+                                 D_final_tail=float(D_tail[-1]), D_final_last=float(dm.D[-1, T - 1]),
+                                 D_max=float(dm.D.max()), cos_final_last=float(dm.cos[-1, T - 1]),
+                                 front01_final=int(fronts[0.01][-1]), front1_final=int(fronts[0.1][-1]),
+                                 front01_max=int(fronts[0.01].max()), front1_max=int(fronts[0.1].max()),
+                                 n_spread01_final=int((dm.D[-1, after] > 0.01).sum()),
+                                 n_spread1_final=int((dm.D[-1, after] > 0.1).sum()),
+                                 n_after=len(after), logp_target_ref=float(dm.logp_target_ref),
+                                 logp_target_pert=float(dm.logp_target_pert),
+                                 B=float(dm.logp_target_pert - dm.logp_target_ref), delta_norm=float(dm.delta_norm),
+                                 audit_rel_err=float(dm.audit.get("rel_err", float("nan")))))
+                for l, key in enumerate(dm.layers):
+                    prof.append(dict(tag=v.tag, family=v.family_id, formulation=v.formulation, K=int(v.K), C=str(v.C),
+                                     inject=inj_name, direction=name, dir_family=C.dir_family(name), eps=float(eps),
+                                     layer=l, snapshot=key, D_tail=float(D_tail[l]), D_last=float(dm.D[l, T - 1]),
+                                     D_after_mean=float(dm.D[l, after].mean()),
+                                     front01=int(fronts[0.01][l]), front1=int(fronts[0.1][l])))
     dcols = list(C.ID_COLS) + ["inject", "site", "dir_site", "inject_layer", "inject_pos", "inject_lang", "inject_unit",
                                "inject_token", "inject_klass", "direction", "dir_family", "eps", "lam",
                                "intercept", "r2", "n_fit_layers", "D_final_tail", "D_final_last", "D_max", "cos_final_last",
@@ -207,7 +217,7 @@ def damage_tables(mb: ModelBundle, variants, banks, dir_names, doses, enabled=Tr
                                "audit_rel_err"]
     pcols = ["tag", "family", "formulation", "K", "C", "inject", "direction", "dir_family", "eps", "layer", "snapshot",
              "D_tail", "D_last", "D_after_mean", "front01", "front1"]
-    return pd.DataFrame(rows, columns=dcols), pd.DataFrame(prof, columns=pcols), caches
+    return pd.DataFrame(rows, columns=dcols), pd.DataFrame(prof, columns=pcols)
 
 
 def phase_table(damage: pd.DataFrame) -> pd.DataFrame:
@@ -231,16 +241,23 @@ def phase_table(damage: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------------------
 # D2 logit lens, D9 cellular automaton
 # --------------------------------------------------------------------------------------
-def lens_tables(mb: ModelBundle, variants, caches: dict, lexicon: dict, lang_axis, threshold: float,
+def lens_tables(mb: ModelBundle, variants, caches: dict | None, lexicon: dict, lang_axis, threshold: float,
                 enabled=True, mass_floor=CA_MASS_FLOOR) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """D2 lens tables and the D9 symbol field.  ``mass_floor`` is the absolute marker-mass
-    floor of :func:`lsne.dynamics.ca_symbolize` (``"auto"`` or a probability mass)."""
+    floor of :func:`lsne.dynamics.ca_symbolize` (``"auto"`` or a probability mass).
+
+    ``caches`` may map tag -> ``all_block_inputs`` reference cache; ``None`` or a missing tag
+    recomputes the reference (one forward per variant, held only for that variant).
+    :func:`run` passes ``None``: keeping a cache per variant does not fit the device."""
     lens_rows, summ_rows, upd_rows, ca_rows, cal_rows = [], [], [], [], []
     markers = resolve_markers(mb, lexicon, lang_axis)
     floor = ca_mass_floor(mass_floor, len(markers["E"]) + len(markers["D"]), mb.vocab)
+    caches = caches or {}
     for v in C.progress(variants, "D2/D9 lens + CA", enabled=enabled):
         T = int(v.n_tokens)
-        ref = caches.get(v.tag) or run_with_cache(mb, C.ids_tensor(mb, v), "all_block_inputs")
+        ref = caches.get(v.tag)
+        if ref is None:
+            ref = run_with_cache(mb, C.ids_tensor(mb, v), "all_block_inputs")
         tail = C.tail_positions(v)
         last = logit_lens_trajectory(mb, ref, target_id=int(v.target_id), positions=[T - 1])
         nxt_pos = [p for p in tail if p < T - 1] or [max(0, T - 2)]
@@ -285,6 +302,7 @@ def lens_tables(mb: ModelBundle, variants, caches: dict, lexicon: dict, lang_axi
                                  frac_D_tail=float((S[l, tail] == 2).mean()) if tail else float("nan"),
                                  activity=float((S[l] != S[l - 1]).mean()) if l > 0 else float("nan"),
                                  marker_mass_median=float(np.median(tot[l])), frac_below_floor=float((tot[l] < floor).mean())))
+        del ref
     return (pd.DataFrame(lens_rows), pd.DataFrame(summ_rows), pd.DataFrame(upd_rows), pd.DataFrame(ca_rows),
             pd.DataFrame(cal_rows))
 
@@ -419,12 +437,13 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
         rand = bank.rand_names[:8]
         lattice_dirs = [n for n in lattice_dirs if C.dir_family(n) != "rand"] + rand
     doses = tuple(float(e) for e in limits.damage_doses) + tuple(float(e) for e in cfg.doses_steer)
-    damage, profile, caches = damage_tables(mb, allv, banks, lattice_dirs, doses, enabled=limits.progress)
+    damage_batch = int(getattr(limits, "damage_batch_size", DAMAGE_BATCH_SIZE))
+    damage, profile = damage_tables(mb, allv, banks, lattice_dirs, doses, enabled=limits.progress,
+                                    batch_size=damage_batch)
     lexicon = C.marker_lexicon(mb.tokenizer)
-    lens, lens_summary, upd, ca, ca_layers = lens_tables(mb, allv, caches, lexicon, bank.get("lang_dom"),
+    lens, lens_summary, upd, ca, ca_layers = lens_tables(mb, allv, None, lexicon, bank.get("lang_dom"),
                                                          limits.ca_threshold, enabled=limits.progress,
                                                          mass_floor=CA_MASS_FLOOR)
-    del caches
 
     gen_dirs = bank.names(("lang_dom",) if limits.limited else GEN_FAMILIES)
     core = C.core_subset(allv)
