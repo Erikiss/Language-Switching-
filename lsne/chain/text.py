@@ -5,13 +5,26 @@ to ``max_nodes - 1`` internal calls in depth-first order with the nesting expres
 words ("Inside that call, …", "Back at level two, …"), values in ETH with two
 significant figures, failures, and a closing summary of the value flow, events and
 storage writes.  Fully deterministic (no randomness, no dict-order dependence).
+
+The value-flow summary uses the same definition as the labels
+(:func:`lsne.chain.itr.effective_transfers`: no reverted and no ``call_code`` /
+``delegate_call`` context-value rows) and adds the net flow
+(:func:`lsne.chain.itr.net_flows`, what ``fan_out_eth`` / ``fan_in_eth`` count) whenever it
+differs from the gross transfers (ETH routed through a contract, refunds).  Whether an
+address is a "contract" or an "account" comes from code evidence -- the chunk-level
+``TxRecord.address_kinds`` (:func:`lsne.chain.itr.address_kinds`) or the call itself
+(children, logs, storage writes, gas spent; no code ran) -- and is "address" when unknown.
+
+The text covers the whole transaction, the ITR window of the trace LM only its first
+``max_len`` tokens; pairs for the alignment therefore exclude transactions longer than
+the window (``python -m lsne.chain.cli pair --max-len``).
 """
 from __future__ import annotations
 
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Optional
 
-from .itr import CallNode, TxRecord, error_kind, iter_nodes
+from .itr import CallNode, TxRecord, effective_transfers, error_kind, iter_nodes, net_flows, reverted_indices
 
 ADDRESS_STYLES = ("short", "full", "named")
 _NAMES = {
@@ -77,9 +90,21 @@ def _kind_addr(kind: str, a: Optional[str], style: str) -> str:
     return f"{kind} {_addr(a, style)}"
 
 
-def _is_contract(n: CallNode) -> bool:
-    return bool(n.selector or n.children or n.logs or n.state_writes or n.n_input_bytes > 0
-                or n.call_type == "create")
+def _address_kind(a: Optional[str], rec: TxRecord, n: Optional[CallNode] = None) -> str:
+    """``"contract"`` / ``"account"`` from code evidence, ``"address"`` when unknown: the
+    chunk-level ``rec.address_kinds`` first, then the call ``n`` to ``a`` itself (code ran:
+    children, logs, storage writes or gas spent without an error; no code ran: a successful
+    call that spent no gas)."""
+    k = (rec.address_kinds or {}).get(a) if a else None
+    if k in ("contract", "account"):
+        return k
+    if n is not None and n.call_type == "create":
+        return "contract"
+    if n is not None and not n.error and n.call_type != "suicide":
+        if n.children or n.logs or n.state_writes or n.gas_used > 0:
+            return "contract"
+        return "account"
+    return "address"
 
 
 def _fn(n: CallNode) -> str:
@@ -99,7 +124,7 @@ def _root_sentence(rec: TxRecord, style: str) -> str:
         what = f"contract {_addr(n.created, style)}" if n.created else "a contract"
         s = f"{sender} creates {what}" + (f" and funds it with {v} ETH" if n.value else "") + "."
     else:
-        kind = "contract" if _is_contract(n) else "account"
+        kind = _address_kind(n.to or rec.to, rec, n)
         tgt = _kind_addr(kind, n.to or rec.to, style)
         if n.value and not n.selector:
             s = f"{sender} sends {v} ETH to {tgt}."
@@ -154,12 +179,13 @@ def _relation(n: CallNode, prev: CallNode) -> str:
 
 
 def _reverted_indices(nodes) -> frozenset:
-    """``internal_index`` of every node inside a failed subtree (its effects are reverted)."""
-    failed = [n.path for n in nodes if n.error]
-    if not failed:
-        return frozenset()
-    return frozenset(n.internal_index for n in nodes
-                     if n.internal_index is not None and any(n.path[:len(p)] == p for p in failed))
+    """``internal_index`` of every node inside a failed subtree (its effects are reverted);
+    alias of :func:`lsne.chain.itr.reverted_indices`."""
+    return reverted_indices(nodes)
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'s' if n != 1 else ''}"
 
 
 def _cap(s: str) -> str:
@@ -183,20 +209,28 @@ def render_text(rec: TxRecord, max_nodes: int = 12, address_style: str = "short"
     rest = len(nodes) - 1 - len(shown)
     if rest > 0:
         parts.append(f"… and {rest} further call{'s' if rest != 1 else ''}.")
-    # value flow summary: value-carrying native transfers outside failed (reverted) subtrees
+    # value flow summary: the effective transfers (no reverted, no call_code / delegate_call
+    # context value) -- the definition of the labels -- and their net flow when it differs
     pos = [t for t in rec.native_transfers if t.get("value")]
-    reverted = _reverted_indices(nodes)
-    eff = [t for t in pos if t.get("internal_index") not in reverted]
+    eff = effective_transfers(rec)
     if eff:
         tot = sum(int(t["value"]) for t in eff)
         snd = len({t.get("from_address") for t in eff})
         rcv = len({t.get("to_address") for t in eff})
-        parts.append(f"In total {format_eth(tot)} ETH moves in {len(eff)} transfer{'s' if len(eff) != 1 else ''} "
-                     f"from {snd} sender{'s' if snd != 1 else ''} to {rcv} receiver{'s' if rcv != 1 else ''}.")
+        parts.append(f"In total {format_eth(tot)} ETH moves in {_plural(len(eff), 'transfer')} "
+                     f"from {_plural(snd, 'sender')} to {_plural(rcv, 'receiver')}.")
+        net = net_flows(eff)
+        gain = {a: v for a, v in net.items() if v > 0}
+        lose = {a: v for a, v in net.items() if v < 0}
+        if not net:
+            parts.append("Net, no address gains or loses ETH.")
+        elif (len(gain), len(lose), sum(gain.values())) != (rcv, snd, tot):
+            parts.append(f"Net, {format_eth(sum(gain.values()))} ETH goes from {_plural(len(lose), 'source')} "
+                         f"to {_plural(len(gain), 'recipient')}.")
     else:
         parts.append("No ETH moves.")
-    if len(pos) > len(eff):
-        k = len(pos) - len(eff)
+    k = sum(1 for t in pos if t.get("reverted") and not t.get("phantom"))
+    if k:
         parts.append(f"{number_word(k).capitalize() if k < 100 else k} attempted transfer{'s are' if k != 1 else ' is'} "
                      f"reverted.")
     if rec.erc20_transfers:

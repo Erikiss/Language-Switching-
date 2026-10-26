@@ -12,9 +12,12 @@ Normalisation done by :func:`read_chunk` (see docs/TRACE_SOURCE_SPEC.md §0 and 
   hashes and addresses in upper-case hex); empty strings become ``None``;
 * ``fixed_size_binary[32]`` values (``value``, ``from_value``/``to_value`` of the balance
   table) are uint256 **little-endian** and become Python ``int``;
-* ``fixed_size_binary[66]`` hashes are ASCII ``"0x…"``; block-level rows (rewards, the
-  fork's irregular state change) carry ``"0x"`` followed by 64 *zero bytes*; they are
-  normalised to ``"0x" + "0" * 64`` and recognised by :func:`is_block_level`;
+* ``fixed_size_binary[66]`` hashes are ASCII ``"0x…"``; block-level rows (block and uncle
+  rewards) carry ``"0x"`` followed by 64 *zero bytes*; they are normalised to
+  ``"0x" + "0" * 64`` and recognised by :func:`is_block_level`.  The DAO fork's irregular
+  state change (block 1 920 000) is *not* in the tables: the chunk has one block-level
+  trace / native-transfer row there (the 5 ETH block reward) and no block-level
+  ``balance_diffs`` row;
 * the trace column ``action_value`` is a DECIMAL string and becomes ``int``;
 * ``trace_address`` ``None``/``""`` (root) becomes ``()``, ``"1_4_0"`` becomes ``(1, 4, 0)``;
 * storage values, slots, topics, inputs stay lower-case hex strings.

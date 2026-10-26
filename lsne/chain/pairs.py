@@ -40,7 +40,6 @@ working when an older ``lsne.chain.source`` lacks them (``HAVE_CHAIN_CONTROLS``)
 from __future__ import annotations
 
 import copy
-import glob
 import json
 import os
 from types import SimpleNamespace
@@ -56,6 +55,8 @@ from . import labels as LB
 DEFAULT_K = 5
 MIN_PAIRS_DIRECTION = 2
 DIRECTION_FILE = "sharing_directions.pt"
+
+from .source import dedup_pairs, is_lm_val, lm_val_frac, model_fingerprint, split_filter
 
 try:  # round-2 controls of lsne.chain.source
     from .source import (alignment_controls, alignment_split, covariate_matrix, criterion_table, init_seed_of,
@@ -157,7 +158,8 @@ def _existing(path: Optional[str], model_dir: str) -> Optional[str]:
 
 
 def resolve_shards(model_dir: str, explicit: Optional[str] = None) -> tuple[Optional[str], str]:
-    """``(path, how)``: the ITR shards for stage L.  ``explicit`` (``--trace-shards`` /
+    """``(path, how)``: the ITR shards for stage L.  ``explicit`` (option ``shards``:
+    ``trace_shards`` keyword, ``--transplant-source "trace:<dir>,shards=<path>"`` or
     ``Limits.l_trace_shards``) wins; else the ``data`` entry of the model's ``manifest.json``
     (the shards the model was trained on; relative paths are tried against the working
     directory and the model directory's parents).  ``(None, reason)`` when nothing exists."""
@@ -168,8 +170,9 @@ def resolve_shards(model_dir: str, explicit: Optional[str] = None) -> tuple[Opti
     p = _existing(data, model_dir) if data else None
     if p:
         return p, "model_manifest"
-    return None, ("no shards: pass --trace-shards / Limits.l_trace_shards (the model manifest names "
-                  f"{data!r})" if data else "no shards: pass --trace-shards / Limits.l_trace_shards")
+    hint = ('no shards: pass them as --transplant-source "trace:<model_dir>,shards=<path>" (keyword trace_shards, '
+            'Limits.l_trace_shards)')
+    return None, (f"{hint}; the model manifest names {data!r}" if data else hint)
 
 
 def shard_index(path: str, limit: Optional[int] = None, max_len: int = 512) -> pd.DataFrame:
@@ -197,10 +200,15 @@ def fetch_rows(path: str, hashes: Sequence[str]) -> dict:
     return {r["tx_hash"]: r for r in iter_rows(path, hashes=want)} if want else {}
 
 
-def sample_pair_hashes(index: pd.DataFrame, n: int, seed: int = 0, balance: bool = True) -> list:
+def sample_pair_hashes(index: pd.DataFrame, n: int, seed: int = 0, balance: bool = True,
+                       max_len: Optional[int] = None) -> list:
     """Hashes of ``n`` alignment pairs: equal numbers per sharing label (``balance``; labels
-    with fewer transactions contribute all of theirs) or a plain random sample (seeded)."""
+    with fewer transactions contribute all of theirs) or a plain random sample (seeded).
+    ``max_len``: transactions longer than the trace LM's window are excluded (their English
+    text covers nodes the window does not show)."""
     rng = np.random.default_rng(int(seed))
+    if max_len is not None and not index.empty and "n_tokens" in index.columns:
+        index = index[index["n_tokens"].astype(int) <= int(max_len)]
     if index.empty:
         return []
     if not balance or "label" not in index.columns:
@@ -328,24 +336,32 @@ def find_direction_file(model_dir: str, explicit: Optional[str] = None) -> Optio
 def load_direction(path: str, layer: int, d_model: int, model_dir: Optional[str] = None) -> tuple:
     """``(vec [d] or None, info)`` of the direction at residual snapshot ``layer`` in a file
     written by ``lsne.chain.cli probe``.  Refused (``None`` + reason) when the width differs,
-    the layer is missing, or the file names a different model directory."""
+    the layer is missing, or the file was written for another model: the recorded model
+    directory must be the same path (realpath) or, for a moved / copied directory, carry the
+    same :func:`lsne.chain.source.model_fingerprint` (a matching basename is not enough).
+    ``info`` repeats the probe specification of the file (kind, match, mask, readout, k,
+    length_ratio, max_len, visible, split) for :func:`direction_spec_ok`."""
     info = dict(path=str(path))
     try:
         saved = torch.load(path, map_location="cpu", weights_only=False)
     except Exception as e:  # noqa: BLE001 - reported, the in-stage direction is used instead
         info["refused"] = f"unreadable: {e!r}"
         return None, info
-    info.update(kind=saved.get("kind"), readout=saved.get("readout"), n_pairs=saved.get("n_pairs"),
-                model=saved.get("model"))
+    info.update({k: saved.get(k) for k in ("kind", "readout", "n_pairs", "model", "match", "mask", "k", "length_ratio",
+                                           "max_len", "length_cap", "visible", "split", "eras", "model_fingerprint")})
     if saved.get("d_model") is not None and int(saved["d_model"]) != int(d_model):
         info["refused"] = f"d_model {saved['d_model']} != {d_model}"
         return None, info
     if model_dir is not None and saved.get("model"):
         same = os.path.realpath(str(saved["model"])) == os.path.realpath(str(model_dir))
-        if not same and os.path.basename(os.path.normpath(str(saved["model"]))) != os.path.basename(
-                os.path.normpath(str(model_dir))):
-            info["refused"] = f"file was written for model {saved['model']!r}"
-            return None, info
+        if not same:
+            fp_file = saved.get("model_fingerprint")
+            fp_model = model_fingerprint(str(model_dir)) if fp_file else None
+            info["model_fingerprint_current"] = fp_model
+            if not fp_file or fp_file != fp_model:
+                info["refused"] = (f"file was written for model {saved['model']!r} "
+                                   + ("(different fingerprint)" if fp_file else "(no fingerprint to compare)"))
+                return None, info
     layers = saved.get("layers", {})
     ent = layers.get(int(layer), layers.get(str(int(layer))))
     if ent is None or ent.get("vec") is None:
@@ -356,6 +372,30 @@ def load_direction(path: str, layer: int, d_model: int, model_dir: Optional[str]
         info["refused"] = "vector has the wrong size or is degenerate"
         return None, info
     return vec / vec.norm(), info
+
+
+#: the specification of the frozen probe (DESIGN 4.9 / trace_probe); a direction file counts
+#: only when it was written by exactly this probe
+FROZEN_PROBE_SPEC = dict(kind="fanout", match="length", mask="none", readout="mean")
+
+
+def direction_spec_ok(info: dict, k: int, length_ratio: float, max_len: int) -> tuple:
+    """``(ok, reasons)``: whether a direction file (``info`` of :func:`load_direction`) was
+    written by the stage's pre-specified probe -- kind ``fanout``, ``match length``, mask
+    ``none``, readout ``mean``, the same ``k``, ``length_ratio`` and window ``max_len``.
+    Files without these fields (older probes) do not qualify."""
+    reasons = []
+    for key, want in FROZEN_PROBE_SPEC.items():
+        if info.get(key) != want:
+            reasons.append(f"{key}={info.get(key)!r} (needs {want!r})")
+    if info.get("k") is None or int(info["k"]) != int(k):
+        reasons.append(f"k={info.get('k')!r} (needs {int(k)})")
+    lr = info.get("length_ratio")
+    if lr is None or abs(float(lr) - float(length_ratio)) > 1e-9:
+        reasons.append(f"length_ratio={lr!r} (needs {float(length_ratio)})")
+    if info.get("max_len") is not None and int(info["max_len"]) != int(max_len):
+        reasons.append(f"max_len={info.get('max_len')!r} (needs {int(max_len)})")
+    return (not reasons), reasons
 
 
 # ======================================================================================
@@ -403,5 +443,7 @@ def carrier_rows(preferred: Sequence[dict], fallback: Sequence[dict], n: int, se
 
 __all__ = ["HAVE_CHAIN_CONTROLS", "DEFAULT_K", "DIRECTION_FILE", "model_dir_of", "read_model_manifest", "resolve_shards",
            "shard_index", "fetch_rows", "sample_pair_hashes", "fanout_probe", "probe_states", "probe_table",
-           "find_direction_file", "load_direction", "residualised_alignment", "carrier_rows", "alignment_controls",
+           "find_direction_file", "load_direction", "direction_spec_ok", "FROZEN_PROBE_SPEC", "residualised_alignment",
+           "carrier_rows", "alignment_controls", "dedup_pairs", "is_lm_val", "lm_val_frac", "model_fingerprint",
+           "split_filter",
            "alignment_split", "covariate_matrix", "length_covariates", "residualize", "untrained_twin", "init_seed_of"]

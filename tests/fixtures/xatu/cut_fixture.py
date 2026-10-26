@@ -2,7 +2,10 @@
 
 Usage::
 
-    python -I tests/fixtures/xatu/cut_fixture.py <dir with canonical_execution_<table>_<start>.parquet> [out_dir]
+    python -I tests/fixtures/xatu/cut_fixture.py <dir[:dir...] with canonical_execution_<table>_<start>.parquet> [out_dir]
+
+(several source directories separated by ``:``: each file is taken from the first directory
+that has it).
 
 Keeps the original Arrow schemas (pyarrow ``Table.filter``) and selects the rows of the
 transactions listed below (hashes compared case-insensitively, since
@@ -18,6 +21,14 @@ import pyarrow.parquet as pq
 
 DRAIN = "0x0ec3f2488a93839524add10ea229e773f6bc891b4eb4794c3337d4495263790b"
 SELECTION = {
+    1428000: {
+        "tables": ("traces", "transaction", "native_transfers", "erc20_transfers", "logs", "storage_diffs"),
+        "txs": [
+            "0xe9ebfecc2fa10100db51a4408d18193b3ac504584b51a4e55bdef1318f0a30f9",  # creation of the DAO (1428757)
+            "0xf5097cbcdb67f5a8f51fa602157725ba06bb37fc56bfdcb395b01174a2b25372",  # ETH refunded to the sender
+            "0x7f3342ede04b21f8454e06088e3ef7f065b819f788bad88409a93b2b195e8e66",  # 1 wei + reverted attempt
+        ],
+    },
     1718000: {
         "tables": ("traces", "native_transfers", "logs", "storage_diffs"),
         "txs": [
@@ -41,10 +52,25 @@ SELECTION = {
             "0x29c0938e0933990d9965c64130c89189501b6a531d5a53ad4d907c9c698052f6",  # call_code
             "0x798af2597c979e2a218d7a7b8067fa48913c88cfa82e7bafa2dc3120317310e7",  # suicide
             "0xa1fafc6fd9351e7921147d8ddbac1fe169d34cd7baadb2f5cbee69a5f527cd2b",  # 13 nodes, fan-out 5
+            "0xd97337573a1e7de0cfac529c3999b448968aa14c0876c15585acd80b8c67c2fe",  # WithdrawDAO, writes by transferFrom
         ],
         "reward_block": 1920000,
     },
+    1978000: {
+        "tables": ("traces", "transaction", "native_transfers", "erc20_transfers", "logs", "storage_diffs"),
+        "txs": [
+            "0x5ed540cfe135fb0501b0de15815d60b865e290e4b0d34d1ba488792d999e3175",  # reverted 2**256-wei attempt
+        ],
+    },
 }
+
+
+def _src(src_dirs, name: str) -> str:
+    for d in src_dirs:
+        p = os.path.join(d, name)
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError(f"{name} in none of {src_dirs}")
 
 
 def _hash_of(v: bytes) -> str:
@@ -55,7 +81,8 @@ def _is_block_level(h: str) -> bool:
     return all(c in "0\x00" for c in h[2:])
 
 
-def cut(src: str, out: str) -> None:
+def cut(src, out: str) -> None:
+    src_dirs = src.split(":") if isinstance(src, str) else list(src)
     os.makedirs(out, exist_ok=True)
     for start, sel in SELECTION.items():
         txs = set(sel["txs"])
@@ -63,7 +90,7 @@ def cut(src: str, out: str) -> None:
         for table in sel["tables"]:
             if table == "block":
                 continue
-            tbl = pq.read_table(os.path.join(src, f"canonical_execution_{table}_{start}.parquet"))
+            tbl = pq.read_table(_src(src_dirs, f"canonical_execution_{table}_{start}.parquet"))
             hashes = [_hash_of(h) for h in tbl.column("transaction_hash").to_pylist()]
             bn = tbl.column("block_number").to_pylist()
             mask = [h in txs for h in hashes]
@@ -90,7 +117,7 @@ def cut(src: str, out: str) -> None:
                            compression="zstd")
             print(table, start, sub.num_rows)
         if "block" in sel["tables"]:
-            tbl = pq.read_table(os.path.join(src, f"canonical_execution_block_{start}.parquet"))
+            tbl = pq.read_table(_src(src_dirs, f"canonical_execution_block_{start}.parquet"))
             mask = [b in blocks for b in tbl.column("block_number").to_pylist()]
             sub = tbl.filter(pa.array(mask))
             pq.write_table(sub, os.path.join(out, f"canonical_execution_block_{start}.parquet"),

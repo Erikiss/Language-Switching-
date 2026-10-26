@@ -160,6 +160,87 @@ def init_seed_of(model_dir: str, default: int = 0) -> int:
         return int(default)
 
 
+def lm_val_frac(model_dir: str, default: Optional[float] = None) -> Optional[float]:
+    """The hash split of the LM's training corpus (``corpus.val_frac`` of ``manifest.json``,
+    written by ``python -m lsne.chain.cli train``): a transaction belongs to the LM's held-out
+    part when the last 8 hex digits of its hash / 2**32 are below it (:func:`is_lm_val`)."""
+    p = os.path.join(str(model_dir), "manifest.json")
+    try:
+        with open(p, encoding="utf-8") as fh:
+            m = json.load(fh)
+        v = (m.get("corpus") or {}).get("val_frac")
+        return default if v is None else float(v)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return default
+
+
+def is_lm_val(tx_hash: str, val_frac: Optional[float]) -> bool:
+    """Membership of a transaction in the LM's held-out split (same rule as the training
+    corpus, ``lsne.chain.cli._is_val``)."""
+    return bool(val_frac) and float(val_frac) > 0 and (int(str(tx_hash)[-8:], 16) / 2 ** 32) < float(val_frac)
+
+
+SPLITS = ("all", "heldout", "train")
+
+
+def split_filter(hashes: Sequence[str], split: str, val_frac: Optional[float]) -> list:
+    """Booleans: which transactions belong to ``split`` (``"all"``, ``"heldout"`` = the LM's
+    validation split, ``"train"``); ``heldout`` / ``train`` need ``val_frac``."""
+    if split not in SPLITS:
+        raise ValueError(f"split must be one of {SPLITS}, got {split!r}")
+    if split == "all":
+        return [True] * len(hashes)
+    if not val_frac:
+        raise ValueError(f"split={split!r} needs the LM's val_frac (model manifest corpus.val_frac)")
+    v = [is_lm_val(h, val_frac) for h in hashes]
+    return v if split == "heldout" else [not x for x in v]
+
+
+def model_fingerprint(model_dir: str) -> Optional[str]:
+    """Short content fingerprint of a model directory: sha256 over ``config.json``,
+    ``vocab.json`` and, per weights file, its size plus its first and last MiB.  Survives
+    copying / moving the directory (Drive mounts), changes with every retraining."""
+    import hashlib
+
+    d = str(model_dir)
+    h = hashlib.sha256()
+    found = False
+    for name in ("config.json", "vocab.json"):
+        p = os.path.join(d, name)
+        if os.path.isfile(p):
+            with open(p, "rb") as fh:
+                h.update(name.encode() + b"\0" + fh.read())
+            found = True
+    for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        if name.endswith((".safetensors", ".bin")) and os.path.isfile(os.path.join(d, name)):
+            p = os.path.join(d, name)
+            size = os.path.getsize(p)
+            with open(p, "rb") as fh:
+                head = fh.read(1 << 20)
+                fh.seek(max(0, size - (1 << 20)))
+                tail = fh.read(1 << 20)
+            h.update(f"{name}\0{size}\0".encode() + head + tail)
+            found = True
+    return h.hexdigest()[:24] if found else None
+
+
+def dedup_pairs(pos_items: Sequence, neg_items: Sequence) -> list:
+    """Indices of the matched pairs to keep so that no token sequence occurs twice in the
+    probe set: pairs are scanned in order and dropped when the positive's or the negative's
+    (vocabulary-mapped, truncated, masked) sequence was already seen in either class.  The
+    split halves and the pair bootstrap of :func:`probe_criterion` treat pairs as independent
+    units; identical sequences in both halves would make the split-half AUC partly in-sample
+    and the CIs too narrow."""
+    seen, keep = set(), []
+    for i, (p, q) in enumerate(zip(pos_items, neg_items)):
+        kp, kq = tuple(p), tuple(q)
+        if kp in seen or kq in seen or kp == kq:
+            continue
+        seen.update((kp, kq))
+        keep.append(i)
+    return keep
+
+
 def untrained_twin(src: TraceLMSource, seed: int = 0) -> TraceLMSource:
     """Control source: identical architecture (the trained model's config), vocabulary,
     tokenizer, serialisation and ``max_len``, weights freshly initialised exactly like
@@ -339,9 +420,12 @@ def probe_criterion(S_pos, S_neg, S0_pos, S0_neg, seed: int = 0, n_boot: int = 1
     * bootstrap over matched pairs (``n_boot``): each half is resampled with replacement
       separately (no pair can land in both the fitting and the evaluation half), the
       direction is refitted, the *same* resampled pairs are used for both models ->
-      percentile CIs ``delta_ci_lo/hi`` (level ``ci``), ``auc_trained_ci_*``,
-      ``auc_untrained_ci_*``; with ``n_tests > 1`` also the Bonferroni level
-      ``1 - (1 - ci) / n_tests`` (``delta_ci_lo_adj/hi_adj``, ``counts_adj``);
+      percentile CIs ``delta_ci_lo/hi`` (level ``ci``; the decision CI, conservative: it
+      contains the direction-estimation uncertainty), ``auc_trained_ci_*``,
+      ``auc_untrained_ci_*``; ``delta_ci_eval_lo/hi``: the same draws with the directions of
+      the original halves fixed (evaluation sampling only, for comparison); with
+      ``n_tests > 1`` also the Bonferroni level ``1 - (1 - ci) / n_tests``
+      (``delta_ci_lo_adj/hi_adj``, ``counts_adj``);
     * label-permutation null (``n_perm``): positive and negative swapped inside random
       pairs, same swaps for both models -> ``perm_auc_p95``/``perm_p`` (trained AUC) and
       ``perm_delta_p95``/``perm_delta_p`` (difference); p-values ``(1 + #null >= obs) /
@@ -353,35 +437,51 @@ def probe_criterion(S_pos, S_neg, S0_pos, S0_neg, seed: int = 0, n_boot: int = 1
     n = min(len(Xp), len(Xq), len(Yp), len(Yq))
     out = dict(n_pairs=int(n), ci_level=float(ci), n_boot=int(n_boot), n_perm=int(n_perm), n_random=int(n_random))
     keys = ("auc_trained", "auc_untrained", "delta", "delta_ci_lo", "delta_ci_hi", "delta_boot_sd",
+            "delta_boot_mean", "delta_ci_eval_lo", "delta_ci_eval_hi",
             "auc_trained_ci_lo", "auc_trained_ci_hi", "auc_untrained_ci_lo", "auc_untrained_ci_hi",
             "perm_auc_mean", "perm_auc_p95", "perm_p", "perm_delta_p95", "perm_delta_p",
             "random_dir_auc_mean", "random_dir_auc_p95", "random_dir_auc_max", "random_dir_auc_p95_untrained")
     out.update({k: float("nan") for k in keys})
     out["counts"] = False
+    if int(n_tests) > 1:
+        out.update(ci_level_adj=1.0 - (1.0 - float(ci)) / int(n_tests), delta_ci_lo_adj=float("nan"),
+                   delta_ci_hi_adj=float("nan"), counts_adj=False)
     if n < 4:
         return out
     Xp, Xq, Yp, Yq = Xp[:n], Xq[:n], Yp[:n], Yq[:n]
     A, B = split_halves(n, seed)
     a1, a0 = _split_half(Xp, Xq, A, B), _split_half(Yp, Yq, A, B)
     out.update(auc_trained=a1, auc_untrained=a0, delta=a1 - a0)
-    # bootstrap over matched pairs, halves resampled separately, same draws for both models
+    # bootstrap over matched pairs, halves resampled separately, same draws for both models;
+    # (i) refit: the direction is refitted on the resampled fitting half (decision CI, includes
+    # the direction-estimation uncertainty); (ii) eval-only: directions of the original halves
+    # fixed, only the evaluation pairs resampled (test-sampling uncertainty alone, narrower)
     rng = np.random.default_rng(int(boot_seed))
-    b1, b0 = np.empty(int(n_boot)), np.empty(int(n_boot))
+    b1, b0, e1, e0 = (np.empty(int(n_boot)) for _ in range(4))
+
+    def scores(P, Q, fit, ev):
+        v = P[fit].mean(0) - Q[fit].mean(0)
+        return P[ev] @ v, Q[ev] @ v
+
+    sc1 = (scores(Xp, Xq, A, B), scores(Xp, Xq, B, A))
+    sc0 = (scores(Yp, Yq, A, B), scores(Yp, Yq, B, A))
     for i in range(int(n_boot)):
-        As = A[rng.integers(0, len(A), len(A))]
-        Bs = B[rng.integers(0, len(B), len(B))]
-        b1[i] = _split_half(Xp, Xq, As, Bs)
-        b0[i] = _split_half(Yp, Yq, As, Bs)
+        ia = rng.integers(0, len(A), len(A))
+        ib = rng.integers(0, len(B), len(B))
+        b1[i] = _split_half(Xp, Xq, A[ia], B[ib])
+        b0[i] = _split_half(Yp, Yq, A[ia], B[ib])
+        e1[i] = 0.5 * (_auc_cols(sc1[0][0][ib], sc1[0][1][ib])[0] + _auc_cols(sc1[1][0][ia], sc1[1][1][ia])[0])
+        e0[i] = 0.5 * (_auc_cols(sc0[0][0][ib], sc0[0][1][ib])[0] + _auc_cols(sc0[1][0][ia], sc0[1][1][ia])[0])
     if int(n_boot) > 1:
         d = b1 - b0
         out["delta_ci_lo"], out["delta_ci_hi"] = _quantile_ci(d, ci)
         out["delta_boot_sd"] = float(np.std(d, ddof=1))
+        out["delta_boot_mean"] = float(np.mean(d))
+        out["delta_ci_eval_lo"], out["delta_ci_eval_hi"] = _quantile_ci(e1 - e0, ci)
         out["auc_trained_ci_lo"], out["auc_trained_ci_hi"] = _quantile_ci(b1, ci)
         out["auc_untrained_ci_lo"], out["auc_untrained_ci_hi"] = _quantile_ci(b0, ci)
         if int(n_tests) > 1:
-            lvl = 1.0 - (1.0 - float(ci)) / int(n_tests)
-            out["ci_level_adj"] = lvl
-            out["delta_ci_lo_adj"], out["delta_ci_hi_adj"] = _quantile_ci(d, lvl)
+            out["delta_ci_lo_adj"], out["delta_ci_hi_adj"] = _quantile_ci(d, out["ci_level_adj"])
     # label-permutation null (swap positive / negative inside random pairs)
     rng = np.random.default_rng(int(perm_seed))
     p1, pd_ = np.empty(int(n_perm)), np.empty(int(n_perm))
@@ -403,7 +503,7 @@ def probe_criterion(S_pos, S_neg, S0_pos, S0_neg, seed: int = 0, n_boot: int = 1
                    random_dir_auc_max=float(r1.max()), random_dir_auc_p95_untrained=float(np.quantile(r0, 0.95)))
     perm_ok = (not np.isfinite(out["perm_auc_p95"])) or a1 > out["perm_auc_p95"]
     out["counts"] = bool(np.isfinite(out["delta_ci_lo"]) and out["delta_ci_lo"] > 0 and perm_ok)
-    if "delta_ci_lo_adj" in out:
+    if int(n_tests) > 1:
         out["counts_adj"] = bool(np.isfinite(out["delta_ci_lo_adj"]) and out["delta_ci_lo_adj"] > 0 and perm_ok)
     return out
 
@@ -496,15 +596,17 @@ def paired_items(records: Sequence, max_nodes: int = 12, address_style: str = "s
     return out
 
 
-def load_pairs(path: str) -> list:
-    """Read a pair file written by ``python -m lsne.chain.cli pair`` -> ``[(tokens, text)]``."""
-    out = []
+def load_pairs(path: str, with_hashes: bool = False):
+    """Read a pair file written by ``python -m lsne.chain.cli pair`` -> ``[(tokens, text)]``
+    (``with_hashes``: ``(pairs, tx_hashes)``)."""
+    out, hashes = [], []
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             if line.strip():
                 d = json.loads(line)
                 out.append((list(d["tokens"]), str(d["text"])))
-    return out
+                hashes.append(d.get("tx_hash"))
+    return (out, hashes) if with_hashes else out
 
 
 # ======================================================================================
@@ -515,8 +617,10 @@ def length_covariates(items: Sequence, texts: Optional[Sequence[str]] = None, to
     """Length features of the source items (raw ITR tokens of a record / token list / shard
     row): ``n_tokens`` (visible length ``min(len, max_len)``), ``n_tokens_raw``, ``n_nodes``
     (``[CALL]`` entries = call-tree nodes) and ``n_value_calls`` (calls with a non-zero
-    ``V:`` value = :func:`lsne.chain.labels.sharing_features` ``n_value_calls``), counted on
-    the full transaction; with ``texts`` and the target ``tokenizer`` also ``n_text_tokens``."""
+    ``V:`` value as the tokens show them -- reverted and ``call_code`` / ``delegate_call``
+    value calls included, unlike the label feature
+    :func:`lsne.chain.labels.sharing_features` ``n_value_calls``), counted on the full
+    transaction; with ``texts`` and the target ``tokenizer`` also ``n_text_tokens``."""
     rows = []
     for it in items:
         toks = item_tokens(it, None)
@@ -564,10 +668,19 @@ def residualize(X, Z, train_idx=None) -> np.ndarray:
     return X - Z1 @ beta
 
 
+#: smallest hold-out for the alignment bootstrap CIs (below: NaN, the CI cannot be estimated)
+MIN_HOLDOUT_BOOT = 8
+#: share of draws that must be usable (target variance not ~0) for a CI
+MIN_VALID_BOOT = 0.9
+
+
 def _boot_r2_gain(Y: np.ndarray, P1: np.ndarray, P0: np.ndarray, n_boot: int, rng) -> tuple:
-    """Bootstrap over hold-out rows of ``R2(P1) - R2(P0)`` and of ``R2(P1)``: ``(gain, r2_1, r2_0)`` arrays."""
+    """Bootstrap over hold-out rows of ``R2(P1) - R2(P0)`` and of ``R2(P1)``: ``(gain, r2_1, r2_0)``
+    arrays.  Draws whose resampled target variance is ~0 (a few distinct rows) give no R²
+    and are dropped (NaN); with fewer than :data:`MIN_HOLDOUT_BOOT` hold-out rows or fewer than
+    :data:`MIN_VALID_BOOT` usable draws every value is NaN (no CI rather than an absurd one)."""
     m = len(Y)
-    if m < 3 or n_boot <= 1:
+    if m < MIN_HOLDOUT_BOOT or n_boot <= 1:
         return np.full(0, np.nan), np.full(0, np.nan), np.full(0, np.nan)
     C = np.zeros((int(n_boot), m))
     draws = rng.integers(0, m, (int(n_boot), m))
@@ -577,9 +690,14 @@ def _boot_r2_gain(Y: np.ndarray, P1: np.ndarray, P0: np.ndarray, n_boot: int, rn
     ss_tot = C @ rowsq - m * (mean_b ** 2).sum(1)
     e1 = ((Y - P1) ** 2).sum(1)
     e0 = ((Y - P0) ** 2).sum(1)
+    full = float(((Y - Y.mean(0)) ** 2).sum())
+    ok = np.isfinite(ss_tot) & (ss_tot > 1e-6 * max(full, 1e-300))
     with np.errstate(divide="ignore", invalid="ignore"):
-        r1 = 1.0 - (C @ e1) / ss_tot
-        r0 = 1.0 - (C @ e0) / ss_tot
+        r1 = np.where(ok, 1.0 - (C @ e1) / np.where(ok, ss_tot, 1.0), np.nan)
+        r0 = np.where(ok, 1.0 - (C @ e0) / np.where(ok, ss_tot, 1.0), np.nan)
+    if ok.mean() < MIN_VALID_BOOT:
+        nan = np.full(int(n_boot), np.nan)
+        return nan, nan, nan
     return r1 - r0, r1, r0
 
 

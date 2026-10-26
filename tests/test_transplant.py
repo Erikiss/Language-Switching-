@@ -621,3 +621,147 @@ def test_cross_size_pythia70m_to_14m(mb):
         assert np.isfinite(r[k])
     assert r["r2_holdout"] > r["r2_permuted"]
     assert torch.isfinite(tp.transfer_states(a, S[L_s // 2][:3])).all()
+
+
+# ---------------------------------------------------------------------------------------
+# prompt pairs: the source encodes one item, the target another (trace source, DESIGN 4.9)
+# ---------------------------------------------------------------------------------------
+class _SpySource:
+    """Wraps a SourceModel and records every item it is asked to encode."""
+
+    def __init__(self, base):
+        self.base, self.seen = base, []
+        self.name, self.d_model, self.n_layers = "spy:" + base.name, base.d_model, base.n_layers
+
+    def encode(self, item):
+        self.seen.append(item)
+        return self.base.encode(item)
+
+    def residuals(self, ids, layers=None):
+        return self.base.residuals(ids, layers)
+
+
+def test_as_prompt_pair_normalisation():
+    pp = tp.as_prompt_pair("The weather was")
+    assert (pp.source, pp.text, pp.target, pp.paired) == ("The weather was", "The weather was", None, False)
+    pp = tp.as_prompt_pair(("The weather was", " cold"))                  # the old (text, target) form
+    assert (pp.source, pp.text, pp.target, pp.paired) == ("The weather was", "The weather was", " cold", False)
+    ids = [5, 6, 7, 8]
+    pp = tp.as_prompt_pair((ids, "The weather was", 123))                 # (source_item, text, target)
+    assert pp.source == ids and pp.text == "The weather was" and pp.target == 123 and pp.paired
+    row = {"tx_hash": "0xabc", "tokens": ["[TX]", "[/TX]"], "text": "Account 0x1 sends 1 ETH."}
+    pp = tp.as_prompt_pair(row)                                            # a shard row is its own source item
+    assert pp.source is row and pp.text == row["text"] and pp.name == "0xabc" and pp.paired
+    assert tp.as_prompt_pair({"source": ids, "text": "x", "target_id": 3}).target == 3
+    given = tp.PromptPair(source=ids, text="hi", target=1, ids=[1, 2])
+    assert tp.as_prompt_pair(given) is given and tp.as_prompt_pair(given, target=9).target == 9
+    assert tp.source_name(row) == "0xabc" and tp.source_name(ids) == "ids[4]" and tp.source_name("a b") == "a b"
+    for bad in ({"tokens": ["[TX]"]}, (ids,), (ids, 5), 3.5):
+        with pytest.raises((ValueError, TypeError)):
+            tp.as_prompt_pair(bad)
+
+
+def test_plain_string_prompts_unchanged(stub, mb):
+    """Plain strings and (text, target) tuples keep the old behaviour: the same text in both
+    models, identical numbers to the explicit same-text PromptPair."""
+    L = mb.n_layers
+    site = HookSite(L // 2, "block_input")
+    pairs = [(t, t) for t in TEXTS_E[:8] + TEXTS_D[:8]]
+    aligns = tp.layer_alignments(stub, mb, pairs, layers_src=[stub.n_layers], alpha=0.1)
+    v_src = random_directions(stub.d_model, 1, 0)[0]
+    prompt, kw = "The weather was", dict(eps=1.0, n_prefix=2, gen_kw=dict(n_new=3, n_samples=1), seed=0)
+    spy = _SpySource(stub)
+    old = tp.transplant_experiment(mb, spy, aligns, v_src, [(prompt, " cold")], site, **kw)
+    assert spy.seen == [prompt] and not old["paired"].any() and (old["source_item"] == prompt).all()
+    T = mb.encode(prompt).shape[1]
+    assert (old["n_src_tokens"] == stub.encode(prompt).shape[1]).all() and (old["n_tgt_tokens"] == T).all()
+    new = tp.transplant_experiment(mb, stub, aligns, v_src, [tp.PromptPair(prompt, prompt, " cold")], site, **kw)
+    num = ["entropy", "logp_target", "fD", "written_norm", "n_prefix", "n_substituted"]
+    assert np.allclose(old[num].to_numpy(float), new[num].to_numpy(float), equal_nan=True)
+    plain = tp.transplant_experiment(mb, stub, aligns, v_src, [prompt], site, targets=[" cold"], **kw)
+    assert np.allclose(old[num].to_numpy(float), plain[num].to_numpy(float), equal_nan=True)
+    # the helpers still take ids, and a text / pair encodes its target side
+    ids = mb.encode(prompt)
+    H = {L // 2: torch.zeros(2, mb.d_model)}
+    for x in (prompt, tp.PromptPair([1, 2, 3], prompt)):
+        assert torch.equal(tp.plant_kv_prefix(mb, x, H)["logits"], tp.plant_kv_prefix(mb, ids, H)["logits"])
+        assert torch.equal(tp.substitute_residual(mb, x, site, [-1], torch.zeros(1, mb.d_model)),
+                           tp.substitute_residual(mb, ids, site, [-1], torch.zeros(1, mb.d_model)))
+
+
+def test_prompt_pairs_encode_differently_on_both_sides(stub, mb):
+    """A pair's source side goes to the source model, its text to the target: different
+    items, different lengths; the one-prompt helpers equal the manual route."""
+    L = mb.n_layers
+    site = HookSite(L // 2, "block_input")
+    pairs = [(t, t) for t in TEXTS_E[:8] + TEXTS_D[:8]]
+    aligns = tp.layer_alignments(stub, mb, pairs, layers_src=[stub.n_layers], alpha=0.1)
+    v_src = random_directions(stub.d_model, 1, 0)[0]
+    src_ids = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]                # a "trace": 11 source tokens
+    text = "The weather was"
+    pair = tp.PromptPair(source=src_ids, text=text, target=" cold", name="tx-1")
+    spy = _SpySource(stub)
+    meas = HookSite(L - 1, "block_input")
+    df, states = tp.transplant_experiment(mb, spy, aligns, v_src, [pair], site, eps=1.0, n_prefix=2, n_substitute=1,
+                                          gen_kw=dict(n_new=3, n_samples=1), seed=0, state_sites=[meas])
+    assert spy.seen == [src_ids]                                           # the source never saw the text
+    T = mb.encode(text).shape[1]
+    assert df["paired"].all() and (df["source_item"] == "tx-1").all() and (df["prompt"] == text).all()
+    assert (df["n_src_tokens"] == len(src_ids)).all() and (df["n_tgt_tokens"] == T).all() and len(src_ids) != T
+    assert (df.loc[df["mode"] != "kv", "n_substituted"] == 1).all()
+    # states at the measurement site: one dict per row, last real position
+    assert len(states) == len(df) and all(s[meas.key].shape == (mb.d_model,) for s in states)
+    i_id = int(df.index[(df["mode"] == "residual") & (df["control"] == "identity")][0])
+    own = run_with_cache(mb, mb.encode(text), [meas]).resid[meas.key][0, -1]
+    assert np.allclose(states[i_id][meas.key], own.numpy(), atol=1e-4)
+    # the pair's text side is what the target encodes; the source side is the trace
+    H_S = stub.residuals(stub.encode(src_ids), [stub.n_layers])[stub.n_layers]
+    H_T = tp.transplanted_states(stub, aligns, pair, v_src, 1.0)
+    a = aligns[L // 2]
+    manual = tp.transfer_states(a, tp._dose_rows(H_S, v_src, 1.0))
+    assert H_T[L // 2].shape == (len(src_ids), mb.d_model) and torch.allclose(H_T[L // 2], manual, atol=1e-5)
+    lo = tp.transplant_residual(mb, stub, aligns, pair, site, v_src, 1.0, n_substitute=2)
+    ref = tp.substitute_residual(mb, mb.encode(text), site, [T - 2, T - 1], manual[-2:])
+    assert torch.allclose(lo, ref, atol=1e-5)
+    kv = tp.transplant_kv(mb, stub, aligns, pair, v_src, 1.0, n_prefix=3)
+    ref_kv = tp.plant_kv_prefix(mb, mb.encode(text), {l: tp.transfer_states(al, tp._dose_rows(H_S, v_src, 1.0))[-3:]
+                                                      for l, al in aligns.items()})
+    assert kv["n_prefix"] == 3 and torch.allclose(kv["logits"], ref_kv["logits"], atol=1e-5)
+    # a residual row of the experiment = the one-prompt helper (same dose, same positions)
+    row = df[(df["mode"] == "residual") & (df["control"] == "none")].iloc[0]
+    lo1 = tp.transplant_residual(mb, stub, aligns, pair, site, v_src, 1.0, n_substitute=1)
+    assert row["entropy"] == pytest.approx(_entropy(lo1), abs=1e-4)
+    # paired_states reads pairs (source item, target text) and PromptPairs alike
+    S1, T1 = tp.paired_states(stub, mb, [(src_ids, text)], [0], [1])
+    S2, T2 = tp.paired_states(stub, mb, [pair], [0], [1])
+    assert torch.allclose(S1[0], S2[0]) and torch.allclose(T1[1], T2[1])
+    assert torch.allclose(T2[1][0], tp.target_residuals(mb, mb.encode(text), [1])[1].mean(0))
+
+
+def test_random_control_shared_by_prompts_of_one_carrier(stub, mb, monkeypatch):
+    """The random control draws one direction per source item: two prompts on the same
+    carrier (the K=0 variant and its K=8/C1 partner in stage L) get the same random
+    direction, as the transplant arm doses both with the same v_src; different carriers get
+    different directions; plain prompts keep one direction per prompt index."""
+    L = mb.n_layers
+    site = HookSite(L // 2, "block_input")
+    pairs = [(t, t) for t in TEXTS_E[:8] + TEXTS_D[:8]]
+    aligns = tp.layer_alignments(stub, mb, pairs, layers_src=[stub.n_layers], alpha=0.1)
+    v_src = random_directions(stub.d_model, 1, 0)[0]
+    drawn = []
+    real = tp.random_directions
+
+    def spy(d, n, seed=0):
+        drawn.append(int(seed))
+        return real(d, n, seed)
+    monkeypatch.setattr(tp, "random_directions", spy)
+    car_a, car_b = [11, 12, 13, 14], [21, 22, 23, 24]
+    prompts = [tp.PromptPair(source=car_a, text="The weather was", target=" cold", name="0xa"),
+               tp.PromptPair(source=car_a, text="Das Wetter war", target=" kalt", name="0xa"),
+               tp.PromptPair(source=car_b, text="The weather was", target=" cold", name="0xb")]
+    tp.transplant_experiment(mb, stub, aligns, v_src, prompts, site, eps=1.0, n_prefix=2, modes=("residual",),
+                             controls=("random",), gen_kw=dict(n_new=2, n_samples=1), seed=0)
+    assert len(drawn) == 3 and drawn[0] == drawn[1] != drawn[2]
+    assert tp._random_key(prompts[0], 0) == tp._random_key(prompts[1], 1) != tp._random_key(prompts[2], 2)
+    plain = tp.as_prompt_pair("The weather was")
+    assert tp._random_key(plain, 0) == 0 and tp._random_key(plain, 3) == 3

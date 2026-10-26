@@ -10,8 +10,20 @@ Attribution: "ethPandaOps Xatu".
 Changes: the files below are row subsets of the original chunks (pyarrow Table.filter,
 original Arrow schemas kept, re-written with zstd compression); no values were modified.
 
-Source chunks (downloaded 25.10.2026)
--------------------------------------
+Source chunks (downloaded 25.10.2026; 1428000 and 1978000 on 26.10.2026)
+-----------------------------------------------------------------------
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_traces/1000/1428000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_transaction/1000/1428000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_native_transfers/1000/1428000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_erc20_transfers/1000/1428000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_logs/1000/1428000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_storage_diffs/1000/1428000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_traces/1000/1978000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_transaction/1000/1978000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_native_transfers/1000/1978000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_erc20_transfers/1000/1978000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_logs/1000/1978000.parquet
+https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_storage_diffs/1000/1978000.parquet
 https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_traces/1000/1718000.parquet
 https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_native_transfers/1000/1718000.parquet
 https://data.ethpandaops.io/xatu/mainnet/databases/default/canonical_execution_logs/1000/1718000.parquet
@@ -34,6 +46,11 @@ purpose: it exercises the "no transaction row" path of build_records
 
 Selected rows
 -------------
+Chunk 1428000 (DAO creation; blocks before 1 428 757 are "pre_dao"):
+  0xe9ebfecc2fa10100db51a4408d18193b3ac504584b51a4e55bdef1318f0a30f9  creation of the DAO and its extraBalance (1428757)
+  0xf5097cbcdb67f5a8f51fa602157725ba06bb37fc56bfdcb395b01174a2b25372  0.010153 ETH to a contract and straight back (net 0)
+  0x7f3342ede04b21f8454e06088e3ef7f065b819f788bad88409a93b2b195e8e66  1-wei transfer plus a reverted (OutOfFunds) attempt
+
 Chunk 1718000 (eras: block >= 1 718 497 is "drain_crisis"):
   0x0ec3f2488a93839524add10ea229e773f6bc891b4eb4794c3337d4495263790b  DAO drain, block 1718497:
       81 trace nodes, call depth 28, 81 native transfer rows (6 senders, 9 receivers,
@@ -53,9 +70,15 @@ Chunk 1920000 (fork block 1 920 000; "fork" era 1920000-1920009, "post_fork" aft
   0x29c0938e0933990d9965c64130c89189501b6a531d5a53ad4d907c9c698052f6  call_code (1920122)
   0x798af2597c979e2a218d7a7b8067fa48913c88cfa82e7bafa2dc3120317310e7  suicide (1920137)
   0xa1fafc6fd9351e7921147d8ddbac1fe169d34cd7baadb2f5cbee69a5f527cd2b  13 nodes, fan-out 5 (1920247)
+  0xd97337573a1e7de0cfac529c3999b448968aa14c0876c15585acd80b8c67c2fe  WithdrawDAO.withdraw() in the fork block 1920004:
+      the DAO writes and the Transfer log belong to transferFrom (node [1]), not to balanceOf (node [0])
   block-level reward row of block 1920000 (traces + native_transfers; transaction_hash is
   "0x" followed by 64 zero bytes)
   block rows of the 9 blocks above (block 1920000 has extra_data_string "dao-hard-fork")
 
+Chunk 1978000 (post_fork):
+  0x5ed540cfe135fb0501b0de15815d60b865e290e4b0d34d1ba488792d999e3175  186 nodes; node (26,) carries 2**256 wei with
+      error OutOfFunds (reverted, moves nothing): 4 receivers of 0.019 ETH
+
 Regenerate with
-  python -I tests/fixtures/xatu/cut_fixture.py <dir with the full chunks> tests/fixtures/xatu
+  python -I tests/fixtures/xatu/cut_fixture.py <dir[:dir...] with the full chunks> tests/fixtures/xatu

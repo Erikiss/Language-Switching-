@@ -246,3 +246,125 @@ funktionierendem Build nachgeholt werden (`REUSE=False`, nur Stufe E; ≈ 5–15
 | `sae_source = synthetic_random` in H/J/K | Kein publizierter SAE für dieses Modell/diese Site; ein zufälliger Platzhalter-SAE prüft nur die Codepfade. Für SAE-Befunde Shard 3 (`step143000`, `USE_SAE=True`). |
 | Stufe L: `STUB: lsne.transplant nicht importierbar` oder `validated = False` | Der Stand-in `rotated_self` muss den Transfertest bestehen, bevor ein Spurenmodell als Quelle gewertet wird (`docs/BLOCKGPT_FEASIBILITY.md`); ein HF-Quellmodell wird mit `TRANSPLANT_SOURCE="EleutherAI/pythia-70m@step143000"` geladen (Download ~160 MB). |
 | Notebook 10 lädt per `REUSE` den Stufe-K-Lauf von Shard 1 statt Shard 7 zu rechnen | `RUNS_SUBDIR="runs_ttt"` setzen (eigenes Laufverzeichnis) oder `REUSE=False`. |
+
+## 10. Spurenmodell 2016 auf der A100 (Notebook 12, Quelle für Stufe L)
+
+`notebooks/12_trace_source.ipynb` ist der volle Lauf des Quelladapters aus
+`docs/TRACE_SOURCE.md` (dort nur auf der CPU als Rohrleitung validiert): alle
+Xatu-Chunks 2016 (Blöcke 778 000–2 912 999) nach Drive, Serialisierung, Vokabular aus dem
+Hash-Trainingsteil mit Hold-out-OOV, Training `blockgpt` in bf16, Evaluation gegen
+Unigramm/Bigramm/untrainiert, die kontrollierten Sonden, das Alignment mit
+Längenresidualisierung und Stufe L mit `trace:<modell>` gegen `pythia-160m`. Daten:
+ethPandaOps Xatu, **CC BY 4.0** (Namensnennung „Data: ethPandaOps Xatu
+(https://ethpandaops.io), CC BY 4.0“; gilt auch für Shards, Vokabular und Modell).
+
+**Voraussetzung (Präregistrierung 18).** Das Spurenmodell zählt erst als Quelle, wenn der
+Stand-in-Lauf von Notebook 11 mit demselben `MODEL`/`REVISION` bestanden ist: maßgeblich ist
+`runs/L/<modell>@<rev>/verdict.csv` (Kontrast 18: `validated` True — Transfer-Kriterien und
+Vorzeichengleichheit für Residual und KV — und `counts_for_prereg` True; Selbstkonsistenz-Quellen
+`self`/`rotated_self` geben kein Urteil), nicht `transfer_summary.validated`. Abschnitt 8a prüft
+das, Stufe L prüft es selbst (Option `standin` → `trace_verdict.counts_for_prereg`), und die
+Zusammenfassung vermerkt es (`standin_validated`, `stage_L.counts_for_prereg`). Das
+Merkmal „Teilen“ (Netto-fan-out ≥ 5 gegen 1, längengematcht, letzter Snapshot, Kriterium
+trainiert − untrainiert) wird beim ersten Ausführen der Konfigurationszelle nach
+`trace_2016/frozen_feature.json` geschrieben; eine spätere Änderung wird erkannt und macht
+Sonden und Stufe L explorativ. Erwarteter Ausgang nach dem CPU-Lauf: „no claim“ (das
+untrainierte Modell trennt die Sonden genauso gut) — ein Ergebnis, kein Fehler.
+
+**Sitzungen.**
+
+| Sitzung | Laufzeittyp | Schritte | Dauer (Plan) | Einstellungen |
+|---|---|---|---|---|
+| 1 | CPU mit hohem RAM (oder gleich A100) | 1 Download, 2 Serialisierung, 3 Split/Vokabular/Hold-out-OOV | ≈ 1–3 h je nach Kernzahl | keine; ohne GPU überspringt das Notebook die Schritte 4–8 mit Hinweis |
+| 2 | A100 (40/80 GB) | 4 Durchsatz + Training, 5 Evaluation, 6 Sonden, 7 Paare/Alignment, 8 Stufe L | ≈ 2,3–4,8 h | alle Zellen erneut ausführen; erledigte Schritte werden übersprungen |
+
+Gesamt ≈ 3,3–7,8 h (Planungswerte aus `docs/TRACE_SOURCE.md` §8, Unsicherheit mindestens
+Faktor 2; die Tabelle „Ist gegen Plan“ am Ende des Notebooks zeigt die echten Zeiten). Eine
+A100 kostet ≈ 12 Recheneinheiten pro Stunde, also ≈ 27–57 CU für Sitzung 2 und ≈ 40–95 CU,
+wenn alles auf der A100 läuft (Preise vor dem Lauf in Colab prüfen). Reines Training:
+20 000 × 32 × 512 = 328 M Tokens ≈ 1 Epoche 2016, hochgerechnet 0,4–0,75 h bei 15–30 % MFU;
+Abschnitt 4a misst den bf16-Durchsatz vor dem Start.
+
+**Drive (≈ 14 GB).**
+
+```
+MyDrive/LSNE/
+├── cache/xatu/                         ≈ 5,2 GB Parquet (12 810 Dateien; download_log.csv des letzten Bereichs)
+├── trace_2016/                         = TRACE_ROOT
+│   ├── itr/  itr_train/                ≈ 3,2 GB + ≈ 1,3 GB Shards (gzip-JSONL je Chunk; split_counts.json)
+│   ├── vocab/                          Vokabular, Tokenizer, oov.json, oov_heldout.json
+│   ├── trace_lm_blockgpt/              Modell, checkpoint-*/ (2 × ≈ 1,2 GB), train_log.csv, manifest.json
+│   ├── blocks/                         gepackte Blöcke der Evaluation (≈ 1,4 GB int32)
+│   ├── eval.json  pairs_2000.jsonl  frozen_feature.json
+│   ├── probes/<sonde>/                 criterion.csv, probe_report.json, match_table.csv, sharing_directions.pt
+│   ├── align/                          align_controls.csv, align_summary.json
+│   ├── logs/<schritt>.log              Ausgabe jedes CLI-Aufrufs (auch nach Abbruch der Sitzung)
+│   └── steps/<schritt>.json            Marker erledigter Schritte (Status, Wandzeit)
+├── runs_trace/L/pythia-160m@step98000/ Stufe L mit dem Spurenmodell (getrennt vom Stand-in-Lauf in runs/L/…)
+├── figures/12_trace_source/
+└── summary_12_trace_source_pythia-160m_step98000_float32.json
+```
+
+Das Sondenkorpus (jeder `PROBE_SHARD_EVERY`-te Shard plus die Drain- und Fork-Chunks)
+besteht aus symbolischen Links unter `/content/trace_itr_probe` (Drive kann keine Links
+speichern) und wird in jeder Sitzung neu angelegt.
+
+**Fortsetzen.** Download: vorhandene vollständige Dateien werden übersprungen, ein
+fehlgeschlagener Bereich wird beim nächsten Ausführen wiederholt. Serialisierung: vorhandene
+Shards werden übersprungen. Split: je Shard (`split_counts.json`). Training: setzt beim
+neuesten vollständigen Checkpoint auf Drive fort (`SAVE_EVERY = 2000`, die Batch-Reihenfolge
+hängt nur von Saat und Schritt ab); vor dem ersten Schritt werden alle Shards neu gepackt
+(≈ 25 min für 2016). Ein höheres `STEPS` setzt ein fertiges Training fort. Alle übrigen
+Schritte: Marker unter `steps/` (`REUSE = True`); `FORCE_STEPS = {"evaluate", ...}` rechnet
+gezielt neu. Stufe L: `run_stage` lädt einen fertigen Lauf (`manifest.json`, `status: ok`).
+
+**Ohne Colab (CLI auf einer GPU-Maschine).**
+
+```bash
+export OUT=/data/lsne/trace_2016 CACHE=/data/lsne/cache/xatu
+for a in $(seq 778000 100000 2899999); do b=$((a + 100000)); [ $b -gt 2913000 ] && b=2913000
+  python -m lsne.chain.cli download --from $a --to $b --tables traces,transaction,native_transfers,erc20_transfers,logs,storage_diffs \
+      --cache $CACHE --workers 16 --retries 6; done
+python -m lsne.chain.cli serialize --cache $CACHE --from 778000 --to 2913000 --out $OUT/itr --workers $(nproc)
+ITR=$OUT/itr ITR_TRAIN=$OUT/itr_train VOCAB=$OUT/vocab VAL_FRAC=0.01 N_ADDRESSES=50000 VOCAB_REPORT=0 \
+    OUT=$OUT scripts/trace_e2e.sh vocab                      # Hash-Split + vocab (Hold-out-OOV: Notebook-Zelle 3c)
+python -m lsne.chain.cli train --in $OUT/itr --vocab $OUT/vocab --size blockgpt --out $OUT/trace_lm_blockgpt \
+    --steps 20000 --batch-size 32 --lr 3e-4 --warmup 200 --val-frac 0.01 --eval-every 500 --eval-blocks 512 \
+    --save-every 2000 --keep-checkpoints 2 --bf16 on --device auto
+python -m lsne.chain.cli probe --model $OUT/trace_lm_blockgpt --in $OUT/itr --kind fanout --k 5 --match length \
+    --length-ratio 1.25 --n 2000 --untrained auto --out $OUT/probes/fanout_len_k5        # ebenso k 3, k 2
+python -m lsne.chain.cli probe --model $OUT/trace_lm_blockgpt --in $OUT/itr --kind dao --match length \
+    --mask all_addresses --n 2000 --untrained auto --out $OUT/probes/dao_len_mask_all    # ebenso --mask dao
+python -m lsne.chain.cli pair --in $OUT/itr --n 2000 --balance --out $OUT/pairs_2000.jsonl
+python -m lsne.chain.cli align --model $OUT/trace_lm_blockgpt --pairs $OUT/pairs_2000.jsonl \
+    --target EleutherAI/pythia-160m@step98000 --alphas 1,100 --out $OUT/align
+python -m lsne.cli run --stage L --model EleutherAI/pythia-160m --revision step98000 --out /data/lsne/runs_trace \
+    --transplant-source "trace:$OUT/trace_lm_blockgpt,shards=$OUT/itr,k=5,standin=/data/lsne/runs/L/pythia-160m@step98000"
+```
+
+Die Spuren-Optionen der Stufe L stehen als `key=value` hinter dem Modellverzeichnis
+(`shards`, `direction`, `layer`, `k`, `n_probe`, `n_pairs`, `length_ratio`, `site_layer`,
+`n_prompts`, `split`, `standin`, …; `lsne.cli run` hat keine `--trace-*`-Flags); `standin`
+zeigt auf den Stand-in-Lauf (Notebook 11), ohne ihn zählt kein Ergebnis für
+Präregistrierung 18. Für Sonden und Paare ohne Trainingsdaten des Spurenmodells:
+`probe … --split heldout`, `pair … --split heldout --model $OUT/trace_lm_blockgpt` und in Stufe L
+`split=heldout` (der Hash-Split des Trainings, `val_frac` aus dem Modell-Manifest).
+
+Die Evaluation gegen Unigramm/Bigramm/untrainiert hat keinen CLI-Befehl; sie steht im
+Notebook (Zelle 5a) und in `scripts/trace_e2e.sh` (Schritte `baseline evaluate untrained`).
+Auf der CLI lesen `probe`, `pair` und Stufe L das ganze Korpus; für Speicher und Zeit ein
+Verzeichnis mit Links auf jeden 4. Shard übergeben (wie das Notebook).
+
+**Fehlersuche (Notebook 12).**
+
+| Symptom | Ursache / Abhilfe |
+|---|---|
+| `download: … failed` / `FAILED <tabelle> <start>: HTTP 404` | Der Chunk fehlt bei Xatu für diese Tabelle (wird nicht wiederholt); die Serialisierung nutzt die vorhandenen Tabellen. Netzfehler: Zelle erneut ausführen. |
+| Drive voll / `OSError: [Errno 28]` | ≈ 14 GB nötig; alte Checkpoints (`KEEP_CHECKPOINTS = 1`) oder `blocks/` löschen; `cache/xatu` kann nach der Serialisierung archiviert werden. |
+| Training startet erst nach ≈ 25 min | Normal: `train` packt alle Shards vor dem ersten Schritt neu (je Start und Fortsetzung). |
+| `CUDA out of memory` im Training | `BATCH = 16`, `GRAD_ACCUM = 2` (gleiche Tokens pro Schritt; beim Fortsetzen eines laufenden Trainings warnt `train`, dass die Batch-Reihenfolge dann von einem ununterbrochenen Lauf abweicht). |
+| RAM-Abbruch in 5a oder 6a | `BASELINE_MAX_TRAIN_BLOCKS = 200_000` bzw. `PROBE_SHARD_EVERY = 8`. |
+| `probe: only N matched pairs … need >= 2` | Zu wenige längengematchte Paare: der Netto-fan-out ≥ 5 (Empfänger mit Netto-Zufluss über die wirksamen Transfers, sichtbar im 512-Token-Fenster) ist 2016 extrem selten (CPU-Stichprobe: 4 von 225 854 Transaktionen); das ist ein Ergebnis und wird so markiert. Stufe L fällt dann auf eine gelockerte Sonde zurück und behauptet nichts (`feature_frozen = False`). |
+| `labels_df comes from an older serialisation (fan definition ['value_gt_0'] …)` | Die Shards stammen von vor Fix-Runde 1 (Brutto-fan-out ohne Netto-Flüsse und ohne Fenster-Merkmale, Logs/Diffs am ersten Knoten): `python -m lsne.chain.cli serialize … --overwrite` (bzw. die Serialisierungs-Marker löschen), danach Split, Vokabular und Training neu. |
+| `WARNUNG: das eingefrorene Merkmal wurde geändert` | `TRACE_K`, `TRACE_LAYER`, `LENGTH_RATIO`, `TRACE_DIRECTION` oder die fan-out-Definition (`fan_definition`, seit Fix-Runde 1 `net_effective`; `visible_window`) weichen von `frozen_feature.json` ab: der Lauf ist explorativ (Präregistrierung 18). Ein vor Fix-Runde 1 eingefrorenes Merkmal ist damit immer „geändert“; vor dem ersten echten Lauf `frozen_feature.json` bewusst neu schreiben (löschen) und das dokumentieren. |
+| Stufe L lädt per `REUSE` einen alten Lauf | `REUSE = False` oder `runs_trace/L/…` löschen. |

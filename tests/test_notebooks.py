@@ -9,6 +9,16 @@ outputs and execution counts ignored) so that they can never drift from the gene
 The stage G-L notebooks (06-11) must additionally carry the pre-registration paragraph,
 the substage report and the stage-specific keyword arguments of their ``run()``.
 
+Notebook 12 (``12_trace_source``, the A100 run of the stage-L trace source) has its own
+skeleton test: setup / Drive / configuration / runner / summary as in 00-11, every
+pipeline step (download, serialize, hash-split vocabulary with held-out OOV, bf16 training
+with checkpoints and resume, evaluation against unigram / bigram / untrained, controlled
+probes, length-residualised alignment, stage L with ``trace:<model_dir>``), the cost
+table and the frozen feature; every ``python -m lsne.chain.cli`` option the notebook
+passes must exist in the parser of ``lsne.chain.cli``.  Its headless smoke execution on
+the Xatu fixture is marked ``slow``.  The committed notebooks must also be byte-identical
+to the generator output.
+
 ``test_notebook_runs_headless_in_smoke_mode`` (marked ``slow``) executes notebooks 00 and
 06 with ``SMOKE = True`` (pythia-14m, DEV01) through nbclient inside this checkout: every
 cell must run without an uncaught error, the stage manifest must say ``ok`` and the
@@ -58,6 +68,10 @@ STAGE_TABLES = {
     "L": ["transfer_test", "transfer_summary", "layer_matching", "alignments", "transplant", "transplant_summary"],
 }
 HEADLESS = ["00_setup_and_anchor", "06_geometry_trajectory"]
+#: notebooks outside the A-L stage sequence (same skeleton conventions, own tests)
+TRACE_NB = "12_trace_source"
+ALL = EXPECTED + [TRACE_NB]
+STAGE_OF["12"] = "L"
 
 
 @pytest.fixture(scope="module")
@@ -92,13 +106,14 @@ def _code(nb: nbformat.NotebookNode) -> str:
 
 
 def test_generator_covers_all_notebooks(builder):
-    assert list(builder.NOTEBOOKS) == EXPECTED
-    assert set(builder.BUILDERS) == set(EXPECTED)
+    assert list(builder.NOTEBOOKS) == ALL
+    assert set(builder.BUILDERS) == set(ALL)
     assert [builder.NOTEBOOKS[s][0] for s in EXPECTED] == list("ABCDEFGHIJKL")
     assert [STAGE_OF[s[:2]] for s in EXPECTED] == list("ABCDEFGHIJKL")
+    assert builder.NOTEBOOKS[TRACE_NB][0] == "L"
 
 
-@pytest.mark.parametrize("stem", EXPECTED)
+@pytest.mark.parametrize("stem", ALL)
 def test_regenerated_notebook_is_valid(regenerated, stem):
     path = regenerated / f"{stem}.ipynb"
     assert path.exists(), f"{path} not written"
@@ -170,7 +185,7 @@ def test_stage_g_to_l_notebooks(regenerated, stem):
 def test_committed_notebooks_equal_regenerated(builder, regenerated):
     """The committed notebooks must be byte-for-byte what the generator produces (normalised)."""
     drift = []
-    for stem in EXPECTED:
+    for stem in ALL:
         committed = NOTEBOOK_DIR / f"{stem}.ipynb"
         assert committed.exists(), f"{committed} is missing; run python scripts/build_notebooks.py"
         a = _normalised(nbformat.read(committed, as_version=4))
@@ -181,10 +196,20 @@ def test_committed_notebooks_equal_regenerated(builder, regenerated):
     assert builder.check(NOTEBOOK_DIR) == []
 
 
+@pytest.mark.parametrize("stem", ALL)
+def test_committed_notebooks_are_byte_identical(regenerated, stem):
+    """Regenerating must reproduce every committed notebook byte for byte (not only after
+    normalisation): adding a notebook must never touch the others."""
+    committed = NOTEBOOK_DIR / f"{stem}.ipynb"
+    assert committed.exists(), f"{committed} is missing; run python scripts/build_notebooks.py"
+    assert committed.read_bytes() == (regenerated / f"{stem}.ipynb").read_bytes(), (
+        f"{stem}: committed notebook differs from the generator output; run python scripts/build_notebooks.py")
+
+
 def test_check_mode_detects_drift(builder, tmp_path):
     """``--check`` reports a modified notebook and a missing one."""
     paths = builder.write_all(tmp_path)
-    assert len(paths) == len(EXPECTED)
+    assert len(paths) == len(ALL)
     assert builder.check(tmp_path) == []
     nb = nbformat.read(paths[0], as_version=4)
     nb.cells[-1].source += "\nprint('drift')\n"
@@ -195,6 +220,159 @@ def test_check_mode_detects_drift(builder, tmp_path):
     r = subprocess.run([sys.executable, str(SCRIPT), "--check", "--out", str(tmp_path)], capture_output=True,
                        text=True, cwd=str(REPO), timeout=120)
     assert r.returncode == 1
+
+
+# --------------------------------------------------------------------------------------
+# notebook 12: the trace source on all of 2016 (A100)
+# --------------------------------------------------------------------------------------
+def _trace_nb(regenerated) -> nbformat.NotebookNode:
+    return nbformat.read(regenerated / f"{TRACE_NB}.ipynb", as_version=4)
+
+
+def _config_source(nb) -> str:
+    cells = [c.source for c in nb.cells if c.cell_type == "code" and "SMOKE = False" in c.source]
+    assert len(cells) == 1, "the configuration cell must set SMOKE = False exactly once"
+    return cells[0]
+
+
+def _chain_cli_calls(nb) -> list[tuple[int, str, list[str]]]:
+    """``(cell index, first element, [--options])`` of every list literal in the code cells
+    whose first element is a string: the argument lists handed to ``run_cli``."""
+    import ast
+
+    out = []
+    for i, c in enumerate(nb.cells):
+        if c.cell_type != "code":
+            continue
+        for node in ast.walk(ast.parse(c.source)):
+            if isinstance(node, ast.List) and node.elts and isinstance(node.elts[0], ast.Constant) \
+                    and isinstance(node.elts[0].value, str):
+                opts = [e.value for e in node.elts if isinstance(e, ast.Constant) and isinstance(e.value, str)
+                        and e.value.startswith("--")]
+                out.append((i, node.elts[0].value, opts))
+    return out
+
+
+def _subparser_options(parser) -> dict[str, set]:
+    import argparse
+
+    sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    return {name: set(sp._option_string_actions) for name, sp in sub.choices.items()}
+
+
+def test_trace_source_notebook_skeleton(regenerated):
+    """Header, expectations / cost table, setup, Drive, configuration, runner, every pipeline
+    step, stage L with the trace source and the summary json."""
+    nb = _trace_nb(regenerated)
+    assert nb.metadata["lsne"]["stage"] == "L" and len(nb.cells) >= 20
+    head = nb.cells[0].source
+    assert head.startswith("# LS-NEQ 12_trace_source")
+    for s in ("Dossier-Stufe L", "**Zweck.**", "**Eingaben.**", "**Ausgaben**", "**Ablauf.**", "**Präregistrierung.**",
+              "CC BY 4.0", "ethPandaOps Xatu", "docs/TRACE_SOURCE.md", "frozen_feature.json", "Kontrast 18", "SMOKE = True"):
+        assert s in head, s
+    md_all = "\n".join(c.source for c in nb.cells if c.cell_type == "markdown")
+    for s in ("## Realistische Erwartungen und Kosten", "EXTRAPOLATION", "| Schritt |", "**Summe**", "5,2 GB", "338 M",
+              "Recheneinheiten", "14 GB", "no claim", "untrainiert", "1,12 gegen 1,49"):
+        assert s in md_all, s
+    src = _code(nb)
+    for s in ("https://github.com/Erikiss/Language-Switching-.git", "claude/language-switching-non-equilibrium-ejpz0q",
+              "/content/lsne-repo", "requirements.txt", "pip install -q -e .", "google.colab", "drive_root", "OUT_ROOT",
+              "def guarded(", "traceback", "def run_stage(", "def substage_report(", "summary_", "json.dump", "savefig(",
+              "plt.show()"):
+        assert s in src, s
+    cfg = _config_source(nb)
+    for s in ("BLOCK_FROM, BLOCK_TO = 778_000, 2_913_000", "N_ADDRESSES = 50_000", 'SIZE = "blockgpt"', 'BF16 = "on"',
+              "STEPS, BATCH, BLOCK_SIZE = 20_000, 32, 512", 'MODEL = "EleutherAI/pythia-160m"', "REUSE = True",
+              "VAL_FRAC = 0.01", "TRACE_K = 5", "frozen_feature.json", "FROZEN_CHANGED", "runs_trace", "PLAN_HOURS = {",
+              'os.path.join(REPO_DIR, "tests", "fixtures", "xatu")'):
+        assert s in cfg, s
+
+
+def test_trace_source_notebook_pipeline(regenerated, builder):
+    """Every lsne.chain.cli step runs through run_cli (log on Drive, step markers); the
+    hash-split vocabulary with held-out OOV, bf16 training with checkpoints and resume,
+    the baselines, the controlled probes, the residualised alignment and stage L."""
+    nb = _trace_nb(regenerated)
+    src = _code(nb)
+    subs = {s for _, s, _ in _chain_cli_calls(nb)}
+    assert {"download", "serialize", "vocab", "train", "probe", "pair", "align"} <= subs
+    for s in ("def run_cli(", "def step_done(", "def mark_step(", "LOG_DIR", "STEP_DIR", "list_checkpoints",
+              '"--save-every", SAVE_EVERY', '"--bf16", BF16', '"--workers", SERIALIZE_WORKERS', '"--n-addresses", N_ADDRESSES',
+              '"--match", "length"', '"--untrained", "auto"', '"--mask", pc["mask"]', 'mask="all_addresses"', 'mask="dao"',
+              '"--target", TARGET', "_is_val", "split_train_shards", "oov_heldout", "address_oov_vs_budget",
+              "measure_throughput", "torch.autocast", "unigram_logp", "bigram_nll", "untrained_val", "make_model",
+              "corpus_blocks", "criterion.csv", "align_controls.csv", "def probe_corpus(", "os.symlink"):
+        assert s in src, s
+    # stage L with the trace source, its tables and the pre-registration 18 prerequisite
+    for s in ('run_stage("L", **L_KW)', 'transplant_source=f"trace:{MODEL_DIR}"', "trace_shards=", "trace_k=",
+              "trace_standin=STANDIN_DIR", '--transplant-source \\"trace:{MODEL_DIR},{_spec_opts}', 'substage_report("L")',
+              'table("L", "trace_verdict")', 'table("L", "trace_probe")', 'table("L", "trace_effects")',
+              'table("L", "trace_alignment_controls")', 'table("L", "trace_sharing")', 'file("verdict.csv")',
+              "STANDIN_VALIDATED", '"counts_for_prereg"', '("self", "rotated_self")'):
+        assert s in src, s
+    # the stand-in prerequisite is read from verdict.csv (contrast 18), never from transfer_summary.validated
+    assert "transfer_summary.csv" not in src and "--trace-shards" not in src
+    # missing CLI features are marked where the notebook works around them
+    assert src.count("TODO(lsne.chain.cli") >= 3
+    # the cost table and the plan-vs-actual table use the same planning values
+    plan = builder.TRACE_PLAN_HOURS
+    assert set(plan) >= {"download", "serialize", "vocab", "train", "evaluate", "probes", "align", "stage_L"}
+    lo, hi = sum(a for a, _ in plan.values()), sum(b for _, b in plan.values())
+    md_all = "\n".join(c.source for c in nb.cells if c.cell_type == "markdown")
+    assert f"≈ {lo:.1f}–{hi:.1f} h".replace(".", ",") in md_all
+
+
+def test_trace_source_notebook_cli_options_exist(regenerated):
+    """Every option the notebook passes to ``python -m lsne.chain.cli <sub>`` exists in that
+    subcommand's parser (option lists appended in the same cell, e.g. ``["--threads", 1]``,
+    must exist in one of the cell's subcommands)."""
+    from lsne.chain import cli as chain_cli
+
+    opts = _subparser_options(chain_cli.build_parser())
+    calls = _chain_cli_calls(_trace_nb(regenerated))
+    by_cell: dict[int, set] = {}
+    for i, first, _ in calls:
+        if first in opts:
+            by_cell.setdefault(i, set()).add(first)
+    checked = 0
+    for i, first, used in calls:
+        if first in opts:
+            bad = [o for o in used if o not in opts[first]]
+            assert not bad, f"cell {i}: lsne.chain.cli {first} has no option(s) {bad}"
+            checked += len(used)
+        elif first.startswith("--"):
+            cands = by_cell.get(i, set())
+            assert cands, f"cell {i}: option list {used} without a subcommand in the same cell"
+            for o in used:
+                assert any(o in opts[s] for s in cands), f"cell {i}: {o} is no option of {sorted(cands)}"
+            checked += len(used)
+    assert checked >= 40
+
+
+def test_trace_source_notebook_stage_l_cli_equivalent(regenerated):
+    """The printed CLI equivalent of stage L uses only options of ``python -m lsne.cli run``;
+    the trace options ride on the source spec (``trace:<dir>,key=value,...``) and every key is
+    one stage L understands."""
+    import re
+
+    from lsne.cli import build_parser
+    from lsne.experiments import stage_l_transplant as SL
+
+    run_opts = _subparser_options(build_parser())["run"]
+    cfg = _config_source(_trace_nb(regenerated))
+    seg = cfg[cfg.index("CLI_COMMAND = ("):]
+    seg = seg[: seg.index("\n\n")]
+    used = set(re.findall(r"(?<![\w-])--[a-z][a-z0-9-]*", seg))
+    assert {"--stage", "--model", "--revision", "--out", "--transplant-source"} <= used
+    missing = sorted(used - set(run_opts))
+    assert not missing, f"lsne.cli run has no option(s) {missing}"
+    # the keyword dict of the notebook maps 1:1 onto spec keys
+    kw = re.findall(r'trace_([a-z_]+)=', cfg[cfg.index("L_KW = dict("):cfg.index("CLI_COMMAND = (")])
+    kw += re.findall(r'L_KW\["trace_([a-z_]+)"\]', cfg)
+    assert kw and set(kw) <= set(SL.TRACE_SPEC_KEYS), set(kw) - set(SL.TRACE_SPEC_KEYS)
+    model_dir, opts = SL.parse_trace_spec("trace:/x/lm,shards=/x/itr,k=5,n_probe=500,length_ratio=1.25,standin=/r/L/m@s")
+    assert model_dir == "/x/lm" and opts == dict(shards="/x/itr", k="5", n_probe="500", length_ratio="1.25",
+                                                 standin="/r/L/m@s")
 
 
 # --------------------------------------------------------------------------------------
@@ -268,3 +446,62 @@ def test_notebook_runs_headless_in_smoke_mode(regenerated, stem, tmp_path, monke
     n_png = sum(1 for c in nb.cells if c.cell_type == "code"
                 for o in c.get("outputs", []) if "data" in o and "image/png" in o["data"])
     assert n_png >= len(figures)
+
+
+@pytest.mark.slow
+def test_trace_notebook_runs_headless_in_smoke_mode(regenerated, tmp_path, monkeypatch):
+    """Execute notebook 12 with SMOKE = True (Xatu fixture, tiny model, pythia-14m) through
+    nbclient: every cell and every guarded section must run, every pipeline step must end
+    with a marker, stage L must finish with the trace source and claim nothing."""
+    nbclient = pytest.importorskip("nbclient")
+    pytest.importorskip("ipykernel")
+    from nbclient.exceptions import CellExecutionError, CellTimeoutError
+
+    nb = _trace_nb(regenerated)
+    for c in nb.cells:
+        if c.cell_type == "code" and "SMOKE = False" in c.source:
+            c.source = c.source.replace("SMOKE = False", "SMOKE = True")
+    out_root = tmp_path / "lsne_out"
+    monkeypatch.setenv("LSNE_RUNS", str(out_root))
+    monkeypatch.setenv("LSNE_CACHE", str(REPO / "cache"))
+    monkeypatch.delenv("LSNE_REPO_DIR", raising=False)
+    client = nbclient.NotebookClient(nb, timeout=1800, kernel_name="python3", allow_errors=False,
+                                     resources={"metadata": {"path": str(REPO)}})
+    started = False
+    try:
+        with client.setup_kernel():
+            started = True
+            client.reset_execution_trackers()
+            for i, cell in enumerate(nb.cells):
+                client.execute_cell(cell, i)
+    except (CellExecutionError, CellTimeoutError) as e:
+        pytest.fail(f"{TRACE_NB}: {e}")
+    except Exception as e:  # noqa: BLE001 - no kernel on this machine
+        if not started:
+            pytest.skip(f"no Jupyter kernel could be started: {e!r}")
+        raise
+
+    text = "\n".join(_cell_text(c) for c in nb.cells if c.cell_type == "code")
+    assert "übersprungen (siehe Traceback)" not in text, text[-4000:]
+    assert "FEHLGESCHLAGEN" not in text and "Vorhandener Checkout" in text and "SMOKE: True" in text
+    root = out_root / "trace_smoke"
+    assert (root / "frozen_feature.json").exists() and (root / "trace_lm_tiny" / "manifest.json").exists()
+    steps = {p.stem: json.loads(p.read_text(encoding="utf-8")) for p in (root / "steps").glob("*.json")}
+    for name in ("serialize", "split", "vocab", "oov_heldout", "train", "evaluate", "pair", "align",
+                 "probe_fanout_len_k5", "probe_dao_len_mask_all"):
+        assert steps[name]["status"] == "ok", (name, steps.get(name))
+    ev = json.loads((root / "eval.json").read_text(encoding="utf-8"))
+    assert ev["model_val"] < ev["untrained_val"] and ev["bigram_val"] < ev["unigram_val"] < ev["uniform"]
+    m = json.loads((out_root / "runs_trace" / "L" / "pythia-14m@step98000" / "manifest.json").read_text(encoding="utf-8"))
+    assert m["status"] == "ok" and m["source"]["kind"] == "trace" and m["trace"]["shards_from"] == "explicit"
+    assert m["substages"]["n_failed"] == 0, m["substages"]["errors"]
+    summaries = list(out_root.glob(f"summary_{TRACE_NB}_*.json"))
+    assert len(summaries) == 1
+    s = json.loads(summaries[0].read_text(encoding="utf-8"))
+    assert s["smoke"] is True and s["stage"] == "L" and s["report"]["L"]["status"] == "ok"
+    assert s["stage_L"]["sharing_effect_claimed"] is False and s["standin_validated"] is None
+    assert s["tables"]["L"]["trace_verdict"] == 3 and set(s["tables"]["L"]) == set(m["tables"])
+    assert {r["step"] for r in s["plan_vs_actual"]} >= {"download", "train", "probes", "stage_L"}
+    assert any(c.startswith("python -m lsne.chain.cli train ") for c in s["cli_commands"])
+    figures = sorted(p.name for p in (out_root / "figures" / TRACE_NB).glob("*.png"))
+    assert len(figures) >= 4 and figures == s["figures"]

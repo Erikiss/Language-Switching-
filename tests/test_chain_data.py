@@ -21,6 +21,13 @@ FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "xatu
 DRAIN = "0x0ec3f2488a93839524add10ea229e773f6bc891b4eb4794c3337d4495263790b"
 WITHDRAW_TXS = ("0xf088dda9ba4a859d73a2ab760be508a6859b493685ff58ffd7f7e45b316caf50",
                 "0x2fffeca979da48f1cf416b136ebf966c2319e55470700e9271df356c6e9b71c6")
+WITHDRAW_FEASIBLE = "0xd97337573a1e7de0cfac529c3999b448968aa14c0876c15585acd80b8c67c2fe"   # fork block 1920004
+CALL_CODE_TX = "0x29c0938e0933990d9965c64130c89189501b6a531d5a53ad4d907c9c698052f6"
+OOG_TX = "0x21d7e78b330072bffe43e26d8d5571bc45691b7d14a454f4d7871c61a58b4414"
+REVERTED_HUGE = "0x5ed540cfe135fb0501b0de15815d60b865e290e4b0d34d1ba488792d999e3175"      # chunk 1978000
+DAO_CREATION = "0xe9ebfecc2fa10100db51a4408d18193b3ac504584b51a4e55bdef1318f0a30f9"      # chunk 1428000
+REFUND_TX = "0xf5097cbcdb67f5a8f51fa602157725ba06bb37fc56bfdcb395b01174a2b25372"
+ONE_WEI_TX = "0x7f3342ede04b21f8454e06088e3ef7f065b819f788bad88409a93b2b195e8e66"
 WEI = 10 ** 18
 
 
@@ -124,8 +131,9 @@ def test_build_records_drain(drain):
     f = labels.sharing_features(drain)
     # structural counts (one native_transfers row per trace node, zero-value calls included)
     assert f["n_call_targets"] == 9 and f["n_call_sources"] == 6
-    # economic fan-out / fan-in: only the 20 value-carrying rows
-    assert f["fan_out_eth"] == 3 and f["fan_in_eth"] == 4 and f["n_native_transfers_pos"] == 20
+    # gross counts over the 20 value-carrying (all effective) rows; net flows: 3 sources, 3 recipients
+    assert f["fan_out_eth_gross"] == 3 and f["fan_in_eth_gross"] == 4 and f["n_native_transfers_pos"] == 20
+    assert f["fan_out_eth"] == 3 and f["fan_in_eth"] == 3 and f["n_transfers_effective"] == 20
     assert len(drain.native_transfers) == 81
     assert abs(sum(t["value"] for t in drain.native_transfers) / WEI - 2597.76) < 0.01
     nodes = {n.internal_index: n for n in drain.nodes()}
@@ -135,26 +143,72 @@ def test_build_records_drain(drain):
         assert n.value == t["value"]
         assert n.frm == t["from_address"]
         assert n.target == t["to_address"]
-    # logs and storage attached by address to the first DFS node with that target, else root
+    # logs and storage diffs attached by address and feasibility (see _assert_feasible)
     dfs = drain.nodes("dfs")
     assert sum(len(n.logs) for n in dfs) == 31
     assert sum(len(n.state_writes) for n in dfs) == 32
-    first = {}
-    for n in dfs:
-        for a in (n.to, n.created):
-            if a and a not in first:
-                first[a] = n
-    for n in dfs:
-        for item in n.logs + n.state_writes:
-            assert first.get(item["address"], drain.root) is n
+    _assert_feasible(drain)
     # children are sorted by trace address; DFS order equals sorted trace addresses
     assert [n.path for n in dfs] == sorted(n.path for n in dfs)
     assert drain.gas_source == "trace_estimate" and drain.gas_used > drain.root.gas_used
 
 
+def _assert_feasible(rec):
+    """Every log / storage diff sits on a frame that acts on its address (call target, created
+    contract, or the caller of a delegate_call / call_code), outside failed subtrees, and the
+    frame's own gas covers the minimum cost of everything attached to it."""
+    failed = itr.failed_nodes(rec.root)
+    for n in rec.nodes("dfs"):
+        if not (n.logs or n.state_writes):
+            continue
+        assert id(n) not in failed and n.call_type not in ("static_call", "suicide")
+        for item in n.logs + n.state_writes:
+            assert item["address"] == itr.context_address(n) and item["attach"] == "feasible"
+        cost = itr.SSTORE_MIN_GAS * len(n.state_writes) + sum(itr.log_min_gas(lg) for lg in n.logs)
+        assert cost <= itr.self_gas(n), (n.path, cost, itr.self_gas(n))
+    # logs follow the execution order (Euler tour of the call tree)
+    tour = itr._euler_tour(rec.root)
+    logs = sorted(((lg["log_index"], n) for n in rec.nodes() for lg in n.logs), key=lambda x: x[0])
+    pos, last = {}, -1
+    for p, n in enumerate(tour):
+        pos.setdefault(id(n), []).append(p)
+    for _, n in logs:
+        nxt = [p for p in pos[id(n)] if p >= last]
+        assert nxt, "logs out of execution order"
+        last = nxt[0]
+
+
+def test_attach_effects_by_feasibility(recs_1920, drain):
+    """WithdrawDAO.withdraw (0xd97337…): the three DAO balance writes and the Transfer log come
+    from transferFrom (node [1], 29 490 gas), not from the preceding balanceOf (node [0], 788 gas)
+    that the old first-node-by-address rule picked."""
+    by = {r.tx_hash: r for r in recs_1920}
+    r = by[WITHDRAW_FEASIBLE]
+    nodes = {n.path: n for n in r.nodes()}
+    assert nodes[(0,)].selector == "0x70a08231" and nodes[(1,)].selector == "0x23b872dd"
+    assert not nodes[(0,)].state_writes and not nodes[(0,)].logs
+    assert len(nodes[(1,)].state_writes) == 3 and len(nodes[(1,)].logs) == 1
+    assert {w["address"] for w in nodes[(1,)].state_writes} == {labels.DAO_ADDRESSES["dao"]}
+    for rec in recs_1920 + [drain]:
+        _assert_feasible(rec)
+    # delegate_call / call_code frames act on their caller's storage, failed frames on nothing
+    root = itr.CallNode(path=(), call_type="call", action_type="call", frm="0xa", to="0xb", value=0, gas=10 ** 6,
+                        gas_used=51000, selector=None, args=[], error=None, created=None)    # 1 000 self gas
+    lib = itr.CallNode(path=(0,), call_type="delegate_call", action_type="call", frm="0xb", to="0xc", value=0,
+                       gas=10 ** 6, gas_used=30000, selector=None, args=[], error=None, created=None)
+    bad = itr.CallNode(path=(1,), call_type="call", action_type="call", frm="0xb", to="0xb", value=0, gas=10 ** 6,
+                       gas_used=20000, selector=None, args=[], error="out of gas", created=None)
+    root.children = [lib, bad]
+    w = [dict(address="0xb", slot="0x1"), dict(address="0xb", slot="0x2"), dict(address="0xd", slot="0x3")]
+    counts = itr.attach_effects(root, [], w)
+    assert [x["slot"] for x in lib.state_writes] == ["0x1", "0x2"] and not bad.state_writes
+    assert counts == {"feasible": 2, "fallback": 0, "root": 1} and root.state_writes[0]["slot"] == "0x3"
+    assert root.state_writes[0]["attach"] == "root" and itr.self_gas(root) == 1000
+
+
 def test_build_records_counts_and_block_level_excluded(recs_1718, recs_1920):
     assert len(recs_1718) == 5
-    assert len(recs_1920) == 9
+    assert len(recs_1920) == 10
     for r in list(recs_1718) + list(recs_1920):
         assert not xatu.is_block_level(r.tx_hash)
         assert r.tx_hash == r.tx_hash.lower()
@@ -173,8 +227,8 @@ def test_build_records_transaction_fields(recs_1920):
     assert {"call", "create", "call_code", "suicide"} <= kinds
     create = next(r for r in recs_1920 if r.root.call_type == "create")
     assert create.to is None and create.root.created is not None and create.root.selector is None
-    assert sum(len(r.erc20_transfers) for r in recs_1920) == 3
-    assert sum(len(n.state_reads) for r in recs_1920 for n in r.nodes()) == 41
+    assert sum(len(r.erc20_transfers) for r in recs_1920) == 4
+    assert sum(len(n.state_reads) for r in recs_1920 for n in r.nodes()) == 49
 
 
 def test_build_records_accepts_raw_pyarrow_rows():
@@ -253,8 +307,66 @@ def test_serialize_args():
                        gas_used=21000, success=True, root=node, n_nodes=1, max_depth=0)
     toks = itr.serialize(rec, max_args=4)
     i = toks.index("[INs]")
+    # 2**70 (an 18-decimal token amount of ~1 180 units) keeps its magnitude; short words are [WORD]
     assert toks[i + 1:toks.index("[OUTs]")] == ["A:0xb656b2a9c3b2416437a811e07466ca712f5a5b5a", "N59e0",
-                                                "[WORD]", "[WORD]"]
+                                                "N12e20", "[WORD]"]
+    # an address with leading zero bytes (< 2**128) is an address only when the tx touches it;
+    # values >= 2**160 (hashes) stay [WORD]
+    lead0 = "00000000ab" + "c" * 30
+    word_lead0 = "0x" + "0" * 24 + lead0
+    word_hash = "0x" + "f" * 64
+    node.args = [word_lead0, word_hash]
+    assert itr.serialize(rec)[i + 1:i + 3] == [itr.numeric_token(int(lead0, 16)), "[WORD]"]
+    node.to = "0x" + lead0
+    assert itr.serialize(rec)[i + 1:i + 3] == ["A:0x" + lead0, "[WORD]"]
+    assert itr._arg_token("0x" + format(2 ** 100, "064x"), None) == itr.numeric_token(2 ** 100)
+    assert itr._arg_token("0x" + format(2 ** 159, "064x"), None) == "A:0x" + format(2 ** 159, "040x")
+    assert itr._arg_token("0x" + format(2 ** 160, "064x"), None) == "[WORD]"
+
+
+def test_error_kinds_of_xatu_strings():
+    """Every distinct trace error of the 2016 chunks maps to a specific kind."""
+    assert itr.error_kind("OutOfFunds") == "out_of_funds"
+    assert itr.error_kind("Bad jump destination") == "bad_jump"
+    assert itr.error_kind("Out of gas") == "out_of_gas"
+    assert itr.error_kind("CallTooDeep") == "call_depth"
+    assert itr.error_kind("calltoodeep") == "call_depth"
+    assert itr.error_kind("InvalidOperandOOG") == "out_of_gas"
+    assert itr.error_kind("EOFOpcodeDisabledInLegacy") == "invalid_opcode"
+    assert itr.error_kind("Reverted") == "reverted" and itr.error_kind(None) is None
+    assert itr.error_kind("something new") == "other"
+
+
+def test_deep_record_dict_roundtrip_is_iterative():
+    """A call chain of depth 3 000 (the call-depth attacks reach 1 025) converts without recursion."""
+    root = itr.CallNode(path=(), call_type="call", action_type="call", frm="0x" + "1" * 40, to="0x" + "2" * 40,
+                        value=0, gas=1, gas_used=0, selector=None, args=[], error=None, created=None)
+    n = root
+    for d in range(3000):
+        c = itr.CallNode(path=n.path + (0,), call_type="call", action_type="call", frm=n.to, to=n.to, value=0,
+                         gas=1, gas_used=0, selector=None, args=[], error=None, created=None)
+        n.children.append(c)
+        n = c
+    rec = itr.TxRecord(tx_hash="0x" + "b" * 64, block_number=1, tx_index=0, frm=root.frm, to=root.to, value=0,
+                       gas_used=0, success=True, root=root, n_nodes=3001, max_depth=3000)
+    d = json.loads(json.dumps(rec.to_dict()))
+    back = itr.TxRecord.from_dict(d)
+    assert back.max_depth == 3000 and len(back.nodes()) == 3001
+    assert max(m.depth for m in back.nodes()) == 3000 and back.nodes()[-1].path == (0,) * 3000
+
+
+def test_node_spans_and_visible_nodes(drain):
+    toks = itr.serialize(drain)
+    spans = itr.node_spans(drain)
+    assert len(spans) == drain.n_nodes and [n for n, _, _ in spans] == drain.nodes("bfs")
+    for n, a, b in spans:
+        assert toks[a:a + 2] == ["[START]", "[CALL]"] and toks[b - 1] == "[END]"
+    vis = itr.visible_nodes(drain, 512)
+    assert 0 < len(vis) < drain.n_nodes and all(b <= 512 for n, a, b in spans if n in vis)
+    assert len(itr.visible_nodes(drain, len(toks))) == drain.n_nodes
+    f = labels.sharing_features(drain, visible_len=60)
+    assert f["visible_len"] == 60 and f["fan_out_eth_visible"] <= f["fan_out_eth"]
+    assert f["n_value_calls_visible"] < f["n_value_calls"]
 
 
 def test_serialize_oov_with_small_vocab(drain):
@@ -331,7 +443,8 @@ def test_format_eth():
 def test_era_of():
     assert labels.era_of(0) == "pre_dao"
     assert labels.era_of(1_427_999) == "pre_dao"
-    assert labels.era_of(1_428_000) == "dao_active"
+    assert labels.era_of(1_428_756) == "pre_dao"         # the DAO is created in block 1 428 757
+    assert labels.era_of(1_428_757) == "dao_active"
     assert labels.era_of(1_718_496) == "dao_active"
     assert labels.era_of(1_718_497) == "drain_crisis"
     assert labels.era_of(1_919_999) == "drain_crisis"
@@ -346,9 +459,9 @@ def test_labels_drain(drain):
     assert f["era"] == "drain_crisis"
     assert f["max_depth"] == 28 and f["n_nodes"] == 81
     assert f["n_state_writes"] == 32
-    assert f["fan_out_eth"] == 3 and f["fan_in_eth"] == 4 and f["fan_definition"] == "value_gt_0"
+    assert f["fan_out_eth"] == 3 and f["fan_in_eth"] == 3 and f["fan_definition"] == "net_effective"
     assert f["n_call_targets"] == 9 and f["n_call_sources"] == 6
-    assert f["has_value_transfer"] and abs(f["total_eth"] - 2597.76) < 0.01
+    assert f["has_value_transfer"] and abs(f["total_eth"] - 2597.76) < 0.01 and f["net_eth"] < f["total_eth"]
     assert labels.sharing_label(f) == "many_to_many"
     assert labels.sharing_label(f, structural=True) == "many_to_many"
 
@@ -368,11 +481,121 @@ def test_labels_withdraw_dao(recs_1920):
     ff = labels.sharing_features(by[WITHDRAW_TXS[1]])
     assert ff["fan_out_eth"] == ff["fan_in_eth"] == 0 and ff["n_call_targets"] == 2
     assert labels.sharing_label(ff) == "none"
-    others = [r for r in recs_1920 if r.tx_hash not in WITHDRAW_TXS]
+    others = [r for r in recs_1920 if r.tx_hash not in WITHDRAW_TXS + (WITHDRAW_FEASIBLE,)]
     assert not any(labels.sharing_features(r)["withdraw_dao_involved"] for r in others)
     plain = by["0x6f75b64d9364b71b43cde81a889f95df72e6be004b28477f9083ed0ee471a7f9"]
     fp = labels.sharing_features(plain)
     assert fp["era"] == "fork" and labels.sharing_label(fp) == "single" and not fp["dao_involved"]
+
+
+def _recs(start):
+    return {r.tx_hash: r for r in itr.load_records(start, FIX)}
+
+
+def test_transfer_flags_and_effective_transfers(recs_1920):
+    """Every native transfer row is flagged; reverted (failed subtree / failed tx) and phantom
+    (call_code / delegate_call) rows move no ETH and count nowhere."""
+    by = {r.tx_hash: r for r in recs_1920}
+    for r in recs_1920:
+        assert all({"reverted", "phantom"} <= set(t) for t in r.native_transfers)
+    cc = by[CALL_CODE_TX]                       # call_code row with 0.168 ETH: no balance change (balance_diffs)
+    ph = [t for t in cc.native_transfers if t["phantom"]]
+    assert len(ph) == 1 and ph[0]["value"] > 0
+    eff = itr.effective_transfers(cc)
+    assert len(eff) == 1 and abs(eff[0]["value"] / WEI - 0.1679) < 1e-3
+    f = labels.sharing_features(cc)
+    assert (f["fan_out_eth"], f["fan_in_eth"], f["n_transfers_phantom"]) == (1, 1, 1) and abs(f["total_eth"] - 0.168) < 1e-3
+    t = text.render_text(cc)
+    assert "In total 0.17 ETH moves in 1 transfer from 1 sender to 1 receiver." in t
+    oog = by[OOG_TX]                             # failed transaction: nothing moved
+    assert not oog.success and all(x["reverted"] for x in oog.native_transfers)
+    fo = labels.sharing_features(oog)
+    assert fo["fan_out_eth"] == fo["fan_in_eth"] == 0 and fo["total_eth"] == 0 and labels.sharing_label(fo) == "none"
+    assert "No ETH moves. One attempted transfer is reverted." in text.render_text(oog)
+    # flags are recomputed for records without them (older dicts)
+    d = cc.to_dict()
+    for x in d["native_transfers"]:
+        x.pop("reverted"), x.pop("phantom")
+    assert len(itr.effective_transfers(itr.TxRecord.from_dict(d))) == 1
+
+
+def test_reverted_huge_transfer_does_not_count():
+    """0x5ed540cf… (chunk 1978000): node (26,) carries 2**256 wei with error OutOfFunds.  Label,
+    total and text agree: four receivers of 0.019 ETH, the attempt is reverted."""
+    r = _recs(1978000)[REVERTED_HUGE]
+    node = next(n for n in r.nodes() if n.path == (26,))
+    assert node.error and node.value >= 2 ** 255
+    f = labels.sharing_features(r)
+    assert f["fan_out_eth_gross"] == 4 and f["n_transfers_reverted"] == 1
+    assert abs(f["total_eth"] - 0.019) < 0.001 and f["total_eth"] < 1
+    assert f["fan_out_eth"] <= 4 and f["fan_out_eth"] < 5
+    t = text.render_text(r)
+    assert "to 4 receivers" in t and "One attempted transfer is reverted." in t and "0.019 ETH" in t
+
+
+def test_net_flows_refund_and_routing():
+    """Pass-through contracts and refunds cancel in the net flows."""
+    rows = [dict(from_address="0xa", to_address="0xc", value=10), dict(from_address="0xc", to_address="0xb", value=10)]
+    assert itr.net_flows(rows) == {"0xa": -10, "0xb": 10} and itr.flow_counts(itr.net_flows(rows)) == (1, 1)
+    refund = [dict(from_address="0xa", to_address="0xc", value=7), dict(from_address="0xc", to_address="0xa", value=7)]
+    assert itr.net_flows(refund) == {}
+    split = [dict(from_address="0xa", to_address="0xc", value=9)] + [
+        dict(from_address="0xc", to_address=f"0x{i}", value=3) for i in range(3)]
+    assert itr.flow_counts(itr.net_flows(split)) == (3, 1)
+    by = _recs(1428000)
+    r = by[REFUND_TX]                        # 0.010153 ETH to a contract and straight back to the sender
+    f = labels.sharing_features(r)
+    assert (f["fan_out_eth_gross"], f["fan_in_eth_gross"]) == (2, 2)
+    assert f["fan_out_eth"] == f["fan_in_eth"] == 0 and labels.sharing_label(f) == "none"
+    assert "Net, no address gains or loses ETH." in text.render_text(r)
+    w = by[ONE_WEI_TX]                       # 1 wei + a reverted OutOfFunds attempt: single, not many_to_many
+    fw = labels.sharing_features(w)
+    assert labels.sharing_label(fw) == "single" and fw["n_transfers_reverted"] >= 1
+    assert "1 transfer from 1 sender to 1 receiver" in text.render_text(w)
+
+
+def test_dao_era_list_and_mentions():
+    by = _recs(1428000)
+    c = by[DAO_CREATION]
+    assert c.block_number == 1_428_757 and labels.era_of(c.block_number) == "dao_active"
+    assert labels.sharing_features(c)["dao_involved"]
+    assert c.address_kinds.get(labels.DAO_ADDRESSES["dao"]) == "contract"
+    assert len(labels.DAO_FORK_LIST) == 116 == len(set(labels.DAO_FORK_LIST))
+    assert labels.DAO_ADDRESSES["dao"] in labels.DAO_FORK_LIST and labels.DAO_ADDRESSES["extra_balance"] in labels.DAO_FORK_LIST
+    dark = "0x304a554a310c7e546dfe434669c62820b7d83490"          # the child DAO of the drain
+    assert dark in labels.DAO_INVOLVED
+    child = itr.CallNode(path=(), call_type="call", action_type="call", frm="0x" + "1" * 40, to=dark, value=0,
+                         gas=50000, gas_used=0, selector="0xa9059cbb", args=[], error=None, created=None)
+    rec = itr.TxRecord(tx_hash="0x" + "c" * 64, block_number=1_800_000, tx_index=0, frm=child.frm, to=dark, value=0,
+                       gas_used=21000, success=True, root=child, n_nodes=1, max_depth=0)
+    assert labels.sharing_features(rec)["dao_involved"]
+    # a DAO address only as a call argument: ambiguous, excluded from the DAO probe's negatives
+    arg = "0x" + "0" * 24 + labels.DAO_ADDRESSES["dao"][2:]
+    other = itr.CallNode(path=(), call_type="call", action_type="call", frm="0x" + "1" * 40, to="0x" + "3" * 40,
+                         value=0, gas=50000, gas_used=0, selector="0x095ea7b3", args=[arg], error=None, created=None)
+    rec2 = itr.TxRecord(tx_hash="0x" + "d" * 64, block_number=1_800_000, tx_index=1, frm=other.frm, to=other.to,
+                        value=0, gas_used=21000, success=True, root=other, n_nodes=1, max_depth=0)
+    f2 = labels.sharing_features(rec2)
+    assert not f2["dao_involved"] and f2["dao_mentioned"]
+    _, neg, mt = labels.probe_sets([rec, rec2], None, "dao", n=5, gas_bins=1)
+    assert not neg and mt.attrs["n_excluded"] == 1
+    assert f"A:{dark}" not in labels.mask_tokens([f"A:{dark}"], "dao")
+
+
+def test_address_kinds_in_text(recs_1920):
+    """Contract / account wording from code evidence: the DAO is a contract in every text."""
+    by = {r.tx_hash: r for r in recs_1920}
+    r = by[WITHDRAW_FEASIBLE]
+    assert r.address_kinds[labels.DAO_ADDRESSES["dao"]] == "contract"
+    assert r.address_kinds[r.frm] == "account"
+    plain = by["0x6f75b64d9364b71b43cde81a889f95df72e6be004b28477f9083ed0ee471a7f9"]
+    assert "to account 0x53d2…8a3d" in text.render_text(plain)
+    # a failed call to an address without evidence is neither called account nor contract
+    oog = by[OOG_TX]
+    oog2 = itr.TxRecord.from_dict({**oog.to_dict(), "address_kinds": {}})
+    assert " to address " in text.render_text(oog2)
+    dao_call = itr.TxRecord.from_dict({**oog.to_dict(), "address_kinds": {oog.root.to: "contract"}})
+    assert " to contract " in text.render_text(dao_call)
 
 
 def test_sharing_label_rules():
@@ -397,12 +620,14 @@ def test_probe_sets_matched_on_era(all_recs):
     assert set(df.columns) >= {"fan_out_eth", "fan_in_eth", "fan_out_erc20", "fan_in_erc20", "n_value_calls",
                                "n_state_writes", "n_distinct_slots_written", "dao_involved",
                                "withdraw_dao_involved", "max_depth", "n_nodes", "era", "label"}
-    # economic fan-out in the fixture is at most 3 (the drain), so the probe uses k=2:
-    # positives drain, 0x124532… (drain_crisis), 0x29c093… (post_fork)
-    # gas deciles: in this small pool high fan-out and fan-out 1 share (almost) no decile, so
-    # the default (min_pairs = min(n, 20)) falls back to era-only matching
+    # net fan-out in the fixture is at most 3 (the drain), so the probe uses k=2: positives drain and
+    # 0x124532… (both drain_crisis; the call_code transaction 0x29c093… has one effective transfer);
+    # gas deciles: in this small pool high fan-out and fan-out 1 share no decile, so the default
+    # (min_pairs = min(n, 20)) falls back to era-only matching
     pos, neg, mt = labels.probe_sets(all_recs, df, "fanout", n=10, k=2)
-    assert len(pos) == len(neg) == len(mt) == 3
+    assert len(pos) == len(neg) == len(mt) == 2
+    assert mt.attrs["visible"] is True and (mt["pos_fan_out_eth_visible"] >= 2).all()
+    assert (mt["neg_fan_out_eth_visible"] == 1).all()
     assert all(mt["era"].notna()) and list(mt.columns)[:3] == ["pair", "era", "gas_decile"]
     assert set(mt["matching"]) == {"era_only"} and mt.attrs["matching"] == "era_only"
     assert np.isfinite(mt["gas_smd"]).all() and mt["gas_smd"].nunique() == 1
@@ -410,7 +635,7 @@ def test_probe_sets_matched_on_era(all_recs):
     assert mt["gas_smd"].iloc[0] == pytest.approx(labels.standardized_mean_difference(mt["pos_gas"], mt["neg_gas"]))
     # without the fallback the gas-decile matching is kept (fewer pairs)
     strict = labels.probe_sets(all_recs, df, "fanout", n=10, k=2, min_pairs=0)[2]
-    assert set(strict["matching"]) <= {"era+gas_decile"} and len(strict) < 3
+    assert set(strict["matching"]) <= {"era+gas_decile"} and len(strict) < 2
     pos, neg, mt = labels.probe_sets(all_recs, df, "fanout", n=10, k=2, gas_bins=1)
     assert len(pos) == len(neg) == len(mt) >= 2 and set(mt["matching"]) == {"era_only"}
     for p, q, (_, row) in zip(pos, neg, mt.iterrows()):
@@ -435,6 +660,124 @@ def test_probe_sets_matched_on_era(all_recs):
     stale = df.drop(columns=["n_call_targets", "n_call_sources"]).assign(fan_out_eth_pos=0)
     with pytest.raises(ValueError, match="older serialisation"):
         labels.probe_sets(all_recs, stale, "fanout", n=10)
+
+
+def _synthetic_frame(rows):
+    """labels_df + stand-in records for probe_sets from (era, fan_out_eth, n_tokens[, gas, dao]) tuples."""
+    recs, out = [], []
+    for i, r in enumerate(rows):
+        era, fo, ntok = r[:3]
+        gas = r[3] if len(r) > 3 else 21000 + i
+        dao = r[4] if len(r) > 4 else False
+        h = f"0x{i:064x}"
+        recs.append(SimpleNamespace(tx_hash=h))
+        out.append(dict(tx_hash=h, era=era, fan_out_eth=fo, dao_involved=dao, gas_used=gas, n_tokens=ntok,
+                        n_nodes=max(1, ntok // 20), n_value_calls=fo, n_call_targets=fo))
+    return recs, __import__("pandas").DataFrame(out)
+
+
+def test_probe_sets_length_matching_caliper_and_balance():
+    rng = np.random.default_rng(0)
+    rows = [("post_fork", 3, int(x)) for x in rng.integers(60, 400, 40)]          # positives, longer on average
+    rows += [("post_fork", 1, int(x)) for x in rng.integers(10, 300, 400)]        # negatives
+    rows += [("dao_active", 2, 50), ("dao_active", 1, 52), ("dao_active", 1, 500)]
+    recs, df = _synthetic_frame(rows)
+    pos, neg, mt = labels.probe_sets(recs, df, "fanout", n=100, k=2, match="length", length_ratio=1.25, seed=3)
+    assert len(pos) == len(neg) == len(mt) and len(mt) >= 30
+    assert set(mt["matching"]) == {"era+log_length"} and (mt["gas_decile"] == -1).all()
+    by = df.set_index("tx_hash")
+    for p, q, (_, row) in zip(pos, neg, mt.iterrows()):
+        assert by.at[p.tx_hash, "era"] == by.at[q.tx_hash, "era"] == row["era"]
+        assert by.at[p.tx_hash, "fan_out_eth"] >= 2 and by.at[q.tx_hash, "fan_out_eth"] == 1
+        assert abs(np.log(row["pos_n_tokens"] / row["neg_n_tokens"])) <= np.log(1.25) + 1e-9
+    assert len({r.tx_hash for r in pos}) == len(pos) and len({r.tx_hash for r in neg}) == len(neg)
+    # the dao_active pair is the nearest admissible length (50 -> 52, not 500)
+    da = mt[mt["era"] == "dao_active"]
+    assert list(zip(da["pos_n_tokens"], da["neg_n_tokens"])) == [(50, 52)]
+    # balance: matched on log length, so the SMD is small although the pools differ a lot
+    pool_smd = labels.standardized_mean_difference(np.log(df[df.fan_out_eth >= 2].n_tokens),
+                                                   np.log(df[df.fan_out_eth == 1].n_tokens))
+    assert pool_smd > 0.5 and abs(mt.attrs["length_smd"]) < 0.1 and mt["length_smd"].nunique() == 1
+    assert mt.attrs["length_ratio_max"] <= 1.25 + 1e-9
+    assert np.isfinite(mt.attrs["gas_smd"]) and np.isfinite(mt.attrs["log_gas_smd"])
+    bal = mt.attrs["balance"]
+    assert {"n_tokens", "gas_used", "n_nodes", "n_value_calls"} <= set(bal)
+    assert bal["n_tokens"]["log_smd"] == pytest.approx(mt.attrs["length_smd"])
+    assert mt.attrs["pool_pos"] == 41 and mt.attrs["pool_neg"] == 402
+    assert mt.attrs["n_matched_total"] == len(mt) + 0 and mt.attrs["n_pos_unmatched"] == 41 - len(mt)
+    again = labels.probe_sets(recs, df, "fanout", n=100, k=2, match="length", length_ratio=1.25, seed=3)[2]
+    assert again.equals(mt)
+    # n caps the number of pairs (random subset of the matched pairs)
+    assert len(labels.probe_sets(recs, df, "fanout", n=5, k=2, match="length")[0]) == 5
+    with pytest.raises(ValueError, match="match must be"):
+        labels.probe_sets(recs, df, "fanout", n=5, match="nope")
+
+
+def test_probe_sets_length_matching_hardest_first_and_no_fallback():
+    # positive A (100 tokens) admits only the 110-token negative; positive B (115) admits 110 and 130.
+    # Nearest-first in random order could give B the 110 and leave A unmatched; hardest-first matches both.
+    rows = [("post_fork", 5, 100), ("post_fork", 5, 115), ("post_fork", 1, 110), ("post_fork", 1, 130)]
+    recs, df = _synthetic_frame(rows)
+    for seed in range(5):
+        _, _, mt = labels.probe_sets(recs, df, "fanout", n=10, k=5, match="length", seed=seed)
+        assert sorted(zip(mt["pos_n_tokens"], mt["neg_n_tokens"])) == [(100, 110), (115, 130)]
+    # no admissible negative -> unmatched, no silent fallback to era-only matching
+    recs, df = _synthetic_frame([("post_fork", 5, 1000), ("post_fork", 1, 20), ("post_fork", 1, 30)])
+    pos, neg, mt = labels.probe_sets(recs, df, "fanout", n=10, k=5, match="length")
+    assert len(pos) == 0 and mt.attrs["n_pos_unmatched"] == 1 and mt.attrs["n_pairs"] == 0
+    # matching on the visible length (min(n, cap)): 1000 and 600 tokens both look like 512
+    recs, df = _synthetic_frame([("post_fork", 5, 1000), ("post_fork", 1, 600), ("post_fork", 1, 20)])
+    _, _, mt = labels.probe_sets(recs, df, "fanout", n=10, k=5, match="length", length_cap=512)
+    assert list(zip(mt["pos_n_tokens"], mt["neg_n_tokens"])) == [(1000, 600)] and mt.attrs["length_cap"] == 512
+    # length matching on stand-in records needs the token counts
+    with pytest.raises(ValueError, match="n_tokens"):
+        labels.probe_sets(recs, df.drop(columns=["n_tokens"]), "fanout", n=10, k=5, match="length")
+
+
+def test_probe_sets_length_matching_on_records(all_recs):
+    # without an n_tokens column the records are serialised; the fixture's fan-out >= 2 transactions are long,
+    # so a generous ratio is needed to find partners at all
+    pos, neg, mt = labels.probe_sets(all_recs, None, "fanout", n=10, k=2, match="length", length_ratio=30.0)
+    assert len(pos) >= 1
+    for p, q, (_, row) in zip(pos, neg, mt.iterrows()):
+        assert row["pos_n_tokens"] == len(itr.serialize(p)) and row["neg_n_tokens"] == len(itr.serialize(q))
+        assert labels.era_of(p.block_number) == labels.era_of(q.block_number)
+        assert abs(np.log(row["pos_n_tokens"] / row["neg_n_tokens"])) <= np.log(30.0) + 1e-9
+    # the gas matching of the spec is unchanged (no token counts computed for records)
+    gas = labels.probe_sets(all_recs, None, "fanout", n=10, k=2)[2]
+    assert "pos_n_tokens" not in gas.columns and gas.attrs["match"] == "gas"
+
+
+def test_mask_tokens(drain, all_recs):
+    toks = itr.serialize(drain)
+    dao_toks = {f"A:{a}" for a in labels.DAO_INVOLVED}           # EIP-779 list + creator + WithdrawDAO
+    assert any(t == "A:0x304a554a310c7e546dfe434669c62820b7d83490" for t in toks)   # the darkDAO
+    n_dao = sum(t in dao_toks for t in toks)
+    assert n_dao > 0
+    m = labels.mask_tokens(toks, "dao")
+    assert len(m) == len(toks) and not any(t in dao_toks for t in m)
+    assert m.count("[A_OOV]") == toks.count("[A_OOV]") + n_dao
+    assert [a for a, b in zip(toks, m) if a != b] == [t for t in toks if t in dao_toks]
+    # the same on vocabulary-mapped tokens (the DAO addresses are always in the vocabulary)
+    vocab = SimpleNamespace(tokens=itr.fixed_tokens(), top_addresses=sorted(labels.DAO_INVOLVED),
+                            top_selectors=[], top_topics=[])
+    mapped = itr.serialize(drain, vocab)
+    assert labels.mask_tokens(mapped, "dao").count("[A_OOV]") == mapped.count("[A_OOV]") + n_dao
+    # WithdrawDAO transactions lose their identity too
+    for r in all_recs:
+        if labels.sharing_features(r)["withdraw_dao_involved"]:
+            assert f"A:{labels.DAO_ADDRESSES['withdraw_dao']}" not in labels.mask_tokens(itr.serialize(r), "dao")
+    allm = labels.mask_tokens(toks + ["A:none"], "all_addresses")
+    assert not any(t.startswith("A:0x") for t in allm) and allm[-1] == "A:none"
+    assert allm.count("[A_OOV]") == sum(t.startswith("A:0x") for t in toks)
+    assert labels.mask_tokens(toks, "none") == toks and labels.mask_tokens(toks, None) == toks
+    custom = labels.mask_tokens(toks, [drain.root.frm.upper().replace("0X", "0x")])
+    assert f"A:{drain.root.frm}" not in custom and custom.count("[A_OOV]") > toks.count("[A_OOV]")
+    with pytest.raises(ValueError, match="mask must be"):
+        labels.mask_tokens(toks, "everything")
+    assert labels.surface_features(m)["n_a_oov"] == m.count("[A_OOV]")
+    assert labels.surface_features(toks)["n_a_oov"] == 0
+    assert "n_a_oov" in labels.SURFACE_FEATURES_OOV and "n_a_oov" not in labels.SURFACE_FEATURES
 
 
 def test_standardized_mean_difference():
@@ -497,7 +840,7 @@ def test_download_chunks_resume_and_errors(local_xatu, tmp_path):
     assert not os.path.exists(xatu.chunk_path(cache, "traces", 1921000))
     assert not [f for f in os.listdir(cache) if ".tmp." in f]
     rows = xatu.read_chunk("traces", 1920000, cache)
-    assert len(rows) == 29
+    assert len(rows) == 33
     again = xatu.download_chunks(["traces"], 1920000, 1921000, cache_dir=cache, base_url=local_xatu)
     assert bool(again.loc[0, "ok"]) and bool(again.loc[0, "cached"])
     # a truncated (non-Parquet) cache file is replaced
@@ -505,7 +848,7 @@ def test_download_chunks_resume_and_errors(local_xatu, tmp_path):
         fh.write(b"PAR1garbage")
     fixed = xatu.download_chunks("traces", 1920000, 1921000, cache_dir=cache, base_url=local_xatu)
     assert bool(fixed.loc[0, "ok"]) and not bool(fixed.loc[0, "cached"])
-    assert len(xatu.read_chunk("traces", 1920000, cache)) == 29
+    assert len(xatu.read_chunk("traces", 1920000, cache)) == 33
     assert xatu.cached_starts(cache) == [1920000]
     every = xatu.download_chunks("traces", 1918000, 1922000, cache_dir=cache, base_url=local_xatu, every=2,
                                  retries=0)

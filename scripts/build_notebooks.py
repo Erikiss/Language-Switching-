@@ -39,6 +39,15 @@ notebooks add a parameter cell for the stage's user-supplied inputs (atlas extra
 TTT corpus / checkpoints, transplant source), a substage report read from the manifest
 (``substages``, ``prereg``) and a header paragraph naming the pre-registered contrasts
 and the tables that carry them.
+
+Notebook 12 (``12_trace_source``) is the A100 pipeline of the stage-L trace source
+(docs/TRACE_SOURCE.md, ``lsne.chain``): download of all 2016 Xatu chunks into Drive,
+serialisation, hash-split vocabulary with held-out OOV, ``blockgpt`` training in bf16
+with checkpoints on Drive, evaluation against unigram / bigram / untrained baselines,
+the controlled probes, the length-residualised alignment and stage L with
+``trace:<model_dir>``.  It shares the setup, Drive, runner and substage cells; its
+pipeline steps call ``python -m lsne.chain.cli`` in subprocesses (logs on Drive, step
+markers for resuming) and ``SMOKE = True`` runs every cell on the Xatu test fixture.
 """
 from __future__ import annotations
 
@@ -72,6 +81,7 @@ NOTEBOOKS: dict[str, tuple[str, str]] = {
     "09_rdx_sharing": ("J", "RDX, Pile-Schwierigkeit und Sharing"),
     "10_ttt_injection": ("K", "Test-Time-Training als strukturelle Injektion"),
     "11_transplant": ("L", "Cross-Modell-Transplantation"),
+    "12_trace_source": ("L", "Spurenmodell 2016 als Quelle (A100)"),
 }
 
 
@@ -2845,6 +2855,1328 @@ def nb_11() -> list[tuple[str, str]]:
     ]
 
 
+# ======================================================================================
+# 12 trace source model on all of 2016 (A100; stage L source adapter)
+# ======================================================================================
+#: planning values per step in hours (A100 session, docs/TRACE_SOURCE.md section 8); the
+#: markdown cost table of notebook 12 and its "Ist gegen Plan" table use the same numbers
+TRACE_PLAN_HOURS = {
+    "download": (0.5, 1.2), "serialize": (0.25, 0.7), "split": (0.08, 0.4), "vocab": (0.17, 0.5),
+    "oov_heldout": (0.05, 0.2), "train": (0.8, 1.5), "evaluate": (0.5, 0.75), "probes": (0.5, 1.0),
+    "pair": (0.03, 0.15), "align": (0.1, 0.35), "stage_L": (0.33, 1.0),
+}
+
+
+def _trace_header() -> tuple[str, str]:
+    return md(
+        """
+        # LS-NEQ 12_trace_source — Spurenmodell 2016 als Quelle für Stufe L (A100)
+
+        **Dossier-Stufe L, Quelladapter** (`lsne.chain`; Vertrag `docs/TRACE_SOURCE_SPEC.md`, Ergebnisse des
+        ersten CPU-Laufs `docs/TRACE_SOURCE.md`, Hintergrund `docs/DESIGN.md` §4.9 und
+        `docs/BLOCKGPT_FEASIBILITY.md`). Dieses Notebook wird von `scripts/build_notebooks.py` erzeugt;
+        Änderungen bitte dort vornehmen und neu generieren (`python scripts/build_notebooks.py`).
+
+        **Zweck.** Der volle Lauf, den der CPU-Durchlauf vom 26.10.2026 nur als Rohrleitung validiert hat:
+        ein BlockGPT-artiges Causal-LM (`blockgpt`: 8 Layer, d = 512, 8 Heads, Kontext 512; GPT-NeoX mit
+        Pythia-Konventionen) auf **allen** Ethereum-Ausführungsspuren des Jahres 2016 (Blöcke 778 000–2 912 999,
+        DAO-Zeit mit Drain und Fork), trainiert auf einer A100 in bf16; danach die **kontrollierten Sonden** auf
+        ein Merkmal „Teilen“ (längengematcht, Identitätsmaskierung, Kriterium trainiert − untrainiert), das
+        **Alignment mit Pythia mit Längenresidualisierung** und **Stufe L** mit dem Spurenmodell als Quelle
+        (`--transplant-source trace:<modell>`) gegen `pythia-160m`.
+
+        **Eingaben.** Öffentliche Xatu-Parquet-Dateien von ethPandaOps, **Lizenz CC BY 4.0, Namensnennung
+        „Data: ethPandaOps Xatu (https://ethpandaops.io), CC BY 4.0“** (abgeleitete Shards, Vokabulare und
+        Modelle tragen dieselbe Namensnennung); die Stimulusbank des Repositorys (Stufe L); optional der
+        Stand-in-Lauf von Notebook 11 (Voraussetzung nach Präregistrierung 18).
+
+        **Ausgaben** (auf Drive unter `MyDrive/LSNE/`, `trace_2016` = `TRACE_ROOT`): `cache/xatu/` (Rohdaten),
+        `trace_2016/itr/` (ITR-Shards, ein gzip-JSONL pro Chunk), `itr_train/` (Trainingsteil des Hash-Splits),
+        `vocab/` (Vokabular, Tokenizer, `oov.json`, `oov_heldout.json`), `trace_lm_blockgpt/` (Modell,
+        Checkpoints, `train_log.csv`, `manifest.json`), `blocks/` (gepackte Blöcke der Evaluation), `eval.json`,
+        `probes/<sonde>/` (`criterion.csv`, `probe_report.json`, `match_table.csv`, `sharing_directions.pt`),
+        `pairs_<n>.jsonl`, `align/` (`align_controls.csv`, `align_summary.json`), `frozen_feature.json`,
+        `logs/` (Ausgabe jedes CLI-Aufrufs), `steps/` (Marker erledigter Schritte); Stufe L unter
+        `runs_trace/L/<modell>@<revision>/` (getrennt vom Stand-in-Lauf in `runs/L/…`); Abbildungen unter
+        `figures/12_trace_source/`; am Ende `summary_12_trace_source_*.json` in `OUT_ROOT`.
+
+        **Ablauf.** Setup → Drive → Konfiguration → Hilfsfunktionen → Umgebung → 1 Download (resumierbar) →
+        2 Serialisierung (parallel) → 3 Hash-Split, Vokabular, Hold-out-OOV → 4 Durchsatz und Training
+        `blockgpt` bf16 (Checkpoints auf Drive, Fortsetzen) → 5 Evaluation gegen Unigramm, Bigramm und die
+        untrainierte Kontrolle → 6 kontrollierte Sonden → 7 Paare und Alignment → 8 Stufe L → Zusammenfassung
+        mit Ist-gegen-Plan-Tabelle.
+
+        **Präregistrierung.** Kontrast 18 (`docs/PREREGISTRATION.md`): Ein Spurenmodell wird erst als Quelle
+        gewertet, wenn die Stand-in-Validierung bestanden ist (Notebook 11, `verdict.csv`: `validated` und
+        `counts_for_prereg` für eine Sprachquelle; Abschnitt 8a und Stufe L selbst prüfen das), und sein Merkmal
+        „Teilen“ wird **vorab im Quellmodell definiert und eingefroren**. Die Konfigurationszelle schreibt es vor
+        der ersten Sonde nach `frozen_feature.json`: Netto-fan-out ≥ 5 (Adressen mit Netto-Zufluss über die
+        wirksamen ETH-Transfers: ohne zurückgerollte und ohne `call_code`/`delegate_call`-Kontextwerte;
+        durchgereichte ETH und Rückzahlungen heben sich auf; auch im sichtbaren 512-Token-Fenster) gegen
+        fan-out = 1, 1:1 innerhalb der Ära auf die ITR-Länge gematcht (Faktor 1,25), Difference-of-Means der
+        gemittelten Residuen am letzten Snapshot. Die Richtung **zählt** nur, wenn das 95-%-Bootstrap-KI von Δ = AUC_trainiert − AUC_untrainiert
+        über 0 liegt und die trainierte AUC über dem 95-%-Quantil der Permutations-Null (`criterion.csv` →
+        `counts`; Kontrast `trace_probe` in Stufe L). Stufe L behauptet einen Effekt
+        (`trace_verdict.sharing_effect_claimed`) nur, wenn zusätzlich das residualisierte Alignment
+        (Hold-out-R² > 0, Abstand zur Permutations-Null ≥ 0,2) und ein Effekt auf B oder T jenseits der
+        Zufalls- **und** der Permuted-Alignment-Kontrolle vorliegen. Eine Änderung des Merkmals nach dem Einfrieren wird erkannt und
+        macht den Lauf explorativ.
+
+        Hinweise: Jede Zelle ist gegen Fehler abgesichert (Traceback, dann weiter). Alle Schritte sind
+        resumierbar: der Download überspringt vorhandene Dateien, die Serialisierung vorhandene Shards, das
+        Training setzt beim neuesten Checkpoint auf Drive fort, und mit `REUSE = True` werden erledigte Schritte
+        (Marker unter `trace_2016/steps/`) und eine fertige Stufe L übersprungen. Ohne GPU laufen nur die
+        Schritte 1–3 (dafür genügt eine CPU-Laufzeit). `SMOKE = True` rechnet alles in wenigen Minuten auf der
+        CPU mit der Test-Fixture (2 echte Chunks, 15 Transaktionen), einem `tiny`-Modell und `pythia-14m`
+        (Rauchtest, keine wissenschaftliche Aussage).
+        """
+    )
+
+
+def _trace_expectations() -> tuple[str, str]:
+    return md(
+        """
+        ## Realistische Erwartungen und Kosten
+
+        > **Planungswerte, keine Messungen (EXTRAPOLATION).** Die A100-Zeiten sind aus `docs/TRACE_SOURCE.md` §8
+        > hochgerechnet: Datenmengen aus 22 Profil-Chunks (jeder 100. Chunk 2016, ±30 %), Rechenzeit aus FLOPs pro
+        > Token und einer *angenommenen* Auslastung (MFU) von 15–30 %; Unsicherheit mindestens Faktor 2.
+        > Abschnitt 4a misst den echten bf16-Durchsatz, die Zusammenfassung stellt Ist und Plan gegenüber.
+
+        **Daten 2016 (hochgerechnet).** 2 135 Chunks × 6 Tabellen = 12 810 Parquet-Dateien, **≈ 5,2 GB**;
+        ≈ 13,6 M Transaktionen, ≈ 1,2 Mrd. rohe ITR-Tokens, **≈ 338 M Trainings-Tokens** (je Transaktion auf 512
+        gekappt, plus `[EOS]`). Zwei Ausreißer prägen die Rohmenge (DoS-Angriffe Sept./Okt. 2016, Chunk
+        2 378 000; Zustandsbereinigung nach Spurious Dragon, Chunk 2 678 000); das Kappen begrenzt sie.
+
+        **Modell.** `blockgpt` mit 50 000 Adressen: V ≈ 72 000, ≈ 99 M Parameter (25 M im Transformer, je ≈ 37 M
+        Ein-/Ausgabe-Embedding), ≈ 385 MFLOP pro Trainings-Token; A100 bf16 (312 TFLOP/s Spitze) bei 15–30 % MFU
+        ≈ 120 000–240 000 Tokens/s, also **0,4–0,75 h** für 20 000 × 32 × 512 = 328 M Tokens (≈ 1 Epoche).
+        Mit 100 000 Adressen: V ≈ 122 000, 150 M Parameter, 0,5–1,05 h.
+
+        | Schritt | Umfang 2016 | Plan | Laufzeittyp | Grundlage (`docs/TRACE_SOURCE.md`) |
+        |---|---|---|---|---|
+        | 1 Download | 12 810 Dateien, ≈ 5,2 GB | 30–70 min | CPU genügt | 1,3–1,8 MB/s mit 4 Threads gemessen; hier 16 Threads, Drive-Schreibrate begrenzt |
+        | 2 Serialisierung | ≈ 13,6 M Tx → ≈ 3,2 GB Shards | 15–40 min | CPU, alle Kerne | 3,6–9,1 CPU-s pro Chunk → 2,1–5,4 CPU-h |
+        | 3a Hash-Split | 13,6 M Tx lesen, Trainingsteil schreiben | 5–25 min | CPU, ein Kern | 7 s für 0,2 M Tx |
+        | 3b Vokabular | 13,5 M Trainings-Tx, zwei Durchgänge | 10–30 min | CPU, ein Kern | 8 s für 0,2 M Tx |
+        | 3c Hold-out-OOV | Validierungsteil (1 %) | 3–12 min | CPU | neu (CPU-Lauf: 154 s für 22 550 Tx, alle Shards) |
+        | 4 Training `blockgpt` bf16 | 328 M Tokens + ≈ 25 min Packen je Start/Fortsetzung | 50–90 min | **A100** | §8: 0,4–0,75 h + 10–20 % Validierung/Checkpoints |
+        | 5 Evaluation | 2. Packdurchgang, Bigramm über 338 M Tokens, 2 Modelle über ≈ 6 600 Val-Blöcke | 30–45 min | A100, ≈ 10–15 GB RAM | §4/§5 |
+        | 6 Sonden (5 Konfigurationen) | Sondenkorpus = jeder 4. Shard + Drain/Fork (≈ 3,4 M Tx) | 30–60 min | A100 | 12 s Merkmale für 0,2 M Tx je Aufruf |
+        | 7 Paare + Alignment | 2 000 Paare, `pythia-160m` | 10–30 min | A100 | 121 s für 2 000 Paare mit `pythia-14m` auf CPU |
+        | 8 Stufe L | Sonde, Alignment, Transplantation A/B/C, alle Familien | 20–60 min | A100 | `docs/RUNBOOK_COLAB.md` §6 + Index des Sondenkorpus |
+        | **Summe** | | **≈ 3,3–7,8 h**, davon ≈ 0,4–0,75 h reines Training | | |
+
+        **Kosten** (Colab; Preise vor dem Lauf in Colab prüfen): eine A100-Laufzeit kostet ≈ 12 Recheneinheiten
+        (CU) pro Stunde, eine CPU-Laufzeit einen Bruchteil davon; 100 CU ≈ 10 US-$ (Pay-as-you-go). Empfohlen:
+        **Sitzung 1 auf einer CPU-Laufzeit mit hohem RAM** für die Schritte 1–3 (≈ 1–3 h je nach Kernzahl,
+        wenige CU), **Sitzung 2 auf der A100** für die Schritte 4–8 (≈ 2,3–4,8 h, ≈ 27–57 CU ≈ 3–6 US-$). Alles auf
+        einer A100: ≈ 3,3–7,8 h, ≈ 40–95 CU. **Drive:** ≈ 5,2 GB Rohdaten + ≈ 3,2 GB Shards + ≈ 1,3 GB
+        Trainingsteil + ≈ 2,4 GB Checkpoints (2 × 1,2 GB) + ≈ 0,4 GB Modell + ≈ 1,4 GB Blockcache ≈ **14 GB** (Google One mit
+        ≥ 100 GB empfohlen; das Gratis-Kontingent von 15 GB reicht nicht neben anderen Läufen). **RAM:** die
+        Bigramm-Baseline über alle Trainingsblöcke braucht ≈ 10–15 GB, jede Sonde ≈ 5–8 GB für die Merkmale
+        ihres Korpus (A100-Laufzeiten haben ≈ 80 GB; sonst `BASELINE_MAX_TRAIN_BLOCKS`, `PROBE_SHARD_EVERY`).
+
+        **Was realistisch herauskommt** (aus dem CPU-Lauf, `docs/TRACE_SOURCE.md` §5–§7):
+
+        1. **Sprachmodell.** Der Validierungsverlust wird klar unter Unigramm und Bigramm fallen (CPU-Lauf nach
+           0,16 Epochen `small`: 1,12 gegen 1,49 nats Bigramm und 4,42 Unigramm). Gelernt wird vor allem die
+           Grammatik der Spuren (Struktur, Tiefe, Call-Typ, Gas, Selektor nach Adresse); Adressen, Werte und
+           `[A_OOV]` bleiben die schweren Klassen (≈ 3–4 nats). 50 000 statt 20 000 Adressen senken die
+           Hold-out-OOV-Rate der Adressen von ≈ 12 % auf ≈ 7 % (im Sample gemessen; über ganz 2016 eher höher,
+           weil später neue Verträge hinzukommen).
+        2. **Sonden — der wahrscheinlichste Ausgang ist negativ.** Im CPU-Lauf trennte das *untrainierte* Modell
+           jede Sonde genauso gut wie das trainierte: ökonomischer fan-out ist direkt aus der Eingabe ablesbar
+           (Zahl der `V:`-Tokens ≠ `V:N0`, Oberflächen-AUC 0,98–1,00), die DAO-Sonde ist eine
+           Adress-Identitätssonde, und Maskieren nur der DAO-Adressen erzeugt eine neue `[A_OOV]`-Abkürzung. Nach
+           Längen-Matching und Maskierung war Δ = trainiert − untrainiert nirgends > 0, in tieferen Layern sogar
+           signifikant negativ. Mehr Daten liefern bei k ≥ 5 mehr längengematchte Paare (CPU-Lauf: 11) und engere
+           KIs, aber keinen Grund, ein positives Δ zu erwarten. Ein KI-gestütztes Δ > 0 am eingefrorenen Layer
+           wäre ein echter Befund.
+        3. **Alignment.** Länge erklärt 0,47–0,60 der Varianz der gemittelten Pythia-Zustände; nach
+           Residualisierung blieb ein kleiner, signifikanter Gewinn des trainierten gegenüber dem untrainierten
+           Modell (+0,06 [+0,03; +0,10] bei 2 000 Paaren, ≈ 0,03 der Gesamtvarianz). Mit `blockgpt` und
+           `pythia-160m` ist eine ähnliche Größenordnung plausibel; ein Merkmal „Teilen“ ist damit nicht gezeigt.
+        4. **Stufe L.** `sharing_effect_claimed` ist nur bei bestandenem Sondenkriterium möglich; nach 2. ist
+           **„no claim“ der erwartete Ausgang**. Die Erwartung aus DESIGN §4.9 („starkes Signal, Transfer sollte
+           gelingen“) stützt der CPU-Lauf nicht; dieser Lauf prüft sie mit dem vollen Jahr und dem vollen Modell —
+           ein negativer Ausgang ist ein Ergebnis, kein Fehler.
+        5. **Bleibende Grenzen** (`docs/TRACE_SOURCE.md` §10): keine Baum-Positionsembeddings, keine
+           ABI-Dekodierung, Kappen auf 512 Tokens pro Transaktion (der Drain hat 1 409), Packing über
+           Transaktionsgrenzen ohne Maske, keine Storage-Reads (Tabelle `storage_reads` optional in `TABLES`),
+           eine Split-Saat, eine Trainings-Saat.
+        """
+    )
+
+
+def _trace_config_cell() -> tuple[str, str]:
+    return code(
+        r"""
+        # --- Konfiguration (hier anpassen) ------------------------------------------------------
+        NOTEBOOK = "12_trace_source"
+        STAGE = "L"                        # the trace LM is a source adapter of stage L
+        SMOKE = False                      # True: CPU-Rauchtest auf der Test-Fixture (2 Chunks, 15 Tx), tiny-Modell, pythia-14m
+        REUSE = True                       # erledigte Schritte (Marker unter <TRACE_ROOT>/steps) und Stufe L (manifest ok) überspringen
+        FORCE_STEPS = set()                # z. B. {"vocab", "evaluate"}: trotz Marker neu rechnen (abhängige Schritte ebenfalls angeben)
+        GPU_STEPS_ON_CPU = False           # True: Training, Evaluation, Sonden, Alignment, Stufe L auch ohne GPU (nur für kleine Läufe)
+        SEED = 0
+
+        # 1-2 Daten: ganz 2016 (erster Block 778 483 am 01.01.2016, letzter 2 912 406 am 31.12.2016)
+        BLOCK_FROM, BLOCK_TO = 778_000, 2_913_000   # [von, bis): 2 135 Chunks à 1 000 Blöcke
+        EVERY = 1                          # jeder k-te Chunk (1 = alle); DOWNLOAD_RANGE muss ein Vielfaches von EVERY * 1000 sein
+        TABLES = "traces,transaction,native_transfers,erc20_transfers,logs,storage_diffs"   # + ",storage_reads" für [STATE] [R] (größer, nicht geschätzt)
+        DOWNLOAD_RANGE = 100_000           # Download in Blockbereichen (Fortschritt und Log je Bereich)
+        DOWNLOAD_WORKERS = 16
+        SERIALIZE_WORKERS = max(1, os.cpu_count() or 1)
+
+        # 3 Hash-Split und Vokabular
+        VAL_FRAC = 0.01                    # Tx mit int(hash[-8:], 16) / 2**32 < VAL_FRAC = Validierung (lsne.chain.cli._is_val), überall gleich
+        N_ADDRESSES = 50_000               # Adress-Budget (CPU-Lauf, Hold-out-OOV: 20 000 -> 11,9 %, 50 000 -> 7,2 %, alle -> 4,9 %)
+        N_SELECTORS, N_TOPICS = 5_000, 2_000
+        OOV_BUDGETS = (1_000, 5_000, 20_000, 50_000)   # Hold-out-OOV der Adressen für kleinere Budgets (Präfixe der Rangliste)
+
+        # 4 Training (blockgpt: 8 Layer, d = 512, 8 Heads, MLP 2 048, Kontext 512)
+        SIZE = "blockgpt"
+        STEPS, BATCH, BLOCK_SIZE = 20_000, 32, 512   # 328 M Tokens ≈ 1 Epoche 2016 (≈ 338 M Trainings-Tokens, Extrapolation)
+        GRAD_ACCUM = 1                     # bei "CUDA out of memory": BATCH = 16, GRAD_ACCUM = 2 (gleiche Tokens pro Schritt)
+        LR, WARMUP = 3e-4, 200
+        EVAL_EVERY, EVAL_BLOCKS = 500, 512
+        SAVE_EVERY, KEEP_CHECKPOINTS = 2_000, 2      # ein Checkpoint (Gewichte + AdamW) ≈ 1,2 GB auf Drive
+        BF16 = "on"                        # "on" (A100) | "auto" (bf16, wenn die GPU es kann) | "off"
+        TRAIN_DEVICE = "auto"
+        A100_PEAK_FLOPS = 312e12           # bf16 dense (NVIDIA-Datenblatt): Bezug der Auslastung (MFU)
+
+        # 5 Evaluation
+        BASELINE_MAX_TRAIN_BLOCKS = None   # None = alle Trainingsblöcke für Uni-/Bigramm (≈ 10-15 GB RAM); sonst z. B. 200_000
+
+        # 6 Sonden: Sondenkorpus = jeder PROBE_SHARD_EVERY-te Shard + Drain-/Fork-Chunks (jede Sonde liest alle Merkmale ihres Korpus)
+        PROBE_SHARD_EVERY = 4              # 1 = alle 2 135 Shards (mehr Paare, ≈ 15 GB RAM und ≈ 25 min je Sonde)
+        PROBE_ALWAYS_CHUNKS = (1_718_000, 1_719_000, 1_920_000, 1_921_000)
+        N_PROBE = 2_000                    # höchstens so viele gematchte Paare je Sonde
+        LENGTH_RATIO = 1.25                # Längen-Matching: |log n_pos - log n_neg| <= log 1,25
+        N_BOOT, N_PERM, N_RANDOM = 1_000, 200, 200
+        PROBE_CONFIGS = [
+            dict(name="fanout_len_k5", kind="fanout", k=5, mask="none"),          # = eingefrorenes Merkmal (TRACE_K)
+            dict(name="fanout_len_k3", kind="fanout", k=3, mask="none"),
+            dict(name="fanout_len_k2", kind="fanout", k=2, mask="none"),
+            dict(name="dao_len_mask_all", kind="dao", k=5, mask="all_addresses"),  # DAO ohne Adress-Abkürzung (Hauptvariante)
+            dict(name="dao_len_mask_dao", kind="dao", k=5, mask="dao"),            # Sensitivität: nur DAO-Adressen maskiert
+        ]
+
+        # 7 Paare und Alignment
+        N_PAIRS = 2_000
+        ALIGN_ALPHAS = "1,100"
+
+        # 8 Stufe L: Zielmodell und eingefrorenes Merkmal (Präregistrierung 18; vor der ersten Sonde festgelegt)
+        MODEL = "EleutherAI/pythia-160m"
+        REVISION = "step98000"
+        DTYPE = "float32"
+        DEVICE = "auto"
+        FAMILIES = None                    # None = alle Familien der Stimulusbank
+        USE_SAE = False                    # True nur mit REVISION = "step143000" (publizierter SAE) -> Sharing-Index in trace_sharing
+        TRACE_K = 5                        # fan-out >= k gegen fan-out = 1, längengematcht innerhalb der Ära
+        TRACE_LAYER = None                 # Residual-Snapshot der Richtung und aller Alignments (None = letzter)
+        TRACE_DIRECTION = None             # None: v_src aus der eigenen gematchten Sonde der Stufe; sonst Pfad zu sharing_directions.pt
+        N_PROBE_STAGE = 500                # gematchte Paare der Sonde in Stufe L
+        N_PAIRS_STAGE = 2_000              # Alignment-Paare in Stufe L (None = 4 x Limits.l_n_texts)
+
+        # ---------------------------------------------------------------------------------------
+        import datetime
+        import json
+
+        import torch
+
+        from lsne.config import ModelSpec, RunConfig
+        from lsne.experiments import common as C
+
+        if SMOKE:
+            CACHE_DIR = os.path.join(REPO_DIR, "tests", "fixtures", "xatu")   # 2 echte Chunks (CC BY 4.0), kein Download
+            BLOCK_FROM, BLOCK_TO, EVERY = 1_718_000, 1_921_000, 1
+            VAL_FRAC, N_ADDRESSES, OOV_BUDGETS = 0.2, 50, (10, 20, 50)
+            SIZE, STEPS, BATCH, BLOCK_SIZE, LR, WARMUP = "tiny", 8, 8, 32, 3e-3, 2
+            EVAL_EVERY, EVAL_BLOCKS, SAVE_EVERY = 4, 64, 4
+            BF16, TRAIN_DEVICE, SERIALIZE_WORKERS = "auto", "cpu", 1
+            PROBE_SHARD_EVERY, N_PROBE, N_PROBE_STAGE, N_PAIRS_STAGE = 1, 50, 50, None
+            N_BOOT, N_PERM, N_RANDOM, ALIGN_ALPHAS = 50, 20, 20, "1"
+            MODEL, REVISION, DTYPE, DEVICE = "EleutherAI/pythia-14m", "step98000", "float32", "cpu"
+            FAMILIES = FAMILIES or ["DEV01"]
+        else:
+            CACHE_DIR = os.path.join(OUT_ROOT, "cache", "xatu")
+        ON_DRIVE = OUT_ROOT.startswith("/content/drive")
+        TRACE_ROOT = os.path.join(OUT_ROOT, "trace_smoke" if SMOKE else "trace_2016")
+        ITR = os.path.join(TRACE_ROOT, "itr")
+        ITR_TRAIN = os.path.join(TRACE_ROOT, "itr_train")
+        VOCAB_DIR = os.path.join(TRACE_ROOT, "vocab")
+        MODEL_DIR = os.path.join(TRACE_ROOT, f"trace_lm_{SIZE}")
+        BLOCKS_DIR = os.path.join(TRACE_ROOT, "blocks")
+        EVAL_JSON = os.path.join(TRACE_ROOT, "eval.json")
+        OOV_JSON = os.path.join(VOCAB_DIR, "oov_heldout.json")
+        PROBE_ROOT = os.path.join(TRACE_ROOT, "probes")
+        PAIRS_FILE = os.path.join(TRACE_ROOT, f"pairs_{N_PAIRS}.jsonl")
+        ALIGN_DIR = os.path.join(TRACE_ROOT, "align")
+        LOG_DIR = os.path.join(TRACE_ROOT, "logs")
+        STEP_DIR = os.path.join(TRACE_ROOT, "steps")
+        # Drive cannot hold symlinks: the probe corpus (links to every k-th shard) lives on the local disk
+        PROBE_ITR = ITR if PROBE_SHARD_EVERY <= 1 else os.path.join("/content" if ON_DRIVE else TRACE_ROOT, "trace_itr_probe")
+        RUNS_TRACE = os.path.join(OUT_ROOT, "runs_trace")   # stage L of the trace source, apart from notebook 11 (RUNS_ROOT)
+        for _d in (TRACE_ROOT, LOG_DIR, STEP_DIR, PROBE_ROOT, RUNS_TRACE):
+            os.makedirs(_d, exist_ok=True)
+
+        HAVE_GPU = torch.cuda.is_available()
+        GPU_OK = bool(SMOKE or HAVE_GPU or GPU_STEPS_ON_CPU)
+        TARGET = f"{MODEL}@{REVISION}"
+        spec = ModelSpec(name=MODEL, revision=REVISION, dtype=DTYPE, device=DEVICE)
+        cfg = RunConfig(model=spec, families=FAMILIES, seed=SEED, out_root=RUNS_TRACE)
+        limits = C.Limits()
+        if SMOKE:
+            cfg, limits = C.smoke_config(cfg), C.Limits.smoke()
+        limits.use_sae = bool(USE_SAE) and not SMOKE
+        limits.progress = True
+
+        # stage L keywords (lsne.experiments.stage_l_transplant, section "Trace source"); the stand-in run of
+        # notebook 11 (same MODEL/REVISION) is the PREREGISTRATION-18 prerequisite the stage checks itself
+        from lsne.io import RunDir as _RunDir
+        STANDIN_DIR = str(_RunDir(RUNS_ROOT, "L", spec, mkdir=False).path)
+        L_KW = dict(transplant_source=f"trace:{MODEL_DIR}", trace_shards=PROBE_ITR, trace_k=int(TRACE_K),
+                    trace_n_probe=int(N_PROBE_STAGE), trace_length_ratio=float(LENGTH_RATIO), trace_standin=STANDIN_DIR)
+        if TRACE_LAYER is not None:
+            L_KW["trace_layer"] = int(TRACE_LAYER)
+        if TRACE_DIRECTION:
+            L_KW["trace_direction"] = TRACE_DIRECTION
+        if N_PAIRS_STAGE:
+            L_KW["trace_n_pairs"] = int(N_PAIRS_STAGE)
+        # the same options on the command line: key=value items on the source spec (lsne.cli run has no --trace-* flags)
+        _spec_opts = ",".join(f"{k[len('trace_'):]}={v}" for k, v in L_KW.items() if k.startswith("trace_"))
+        _fam = f" --families {','.join(FAMILIES)}" if FAMILIES else ""
+        CLI_COMMAND = (f"python -m lsne.cli run --stage L --model {MODEL} --revision {REVISION} --dtype {DTYPE}"
+                       f" --device {DEVICE} --out {RUNS_TRACE} --seed {SEED}{_fam}{' --smoke' if SMOKE else ''}"
+                       f"{' --use-sae' if limits.use_sae else ''} --transplant-source \"trace:{MODEL_DIR},{_spec_opts}\"")
+
+        # the frozen "sharing" feature (pre-registration 18): written once, before the first probe
+        from lsne.chain.labels import FAN_DEFINITION, VISIBLE_LEN
+        FROZEN = dict(feature="sharing_fanout", kind="fanout", k=int(TRACE_K), negatives="fan_out_eth == 1",
+                      fan_definition=FAN_DEFINITION, visible_window=int(VISIBLE_LEN),
+                      match="length within era", length_ratio=float(LENGTH_RATIO),
+                      layer="last" if TRACE_LAYER is None else int(TRACE_LAYER), readout="mean",
+                      direction="difference of means" if not TRACE_DIRECTION else f"file:{TRACE_DIRECTION}",
+                      criterion="95% bootstrap CI of AUC_trained - AUC_untrained above 0 and AUC_trained above the "
+                                "permutation p95 (criterion.csv: counts)", size=SIZE)
+        FROZEN_PATH = os.path.join(TRACE_ROOT, "frozen_feature.json")
+        FROZEN_CHANGED = False
+        if os.path.exists(FROZEN_PATH):
+            with open(FROZEN_PATH, encoding="utf-8") as _f:
+                _old = json.load(_f)
+            _diff = {k: (_old.get("spec", {}).get(k), v) for k, v in FROZEN.items() if _old.get("spec", {}).get(k) != v}
+            if _diff:
+                FROZEN_CHANGED = True
+                print("WARNUNG: das eingefrorene Merkmal wurde geändert (alt -> neu):", _diff,
+                      "\n  -> Stufe L und die Sonden gelten als EXPLORATIV (Präregistrierung 18).")
+            else:
+                print("Eingefrorenes Merkmal unverändert seit", _old.get("frozen_at"))
+        else:
+            with open(FROZEN_PATH, "w", encoding="utf-8") as _f:
+                json.dump(dict(spec=FROZEN, frozen_at=datetime.datetime.now(datetime.timezone.utc).isoformat()), _f, indent=1)
+            print("Merkmal eingefroren ->", FROZEN_PATH)
+
+        # result holders (the summary cell never fails on a skipped step)
+        STEP_LOG, CLI_LOG = {}, []
+        VOCAB_INFO, OOV, THROUGHPUT, TRAIN_INFO, EVAL, ALIGN_SUMMARY = {}, {}, {}, {}, {}, {}
+        PROBE_SUMMARY, STANDIN_VALIDATED = [], None
+        PLAN_HOURS = {{PLAN_HOURS}}
+
+        print(f"SMOKE: {SMOKE} | GPU: {HAVE_GPU} | Blöcke [{BLOCK_FROM:,}, {BLOCK_TO:,}) jeder {EVERY}. Chunk | {SIZE}, "
+              f"{STEPS} Schritte x {BATCH} x {BLOCK_SIZE} | Adressen {N_ADDRESSES:,} | Ziel {TARGET}")
+        print("Xatu-Cache :", CACHE_DIR)
+        print("TRACE_ROOT :", TRACE_ROOT)
+        print("Sondenkorpus:", PROBE_ITR, f"(jeder {PROBE_SHARD_EVERY}. Shard)")
+        print("Stufe L    :", RUNS_TRACE)
+        print("CLI-Äquivalent der Stufe L:\n  " + CLI_COMMAND)
+        """,
+        PLAN_HOURS=repr(TRACE_PLAN_HOURS),
+    )
+
+
+def _trace_helpers_cell() -> tuple[str, str]:
+    return code(
+        r"""
+        # --- Hilfsfunktionen: CLI-Aufrufe mit Log auf Drive, Schritt-Marker (Resume), Sondenkorpus ---
+        import glob
+        import gzip
+        import re
+        import shlex
+        import shutil
+        import subprocess
+
+        from lsne.chain.cli import SHARD_RE, _is_val, _open_text, list_shards
+        from lsne.chain.xatu import cached_starts
+
+
+        def now_utc() -> str:
+            return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+        def read_json(path, default=None):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return json.load(f)
+            except (OSError, ValueError):
+                return default
+
+
+        def step_file(name: str) -> str:
+            return os.path.join(STEP_DIR, f"{name}.json")
+
+
+        def step_done(name: str) -> bool:
+            # True when an earlier session finished `name` (marker with status ok), REUSE is on and it is not forced
+            if not REUSE or name in FORCE_STEPS:
+                return False
+            rec = read_json(step_file(name))
+            if not rec or rec.get("status") != "ok":
+                return False
+            STEP_LOG.setdefault(name, dict(rec, status="reused", wall_s_first_run=rec.get("wall_s"), wall_s=0.0))
+            print(f"[{name}] bereits erledigt am {rec.get('finished')} ({rec.get('wall_s')} s); "
+                  f"FORCE_STEPS = {{'{name}'}} erzwingt die Neuberechnung")
+            return True
+
+
+        def mark_step(name: str, status: str, wall_s: float, **info) -> dict:
+            rec = dict(step=name, status=status, wall_s=round(float(wall_s), 1), finished=now_utc(), smoke=bool(SMOKE), **info)
+            STEP_LOG[name] = rec
+            with open(step_file(name), "w", encoding="utf-8") as f:
+                json.dump(C.to_jsonable(rec), f, indent=1)
+            return rec
+
+
+        def run_cli(name: str, args: list, module: str = "lsne.chain.cli") -> int:
+            # `python -m <module> <args>` in the checkout; output streamed here and appended to LOG_DIR/<name>.log
+            cmd = [sys.executable, "-u", "-m", module] + [str(a) for a in args]
+            shown = f"python -m {module} " + " ".join(shlex.quote(str(a)) for a in args)
+            CLI_LOG.append(shown)
+            print("$", shown, flush=True)
+            log_path = os.path.join(LOG_DIR, f"{name}.log")
+            t0 = time.time()
+            with open(log_path, "a", encoding="utf-8") as log:
+                log.write(f"\n=== {now_utc()} $ {shown}\n")
+                proc = subprocess.Popen(cmd, cwd=REPO_DIR, env=dict(os.environ, PYTHONUNBUFFERED="1"), text=True,
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1)
+                try:
+                    for line in proc.stdout:
+                        print(line, end="", flush=True)
+                        log.write(line)
+                    rc = proc.wait()
+                except KeyboardInterrupt:            # stop the subprocess with the cell
+                    proc.terminate()
+                    proc.wait()
+                    log.write("[abgebrochen]\n")
+                    raise
+                log.write(f"[{name}] exit {rc}, wall {time.time() - t0:.1f} s\n")
+            print(f"[{name}] exit {rc} nach {time.time() - t0:.0f} s (Log: {log_path})", flush=True)
+            return rc
+
+
+        def have_model() -> bool:
+            ok = os.path.exists(os.path.join(MODEL_DIR, "manifest.json"))
+            if not ok:
+                print("Kein trainiertes Spurenmodell unter", MODEL_DIR, "-> zuerst Abschnitt 4")
+            return ok
+
+
+        def gpu_or_skip(what: str) -> bool:
+            if not GPU_OK:
+                print(f"Keine GPU: {what} übersprungen. Auf eine A100-Laufzeit wechseln und alle Zellen erneut "
+                      "ausführen (erledigte Schritte werden übersprungen).")
+            return GPU_OK
+
+
+        def probe_corpus() -> str:
+            # every PROBE_SHARD_EVERY-th shard plus the drain / fork chunks, as symlinks in PROBE_ITR
+            if PROBE_SHARD_EVERY <= 1:
+                return ITR
+            shards = list_shards(ITR)
+            keep = {}
+            for i, p in enumerate(shards):
+                start = int(SHARD_RE.match(os.path.basename(p)).group(1))
+                if i % int(PROBE_SHARD_EVERY) == 0 or start in PROBE_ALWAYS_CHUNKS:
+                    keep[os.path.basename(p)] = p
+            os.makedirs(PROBE_ITR, exist_ok=True)
+            for f in os.listdir(PROBE_ITR):
+                if f not in keep and f != "serialize_params.json":
+                    os.remove(os.path.join(PROBE_ITR, f))
+            for name, p in keep.items():
+                dst = os.path.join(PROBE_ITR, name)
+                if not os.path.lexists(dst):
+                    os.symlink(p, dst)
+            if os.path.exists(os.path.join(ITR, "serialize_params.json")):
+                shutil.copy(os.path.join(ITR, "serialize_params.json"), os.path.join(PROBE_ITR, "serialize_params.json"))
+            print(f"Sondenkorpus: {len(keep)} von {len(shards)} Shards -> {PROBE_ITR}")
+            return PROBE_ITR
+        """
+    )
+
+
+def _trace_environment_cell() -> tuple[str, str]:
+    return code(
+        r"""
+        # --- Umgebung: GPU, RAM, freier Platz, Stand des Caches ----------------------------------
+        with guarded("Umgebung"):
+            ram_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
+            free_gb = shutil.disk_usage(OUT_ROOT).free / 1e9
+            print(f"CPU-Kerne: {os.cpu_count()} | RAM: {ram_gb:.0f} GB | frei unter OUT_ROOT: {free_gb:.0f} GB")
+            if HAVE_GPU:
+                p = torch.cuda.get_device_properties(0)
+                print(f"GPU: {p.name}, {p.total_memory / 1e9:.0f} GB, bf16: {torch.cuda.is_bf16_supported()}")
+                if "A100" not in p.name and not SMOKE:
+                    print("Hinweis: keine A100 - das Training dauert länger (gemessener Durchsatz in Abschnitt 4a).")
+            elif SMOKE or GPU_STEPS_ON_CPU:
+                print("Keine GPU: alle Schritte laufen auf der CPU (SMOKE / GPU_STEPS_ON_CPU).")
+            else:
+                print("Keine GPU: die Schritte 1-3 (Download, Serialisierung, Vokabular) laufen; Training, Evaluation, Sonden, "
+                      "Alignment und Stufe L werden übersprungen (danach auf eine A100-Laufzeit wechseln).")
+            if not SMOKE:
+                if ram_gb < 50:
+                    print("WARNUNG: wenig RAM - BASELINE_MAX_TRAIN_BLOCKS = 200_000 und PROBE_SHARD_EVERY = 8 setzen.")
+                if free_gb < 16:
+                    print("WARNUNG: weniger als 16 GB frei; der volle Lauf braucht ≈ 14 GB (Rohdaten, Shards, Checkpoints).")
+            n_cached = len(cached_starts(CACHE_DIR, "traces")) if os.path.isdir(CACHE_DIR) else 0
+            n_shards = len(list_shards(ITR)) if os.path.isdir(ITR) else 0
+            print(f"Stand: {n_cached} traces-Chunks im Cache, {n_shards} ITR-Shards, Modell vorhanden: "
+                  f"{os.path.exists(os.path.join(MODEL_DIR, 'manifest.json'))}")
+            print("Erledigte Schritte:", sorted(f[:-5] for f in os.listdir(STEP_DIR) if f.endswith(".json")))
+        """
+    )
+
+
+def nb_12() -> list[tuple[str, str]]:
+    return [
+        _trace_header(),
+        _trace_expectations(),
+        setup_cell(),
+        drive_cell(),
+        _trace_config_cell(),
+        runner_cell(),
+        _trace_helpers_cell(),
+        _trace_environment_cell(),
+        md(
+            """
+            ## 1. Download aller Xatu-Chunks 2016 nach Drive
+
+            `python -m lsne.chain.cli download` in Bereichen von `DOWNLOAD_RANGE` Blöcken: atomares Schreiben
+            (temporäre Datei + Umbenennen), Backoff bei Netzfehlern, vorhandene vollständige Dateien (Parquet-Magie
+            an beiden Enden) werden übersprungen. Nach einem Abbruch die Zelle einfach erneut ausführen; ein
+            fehlgeschlagener Bereich wird ebenso wiederholt. Je Bereich landet `download_log.csv` unter `logs/`.
+            """
+        ),
+        code(
+            r"""
+            # --- 1. Download (resumierbar) --------------------------------------------------------------
+            # CLI per range: python -m lsne.chain.cli download --from A --to B --every 1 --tables <TABLES> \
+            #                    --cache <OUT_ROOT>/cache/xatu --workers 16 --retries 6
+            with guarded("1. Download"):
+                if SMOKE:
+                    print("SMOKE: kein Download; Fixture-Chunks", cached_starts(CACHE_DIR, "traces"), "aus", CACHE_DIR)
+                    STEP_LOG["download"] = dict(status="skipped_smoke", wall_s=0.0)
+                elif not step_done("download"):
+                    t0 = time.time()
+                    failed = []
+                    ranges = [(a, min(a + DOWNLOAD_RANGE, BLOCK_TO)) for a in range(BLOCK_FROM, BLOCK_TO, DOWNLOAD_RANGE)]
+                    for i, (a, b) in enumerate(ranges, 1):
+                        print(f"--- Bereich {i}/{len(ranges)}: Blöcke [{a:,}, {b:,})", flush=True)
+                        rc = run_cli(f"01_download_{a}", ["download", "--from", a, "--to", b, "--every", EVERY, "--tables", TABLES,
+                                                          "--cache", CACHE_DIR, "--workers", DOWNLOAD_WORKERS, "--retries", 6])
+                        if os.path.exists(os.path.join(CACHE_DIR, "download_log.csv")):
+                            shutil.copy(os.path.join(CACHE_DIR, "download_log.csv"), os.path.join(LOG_DIR, f"download_log_{a}.csv"))
+                        if rc != 0:
+                            failed.append(dict(block_from=a, block_to=b, rc=rc))
+                    logs = [pd.read_csv(p) for p in sorted(glob.glob(os.path.join(LOG_DIR, "download_log_*.csv")))]
+                    dl = pd.concat(logs, ignore_index=True) if logs else pd.DataFrame(columns=["ok", "bytes"])
+                    info = dict(n_files=int(len(dl)), n_ok=int(dl["ok"].astype(bool).sum()), gb=float(dl["bytes"].sum()) / 1e9,
+                                failed_ranges=failed)
+                    mark_step("download", "ok" if not failed else "error", time.time() - t0, **info)
+                    print(info)
+                    if failed:
+                        print("Fehlgeschlagene Bereiche: Zelle erneut ausführen (vorhandene Dateien werden übersprungen).")
+                print("traces-Chunks im Cache:", len(cached_starts(CACHE_DIR, "traces")))
+            """
+        ),
+        md(
+            """
+            ## 2. Serialisierung (ITR, BlockGPT-Format)
+
+            Ein gzip-JSON-Lines-Shard pro Chunk mit Tokens, Teilen-Merkmalen, Ära, Label und englischem Text
+            (`render_text`); `--workers` Prozesse, vorhandene Shards werden übersprungen.
+            """
+        ),
+        code(
+            r"""
+            # --- 2. Serialisierung mit Worker-Prozessen ----------------------------------------------------
+            # CLI: python -m lsne.chain.cli serialize --cache <CACHE_DIR> --from 778000 --to 2913000 --out <ITR> --workers <n>
+            with guarded("2. Serialisierung"):
+                if not step_done("serialize"):
+                    t0 = time.time()
+                    rc = run_cli("02_serialize", ["serialize", "--cache", CACHE_DIR, "--from", BLOCK_FROM, "--to", BLOCK_TO,
+                                                  "--out", ITR, "--workers", SERIALIZE_WORKERS])
+                    shards = list_shards(ITR) if os.path.isdir(ITR) else []
+                    mark_step("serialize", "ok" if rc == 0 and shards else "error", time.time() - t0, rc=rc, n_shards=len(shards),
+                              gb=sum(os.path.getsize(p) for p in shards) / 1e9)
+                shards = list_shards(ITR) if os.path.isdir(ITR) else []
+                print(f"{len(shards)} Shards, {sum(os.path.getsize(p) for p in shards) / 1e9:.2f} GB unter {ITR}")
+            """
+        ),
+        md(
+            """
+            ## 3. Hash-Split, Vokabular und Hold-out-OOV
+
+            Der Split ist überall derselbe (`lsne.chain.cli._is_val`): eine Transaktion gehört zur Validierung, wenn
+            die letzten 8 Hex-Stellen ihres Hashes / 2³² < `VAL_FRAC` sind. Das Vokabular sieht nur den
+            Trainingsteil (Adress-Budget `N_ADDRESSES`); die OOV-Raten des Validierungsteils sind deshalb echte
+            Hold-out-Raten (gesamt, je Ära und für kleinere Adress-Budgets).
+            """
+        ),
+        code(
+            r"""
+            # --- 3a. Hash-Split: Trainingsteil (nur tx_hash + tokens) für das Vokabular --------------------
+            # Same split as scripts/trace_e2e.sh step 03a.  TODO(lsne.chain.cli vocab): no --val-frac option to build
+            # the vocabulary from the train split of <ITR> directly, hence this filtered copy (resumable per shard).
+            def split_train_shards() -> dict:
+                os.makedirs(ITR_TRAIN, exist_ok=True)
+                shutil.copy(os.path.join(ITR, "serialize_params.json"), os.path.join(ITR_TRAIN, "serialize_params.json"))
+                counts_path = os.path.join(ITR_TRAIN, "split_counts.json")
+                counts = read_json(counts_path, {}) or {}
+                shards = list_shards(ITR)
+                for i, fn in enumerate(shards, 1):
+                    base = os.path.basename(fn).split(".jsonl")[0]
+                    out = os.path.join(ITR_TRAIN, base + ".jsonl.gz")
+                    if base in counts and os.path.exists(out):
+                        continue
+                    c = dict(train_tx=0, val_tx=0, train_tokens=0, val_tokens=0)
+                    tmp = os.path.join(ITR_TRAIN, base + ".tmp.gz")
+                    with _open_text(fn) as fi, gzip.open(tmp, "wt", encoding="utf-8", compresslevel=1) as fo:
+                        for line in fi:
+                            if not line.strip():
+                                continue
+                            r = json.loads(line)
+                            n_tok = int(r.get("n_tokens", len(r["tokens"])))
+                            if _is_val(r["tx_hash"], VAL_FRAC):
+                                c["val_tx"] += 1
+                                c["val_tokens"] += n_tok
+                                continue
+                            c["train_tx"] += 1
+                            c["train_tokens"] += n_tok
+                            fo.write(json.dumps(dict(tx_hash=r["tx_hash"], tokens=r["tokens"])) + "\n")
+                    os.replace(tmp, out)
+                    counts[base] = c
+                    if i % 100 == 0 or i == len(shards):
+                        with open(counts_path, "w", encoding="utf-8") as f:
+                            json.dump(counts, f)
+                        print(f"  Split: {i}/{len(shards)} Shards", flush=True)
+                with open(counts_path, "w", encoding="utf-8") as f:
+                    json.dump(counts, f)
+                return {k: int(sum(c[k] for c in counts.values())) for k in ("train_tx", "val_tx", "train_tokens", "val_tokens")}
+
+
+            with guarded("3a. Hash-Split"):
+                if not step_done("split"):
+                    t0 = time.time()
+                    tot = split_train_shards()
+                    mark_step("split", "ok", time.time() - t0, val_frac=VAL_FRAC, **tot)
+                rec = read_json(step_file("split"), {}) or {}
+                print({k: rec.get(k) for k in ("train_tx", "val_tx", "train_tokens", "val_tokens", "val_frac")})
+            """
+        ),
+        code(
+            r"""
+            # --- 3b. Vokabular aus dem Trainingsteil (CLI vocab) ----------------------------------------
+            # CLI: python -m lsne.chain.cli vocab --in <ITR_TRAIN> --out <VOCAB_DIR> --n-addresses 50000
+            from lsne.chain.vocab import TraceVocab, oov_rates
+
+            with guarded("3b. Vokabular"):
+                if not step_done("vocab"):
+                    t0 = time.time()
+                    rc = run_cli("03b_vocab", ["vocab", "--in", ITR_TRAIN, "--out", VOCAB_DIR, "--n-addresses", N_ADDRESSES,
+                                               "--n-selectors", N_SELECTORS, "--n-topics", N_TOPICS])
+                    mark_step("vocab", "ok" if rc == 0 else "error", time.time() - t0, rc=rc)
+                vocab = TraceVocab.load(VOCAB_DIR)
+                _m = vocab.meta
+                VOCAB_INFO = dict(size=len(vocab), n_closed=_m.get("n_closed"), n_addresses=_m.get("n_addresses"),
+                                  n_selectors=_m.get("n_selectors"), n_topics=_m.get("n_topics"),
+                                  distinct_train=dict(A=_m.get("distinct_addresses"), F=_m.get("distinct_selectors"),
+                                                      T=_m.get("distinct_topics")),
+                                  coverage_train=dict(A=_m.get("coverage_A"), F=_m.get("coverage_F"), T=_m.get("coverage_T")),
+                                  train_tx=_m.get("n_items"), train_tokens=_m.get("n_tokens"),
+                                  oov_insample=(read_json(os.path.join(VOCAB_DIR, "oov.json"), {}) or {}).get("oov"))
+                print(json.dumps({k: v for k, v in VOCAB_INFO.items() if k != "oov_insample"}, indent=1))
+            """
+        ),
+        code(
+            r"""
+            # --- 3c. Hold-out-OOV: Validierungsteil gegen das Vokabular (gesamt, je Ära, je Adress-Budget) ---
+            from collections import Counter, defaultdict
+
+            from lsne.chain.cli import _merge_oov
+
+            with guarded("3c. Hold-out-OOV"):
+                if step_done("oov_heldout"):
+                    OOV = read_json(OOV_JSON, {}) or {}
+                else:
+                    t0 = time.time()
+                    vocab = TraceVocab.load(VOCAB_DIR)
+                    rx = re.compile(r'"tx_hash":\s*"(0x[0-9a-f]+)"')
+                    parts, parts_era, addr = [], defaultdict(list), Counter()
+                    n_val = 0
+                    for fn in list_shards(ITR):
+                        lists, by_era = [], defaultdict(list)
+                        with _open_text(fn) as fh:
+                            for line in fh:
+                                mm = rx.search(line)
+                                if mm is None or not _is_val(mm.group(1), VAL_FRAC):
+                                    continue
+                                r = json.loads(line)
+                                mapped = vocab.map_tokens(r["tokens"])
+                                lists.append(mapped)
+                                by_era[r.get("era")].append(mapped)
+                                addr.update(t[2:] for t in r["tokens"] if t.startswith("A:") and t != "A:none")
+                        n_val += len(lists)
+                        parts.append(oov_rates(lists))
+                        for e, ls in by_era.items():
+                            parts_era[e].append(oov_rates(ls))
+                    tot_a = sum(addr.values())
+                    budgets = {}
+                    for b in OOV_BUDGETS:
+                        if b <= len(vocab.top_addresses) and tot_a:
+                            keep = set(vocab.top_addresses[: int(b)])
+                            budgets[str(b)] = 1.0 - sum(n for a, n in addr.items() if a in keep) / tot_a
+                    keys = ("n_lists", "rate_A", "rate_F", "rate_T", "rate_open")
+                    OOV = dict(n_val_tx=n_val, val_frac=VAL_FRAC, heldout=_merge_oov(parts),
+                               by_era={str(e): {k: _merge_oov(ps)[k] for k in keys} for e, ps in sorted(parts_era.items(), key=str)},
+                               address_oov_vs_budget=budgets, distinct_heldout_addresses=len(addr), vocab_size=len(vocab))
+                    with open(OOV_JSON, "w", encoding="utf-8") as f:
+                        json.dump(C.to_jsonable(OOV), f, indent=1)
+                    mark_step("oov_heldout", "ok", time.time() - t0, n_val_tx=n_val)
+                h = OOV.get("heldout", {})
+                print(f"Hold-out-OOV ({OOV.get('n_val_tx')} Tx): Adressen {h.get('rate_A', float('nan')):.2%}, "
+                      f"Selektoren {h.get('rate_F', float('nan')):.2%}, Topics {h.get('rate_T', float('nan')):.2%}, "
+                      f"[UNK] {h.get('rate_unk', float('nan')):.3%}")
+                show(pd.DataFrame(OOV.get("by_era", {})).T)
+                print("Adress-OOV gegen Budget (Hold-out):", {k: round(v, 4) for k, v in OOV.get("address_oov_vs_budget", {}).items()})
+            """
+        ),
+        md(
+            """
+            ## 4. Training `blockgpt` in bf16 auf der A100
+
+            4a misst den Durchsatz genau wie der Trainer (bf16-Autocast, TF32, AdamW) und rechnet die Dauer für
+            `STEPS` hoch, bevor das Training beginnt. 4b ruft `python -m lsne.chain.cli train` mit Checkpoints auf
+            Drive auf: nach einem Abbruch die Zelle erneut ausführen, das Training setzt beim neuesten vollständigen
+            Checkpoint fort (die Batch-Reihenfolge ist eine reine Funktion von Saat und Schritt, ein fortgesetzter
+            Lauf ist daher identisch mit einem ununterbrochenen). Ein höheres `STEPS` setzt ein fertiges Training fort.
+            """
+        ),
+        code(
+            r"""
+            # --- 4a. Planung: Parameter, FLOPs, gemessener bf16-Durchsatz -> Trainingsdauer --------------
+            from lsne.chain.train import flops_per_token, list_checkpoints, measure_throughput, param_counts
+
+            with guarded("4a. Durchsatz"):
+                V = len(TraceVocab.load(VOCAB_DIR))
+                pc, fpt = param_counts(SIZE, V), flops_per_token(SIZE, V, BLOCK_SIZE)
+                n_tok = int(STEPS) * int(BATCH) * int(GRAD_ACCUM) * int(BLOCK_SIZE)
+                print(f"{SIZE}, V = {V:,}: {pc['total'] / 1e6:.1f} M Parameter ({pc['non_embedding'] / 1e6:.1f} M Transformer), "
+                      f"{fpt / 1e6:.0f} MFLOP/Token; Plan {n_tok / 1e6:.0f} M Tokens")
+                for mfu in (0.15, 0.30):
+                    tps = A100_PEAK_FLOPS * mfu / fpt
+                    print(f"  Annahme MFU {mfu:.0%}: {tps:,.0f} Tokens/s -> {n_tok / tps / 3600:.2f} h (EXTRAPOLATION)")
+                if gpu_or_skip("Durchsatzmessung"):
+                    dev = "cuda" if HAVE_GPU else "cpu"
+                    use_bf16 = bool(HAVE_GPU and BF16 != "off")
+                    if HAVE_GPU:
+                        torch.backends.cuda.matmul.allow_tf32 = True
+                    # TODO(lsne.chain.cli bench): no --bf16 option; the autocast context reproduces the trainer's bf16 path
+                    with (torch.autocast("cuda", dtype=torch.bfloat16) if use_bf16 else contextlib.nullcontext()):
+                        r = measure_throughput(SIZE, V, block_size=BLOCK_SIZE, batch_size=BATCH, n_steps=1 if SMOKE else 10,
+                                               n_warmup=1 if SMOKE else 3, device=dev, optimizer_step=True)
+                    r.update(bf16=use_bf16, mfu_vs_a100_bf16=r["achieved_flops"] / A100_PEAK_FLOPS,
+                             hours_for_plan=n_tok / r["tokens_per_s"] / 3600)
+                    THROUGHPUT = r
+                    print(f"gemessen ({r['device']}, bf16={use_bf16}): {r['tokens_per_s']:,.0f} Tokens/s, {r['s_per_step']:.3f} s/Schritt, "
+                          f"MFU {r['mfu_vs_a100_bf16']:.1%} (bezogen auf A100 bf16) -> {r['hours_for_plan']:.2f} h für {STEPS} Schritte "
+                          "(+ ≈ 25 min Packen, + 10-20 % Validierung/Checkpoints)")
+                    if HAVE_GPU:
+                        torch.cuda.empty_cache()
+            """
+        ),
+        code(
+            r"""
+            # --- 4b. Training (CLI train, bf16, Checkpoints auf Drive, Fortsetzen) -------------------------
+            # CLI: python -m lsne.chain.cli train --in <ITR> --vocab <VOCAB_DIR> --size blockgpt --out <MODEL_DIR> \
+            #        --steps 20000 --batch-size 32 --block-size 512 --lr 3e-4 --warmup 200 --val-frac 0.01 \
+            #        --eval-every 500 --eval-blocks 512 --save-every 2000 --keep-checkpoints 2 --bf16 on --device auto
+            # TODO(lsne.chain.cli train): no option to reuse pre-packed blocks (e.g. --blocks DIR); every start and every
+            #   resume re-encodes all shards single-threaded before the first step (~25 min for 2016, docs/TRACE_SOURCE.md §8).
+            def train_finished() -> bool:
+                log = os.path.join(MODEL_DIR, "train_log.csv")
+                if not (os.path.exists(os.path.join(MODEL_DIR, "manifest.json")) and os.path.exists(log)):
+                    return False
+                try:
+                    return int(pd.read_csv(log)["step"].max()) >= int(STEPS)
+                except Exception:
+                    return False
+
+
+            with guarded("4b. Training"):
+                if train_finished():
+                    print(f"Training abgeschlossen ({STEPS} Schritte):", MODEL_DIR, "| mehr Schritte: STEPS erhöhen (setzt fort); "
+                          "neues Training: MODEL_DIR löschen")
+                    STEP_LOG.setdefault("train", dict(status="reused", wall_s=0.0))
+                elif gpu_or_skip("Training"):
+                    ck = list_checkpoints(MODEL_DIR)
+                    print("Start bei Schritt", ck[-1][0] if ck else 0, "von", STEPS, f"(Checkpoints: {[s for s, _ in ck]})")
+                    t0 = time.time()
+                    rc = run_cli("06_train", ["train", "--in", ITR, "--vocab", VOCAB_DIR, "--size", SIZE, "--out", MODEL_DIR,
+                                              "--steps", STEPS, "--batch-size", BATCH, "--grad-accum", GRAD_ACCUM,
+                                              "--block-size", BLOCK_SIZE, "--lr", LR,
+                                              "--warmup", WARMUP, "--val-frac", VAL_FRAC, "--eval-every", EVAL_EVERY,
+                                              "--eval-blocks", EVAL_BLOCKS, "--save-every", SAVE_EVERY,
+                                              "--keep-checkpoints", KEEP_CHECKPOINTS, "--bf16", BF16, "--seed", SEED,
+                                              "--device", TRAIN_DEVICE])
+                    mark_step("train", "ok" if rc == 0 and train_finished() else "error", time.time() - t0, rc=rc)
+                man = read_json(os.path.join(MODEL_DIR, "manifest.json"), {}) or {}
+                if man:
+                    TRAIN_INFO = {k: man.get(k) for k in ("params", "hparams", "initial_val_loss", "final_val_loss", "tokens_seen",
+                                                          "wall_s", "tokens_per_s", "corpus", "size")}
+                    print(f"Modell: {man.get('size')}, {man.get('params', {}).get('total', 0) / 1e6:.1f} M Parameter, "
+                          f"Val-Loss {man.get('initial_val_loss', float('nan')):.3f} -> {man.get('final_val_loss', float('nan')):.3f}, "
+                          f"{man.get('tokens_seen', 0) / 1e6:.0f} M Tokens in {man.get('wall_s', 0) / 3600:.2f} h "
+                          f"({man.get('tokens_per_s', float('nan')):,.0f} Tokens/s)")
+            """
+        ),
+        md(
+            """
+            ## 5. Evaluation gegen Unigramm, Bigramm und die untrainierte Kontrolle
+
+            Verlust auf **allen** Validierungsblöcken (fp32), auf exakt den gepackten Blöcken des Trainers (gleicher
+            Split, gleiches Kappen, gleiche `[EOS]`-Trennung): gleichverteilt (ln V), Unigramm (Add-one),
+            interpoliertes Bigramm (λ auf den letzten 5 % der *Trainings*blöcke gewählt), das untrainierte Modell
+            (gleiche Architektur, gleiches Vokabular, Trainings-Saat) und das trainierte Modell, auch je Klasse des
+            vorhergesagten Tokens. Die gepackten Blöcke werden unter `blocks/` gecacht.
+            """
+        ),
+        code(
+            r"""
+            # --- 5a. Evaluation ----------------------------------------------------------------------------
+            # Same estimators as scripts/trace_e2e.sh (steps baseline / evaluate / untrained).
+            # TODO(lsne.chain.cli): no `evaluate` / `baseline` subcommand; this cell is the reference implementation.
+            def token_class(t: str) -> str:
+                if t.startswith("A:") or t == "[A_OOV]":
+                    return "A_oov" if t == "[A_OOV]" else ("A_none" if t == "A:none" else "A_in_vocab")
+                for p, name in (("F:", "selector"), ("T:", "topic"), ("[F_OOV]", "selector"), ("[T_OOV]", "topic"),
+                                ("V:", "value"), ("G:", "gas"), ("S:", "slot"), ("[D", "depth"), ("[CT:", "call_type"),
+                                ("[ERR:", "error"), ("[EOS]", "eos"), ("N", "numeric_arg")):
+                    if t.startswith(p):
+                        return name
+                return "structural"
+
+
+            def packed_blocks(vocab):
+                from lsne.chain.cli import corpus_blocks
+
+                os.makedirs(BLOCKS_DIR, exist_ok=True)
+                f_tr, f_va, f_st = (os.path.join(BLOCKS_DIR, n) for n in ("train.npy", "val.npy", "stats.json"))
+                if all(os.path.exists(p) for p in (f_tr, f_va, f_st)) and "evaluate" not in FORCE_STEPS:
+                    return np.load(f_tr, mmap_mode="r"), np.load(f_va), read_json(f_st, {})
+                trb, vab, stats = corpus_blocks(ITR, vocab, BLOCK_SIZE, 512, VAL_FRAC)
+                for arr, p in ((trb.numpy(), f_tr), (vab.numpy(), f_va)):
+                    np.save(p[:-4] + ".tmp.npy", arr)
+                    os.replace(p[:-4] + ".tmp.npy", p)
+                with open(f_st, "w", encoding="utf-8") as f:
+                    json.dump(C.to_jsonable(stats), f, indent=1)
+                return np.load(f_tr, mmap_mode="r"), np.load(f_va), stats
+
+
+            with guarded("5a. Evaluation"):
+                if step_done("evaluate"):
+                    EVAL = read_json(EVAL_JSON, {}) or {}
+                elif have_model() and gpu_or_skip("Evaluation"):
+                    from transformers import AutoModelForCausalLM
+
+                    from lsne.chain.source import init_seed_of
+                    from lsne.chain.train import make_model
+
+                    t0 = time.time()
+                    v = TraceVocab.load(VOCAB_DIR)
+                    V = len(v)
+                    tr, va, stats = packed_blocks(v)
+                    va = np.asarray(va, dtype=np.int64)
+                    tr = np.asarray(tr if BASELINE_MAX_TRAIN_BLOCKS is None else tr[: int(BASELINE_MAX_TRAIN_BLOCKS)], dtype=np.int64)
+
+                    def unigram_logp(blocks):
+                        cnt = np.bincount(blocks.reshape(-1), minlength=V).astype(np.float64)
+                        return np.log((cnt + 1.0) / (cnt.sum() + V))                       # add-one (Laplace)
+
+                    def bigram_tables(blocks):
+                        a, b = blocks[:, :-1].reshape(-1), blocks[:, 1:].reshape(-1)
+                        keys, cnt = np.unique(a * V + b, return_counts=True)
+                        return keys, cnt.astype(np.float64), np.bincount(a, minlength=V).astype(np.float64)
+
+                    def bigram_nll(tables, lp_uni, blocks, lam):
+                        keys, cnt, ctx_n = tables
+                        a, b = blocks[:, :-1].reshape(-1), blocks[:, 1:].reshape(-1)
+                        q = a * V + b
+                        i = np.minimum(np.searchsorted(keys, q), len(keys) - 1)
+                        c = np.where(keys[i] == q, cnt[i], 0.0)
+                        ml = np.where(ctx_n[a] > 0, c / np.maximum(ctx_n[a], 1.0), 0.0)
+                        le = np.where(ctx_n[a] > 0, lam, 0.0)
+                        return -np.log(le * ml + (1 - le) * np.exp(lp_uni[b]))
+
+                    # lambda of the interpolated bigram chosen on the last 5 % of the TRAIN blocks, never on val
+                    n_dev = max(1, len(tr) // 20)
+                    fit, dev_b = (tr[:-n_dev], tr[-n_dev:]) if len(tr) > n_dev else (tr, tr)
+                    lp_fit, tab_fit = unigram_logp(fit), bigram_tables(fit)
+                    dev_ce = {lam: float(bigram_nll(tab_fit, lp_fit, dev_b, lam).mean()) for lam in (0.5, 0.7, 0.8, 0.9, 0.95, 0.99)}
+                    lam = min(dev_ce, key=dev_ce.get)
+                    lp_u, tab = unigram_logp(tr), bigram_tables(tr)
+                    y = va[:, 1:].reshape(-1)
+                    nll_u, nll_b = -lp_u[y], bigram_nll(tab, lp_u, va, lam)
+                    del tab, tab_fit
+
+                    names = sorted({token_class(t) for t in v.tokens})
+                    cid = np.asarray([names.index(token_class(t)) for t in v.tokens])
+                    cy = cid[y]
+                    dev = torch.device("cuda" if HAVE_GPU else "cpu")
+
+                    @torch.no_grad()
+                    def class_nll(model, bs=16 if HAVE_GPU else 4):
+                        ce, n = np.zeros(len(names)), np.zeros(len(names))
+                        model.eval().to(dev)
+                        for i in range(0, len(va), bs):
+                            x = torch.from_numpy(va[i:i + bs]).to(dev)
+                            lp = torch.log_softmax(model(input_ids=x, use_cache=False).logits[:, :-1].float(), -1)
+                            nll = -lp.gather(-1, x[:, 1:, None])[..., 0].reshape(-1).cpu().numpy()
+                            c = cid[x[:, 1:].reshape(-1).cpu().numpy()]
+                            ce += np.bincount(c, weights=nll, minlength=len(names))
+                            n += np.bincount(c, minlength=len(names))
+                        return ce, n
+
+                    trained = AutoModelForCausalLM.from_pretrained(MODEL_DIR, dtype=torch.float32)
+                    ce_m, n_c = class_nll(trained)
+                    del trained
+                    untrained = make_model(V, SIZE, max_position_embeddings=max(512, BLOCK_SIZE), seed=init_seed_of(MODEL_DIR))
+                    ce_0, _ = class_nll(untrained)
+                    del untrained
+                    if HAVE_GPU:
+                        torch.cuda.empty_cache()
+                    ce_bc = np.bincount(cy, weights=nll_b, minlength=len(names))
+                    ce_uc = np.bincount(cy, weights=nll_u, minlength=len(names))
+                    per_class = {nm: dict(share=float(n_c[i] / n_c.sum()), model=float(ce_m[i] / n_c[i]), untrained=float(ce_0[i] / n_c[i]),
+                                          bigram=float(ce_bc[i] / n_c[i]), unigram=float(ce_uc[i] / n_c[i]))
+                                 for i, nm in enumerate(names) if n_c[i] > 0}
+                    EVAL = dict(n_val_blocks=int(len(va)), val_tokens_predicted=int(n_c.sum()), vocab_size=V, uniform=float(np.log(V)),
+                                unigram_val=float(nll_u.mean()), bigram_val=float(nll_b.mean()), bigram_lambda=float(lam),
+                                bigram_dev_ce=dev_ce, baseline_train_blocks=int(len(tr)),
+                                model_val=float(ce_m.sum() / n_c.sum()), untrained_val=float(ce_0.sum() / n_c.sum()),
+                                per_class=per_class, corpus=stats)
+                    EVAL.update(delta_vs_unigram=EVAL["model_val"] - EVAL["unigram_val"], delta_vs_bigram=EVAL["model_val"] - EVAL["bigram_val"],
+                                delta_vs_untrained=EVAL["model_val"] - EVAL["untrained_val"])
+                    with open(EVAL_JSON, "w", encoding="utf-8") as f:
+                        json.dump(C.to_jsonable(EVAL), f, indent=1)
+                    mark_step("evaluate", "ok", time.time() - t0, model_val=EVAL["model_val"], bigram_val=EVAL["bigram_val"])
+                if EVAL:
+                    print(f"Val-Verlust (nats/Token, {EVAL['n_val_blocks']} Blöcke, {EVAL['val_tokens_predicted']:,} Tokens): "
+                          f"Modell {EVAL['model_val']:.3f} | Bigramm {EVAL['bigram_val']:.3f} (λ = {EVAL['bigram_lambda']}) | "
+                          f"Unigramm {EVAL['unigram_val']:.3f} | untrainiert {EVAL['untrained_val']:.3f} | ln V {EVAL['uniform']:.3f}")
+                    print(f"Δ gegen Bigramm {EVAL['delta_vs_bigram']:+.3f}, gegen Unigramm {EVAL['delta_vs_unigram']:+.3f}, "
+                          f"gegen untrainiert {EVAL['delta_vs_untrained']:+.3f}")
+                    pcl = pd.DataFrame(EVAL["per_class"]).T.sort_values("share", ascending=False)
+                    show(pcl.round(3))
+                    fig, axes = plt.subplots(1, 2, figsize=(14, 4), gridspec_kw=dict(width_ratios=[1, 2.4]))
+                    labels = ["ln V", "untrainiert", "Unigramm", "Bigramm", "Modell"]
+                    vals = [EVAL["uniform"], EVAL["untrained_val"], EVAL["unigram_val"], EVAL["bigram_val"], EVAL["model_val"]]
+                    axes[0].bar(labels, vals, color=["0.8", "0.6", "C1", "C2", "C0"])
+                    axes[0].set_ylabel("nats pro Token (Validierung)")
+                    axes[0].set_title("Spurenmodell gegen Baselines", fontsize=9)
+                    pcl[["model", "bigram", "unigram"]].plot(kind="bar", ax=axes[1], width=0.8)
+                    axes[1].set_title("je Klasse des vorhergesagten Tokens (sortiert nach Anteil)", fontsize=9)
+                    axes[1].set_ylabel("nats")
+                    savefig("trace_eval")
+                    plt.show()
+            """
+        ),
+        code(
+            r"""
+            # --- 5b. Lernkurve mit den Baselines ----------------------------------------------------------
+            with guarded("5b. Lernkurve"):
+                log = pd.read_csv(os.path.join(MODEL_DIR, "train_log.csv"))
+                fig, ax = plt.subplots(figsize=(8, 4))
+                ax.plot(log["tokens_seen"] / 1e6, log["train_loss"], "o-", ms=3, label="Training (Mittel seit letzter Zeile)")
+                ax.plot(log["tokens_seen"] / 1e6, log["val_loss"], "s-", ms=3, label=f"Validierung ({EVAL_BLOCKS} Blöcke, bf16)")
+                for key, lab, ls in (("unigram_val", "Unigramm", "--"), ("bigram_val", "Bigramm", ":"), ("model_val", "Modell, alle Val-Blöcke", "-.")):
+                    if key in EVAL:
+                        ax.axhline(EVAL[key], ls=ls, color="grey", lw=1, label=lab)
+                ax.set_yscale("log")
+                ax.set_xlabel("Trainings-Tokens (M)")
+                ax.set_ylabel("nats pro Token")
+                ax.set_title(f"{SIZE} auf Xatu 2016", fontsize=9)
+                ax.legend(fontsize=7)
+                savefig("train_curve")
+                plt.show()
+                show(log.tail(8))
+            """
+        ),
+        md(
+            """
+            ## 6. Kontrollierte Sonden
+
+            `python -m lsne.chain.cli probe` je Konfiguration auf dem Sondenkorpus: **Längen-Matching** (1:1 innerhalb
+            der Ära, ITR-Länge innerhalb des Faktors 1,25), **Identitätsmaskierung** für die DAO-Sonde (alle Adressen
+            bzw. nur die DAO-Adressen → `[A_OOV]`, in beiden Sets) und das **Kriterium trainiert − untrainiert**
+            (`criterion.csv`: Split-Half-AUC beider Modelle, Δ mit Bootstrap-KI über gematchte Paare,
+            Label-Permutation, Zufallsrichtungen, Oberflächen-Baseline; `counts` = KI über 0 und AUC über der
+            Permutations-Null, `counts_adj` mit Bonferroni über die Snapshots). Die erste Konfiguration ist das
+            eingefrorene Merkmal.
+            """
+        ),
+        code(
+            r"""
+            # --- 6a. Sonden (CLI probe) -------------------------------------------------------------------
+            # CLI: python -m lsne.chain.cli probe --model <MODEL_DIR> --in <PROBE_ITR> --kind fanout --k 5 --match length \
+            #        --length-ratio 1.25 --mask none --n 2000 --untrained auto --out <PROBE_ROOT>/fanout_len_k5
+            #      (ebenso --k 3, --k 2; --kind dao --mask all_addresses bzw. --mask dao)
+            with guarded("6a. Sonden"):
+                if have_model() and gpu_or_skip("Sonden"):
+                    PROBE_ITR = probe_corpus()
+                    if FROZEN_CHANGED:
+                        print("WARNUNG: eingefrorenes Merkmal geändert -> Sonden explorativ")
+                    for pc in PROBE_CONFIGS:
+                        name, out = f"probe_{pc['name']}", os.path.join(PROBE_ROOT, pc["name"])
+                        if step_done(name):
+                            continue
+                        args = ["probe", "--model", MODEL_DIR, "--in", PROBE_ITR, "--kind", pc["kind"], "--k", pc.get("k", 5),
+                                "--match", "length", "--length-ratio", LENGTH_RATIO, "--mask", pc["mask"], "--n", N_PROBE,
+                                "--layer", "all", "--untrained", "auto", "--n-boot", N_BOOT, "--n-perm", N_PERM,
+                                "--n-random", N_RANDOM, "--seed", SEED, "--device", DEVICE, "--out", out]
+                        if SMOKE:
+                            args += ["--threads", 1]
+                        t0 = time.time()
+                        rc = run_cli(f"09_{name}", args)
+                        rep = read_json(os.path.join(out, "probe_report.json"), {}) or {}
+                        n_pairs = (rep.get("verdict") or {}).get("n_pairs")
+                        # exit code 1 with a report = too few matched pairs: a result, not a failure
+                        mark_step(name, "ok" if rc == 0 or (rc == 1 and rep) else "error", time.time() - t0, rc=rc, n_pairs=n_pairs)
+            """
+        ),
+        code(
+            r"""
+            # --- 6b. Sondenbericht: AUC trainiert / untrainiert, Δ mit KI, Nullen, Oberflächen-Baseline ------
+            with guarded("6b. Sondenbericht"):
+                rows, crits = [], {}
+                for pc in PROBE_CONFIGS:
+                    out = os.path.join(PROBE_ROOT, pc["name"])
+                    rep = read_json(os.path.join(out, "probe_report.json"), {}) or {}
+                    cpath = os.path.join(out, "criterion.csv")
+                    crit = pd.read_csv(cpath) if os.path.exists(cpath) else pd.DataFrame()
+                    crits[pc["name"]] = crit
+                    mt, surf, ver = rep.get("matching") or {}, rep.get("surface_baseline") or {}, rep.get("verdict") or {}
+                    rows.append(dict(probe=pc["name"], kind=pc["kind"], k=pc.get("k") if pc["kind"] == "fanout" else None, mask=pc["mask"],
+                                     n_pairs=ver.get("n_pairs", 0), pool_pos=mt.get("pool_pos"), pool_neg=mt.get("pool_neg"),
+                                     length_smd=mt.get("length_smd"), surface_auc=surf.get("combined"), surface_best=surf.get("best_single"),
+                                     layers_counting=ver.get("layers_counting", []),
+                                     layers_counting_bonferroni=ver.get("layers_counting_bonferroni", []),
+                                     max_delta=float(crit["delta"].max()) if len(crit) else float("nan")))
+                PROBE_SUMMARY = rows
+                show(pd.DataFrame(rows))
+                have = [n for n, c in crits.items() if len(c)]
+                if have:
+                    fig, axes = plt.subplots(2, len(have), figsize=(3.6 * len(have) + 1, 6.5), squeeze=False)
+                    for j, n in enumerate(have):
+                        c = crits[n].sort_values("layer")
+                        ax = axes[0, j]
+                        ax.plot(c["layer"], c["auc_trained"], "o-", label="trainiert")
+                        ax.plot(c["layer"], c["auc_untrained"], "s--", label="untrainiert")
+                        ax.plot(c["layer"], c["perm_auc_p95"], ":", color="grey", label="Permutation p95")
+                        if "random_dir_auc_p95" in c:
+                            ax.plot(c["layer"], c["random_dir_auc_p95"], "-.", color="0.6", label="Zufallsrichtung p95")
+                        ax.set_ylim(0.4, 1.02)
+                        ax.set_title(n, fontsize=9)
+                        ax = axes[1, j]
+                        ax.errorbar(c["layer"], c["delta"], yerr=[c["delta"] - c["delta_ci_lo"], c["delta_ci_hi"] - c["delta"]],
+                                    fmt="o", capsize=3)
+                        ax.axhline(0, color="k", lw=0.6)
+                        ax.set_xlabel("Residual-Snapshot")
+                    axes[0, 0].set_ylabel("Split-Half-AUC")
+                    axes[1, 0].set_ylabel("Δ = trainiert − untrainiert [95-%-KI]")
+                    axes[0, 0].legend(fontsize=7)
+                    savefig("probe_criterion")
+                    plt.show()
+                # the frozen feature: fan-out >= TRACE_K, length-matched, no mask, at the frozen snapshot
+                fz = [pc["name"] for pc in PROBE_CONFIGS if pc["kind"] == "fanout" and pc.get("k") == TRACE_K and pc["mask"] == "none"]
+                c = crits.get(fz[0], pd.DataFrame()) if fz else pd.DataFrame()
+                if len(c):
+                    layer = int(c["layer"].max()) if TRACE_LAYER is None else int(TRACE_LAYER)
+                    row = c[c["layer"] == layer].iloc[0]
+                    counts = str(row["counts"]).lower() == "true"
+                    print(f"Eingefrorenes Merkmal (fan-out >= {TRACE_K}, Snapshot {layer}): AUC {row['auc_trained']:.3f} trainiert / "
+                          f"{row['auc_untrained']:.3f} untrainiert, Δ {row['delta']:+.3f} [{row['delta_ci_lo']:+.3f}; {row['delta_ci_hi']:+.3f}] "
+                          f"-> {'ZÄHLT' if counts else 'zählt nicht'}" + (" (explorativ: Merkmal geändert)" if FROZEN_CHANGED else ""))
+                else:
+                    print("Eingefrorenes Merkmal: keine Kriteriumstabelle (zu wenige gematchte Paare oder Sonde nicht gelaufen).")
+            """
+        ),
+        md(
+            """
+            ## 7. Paare und Alignment mit Längenresidualisierung
+
+            `pair --balance` zieht gleich viele Transaktionen je Teilen-Label (ITR für das Spurenmodell,
+            `render_text` für Pythia). `align` passt die Ridge-Abbildung Spurenmodell → `pythia-160m` roh, nach
+            Residualisierung beider Seiten auf die Längenmerkmale (`len3`: log ITR-Tokens, Knoten, Calls mit Wert;
+            `len3+text`: zusätzlich log Pythia-Tokens), für die Längenmerkmale allein und für die untrainierte Quelle;
+            berichtet wird der Gewinn trainiert − untrainiert mit Bootstrap-KI.
+            """
+        ),
+        code(
+            r"""
+            # --- 7a. Paare (CLI pair) und Alignment mit Kontrollen (CLI align) ---------------------------------
+            # CLI: python -m lsne.chain.cli pair --in <PROBE_ITR> --n 2000 --balance --seed 0 --out <PAIRS_FILE>
+            #      python -m lsne.chain.cli align --model <MODEL_DIR> --pairs <PAIRS_FILE> --target EleutherAI/pythia-160m@step98000 \
+            #          --alphas 1,100 --untrained auto --out <ALIGN_DIR>
+            with guarded("7a. Paare"):
+                if not step_done("pair"):
+                    PROBE_ITR = probe_corpus()
+                    t0 = time.time()
+                    rc = run_cli("10_pair", ["pair", "--in", PROBE_ITR, "--n", N_PAIRS, "--balance", "--seed", SEED, "--out", PAIRS_FILE])
+                    n = sum(1 for _ in open(PAIRS_FILE, encoding="utf-8")) if os.path.exists(PAIRS_FILE) else 0
+                    mark_step("pair", "ok" if rc == 0 else "error", time.time() - t0, rc=rc, n_pairs=n)
+                labels = pd.Series([json.loads(l).get("label") for l in open(PAIRS_FILE, encoding="utf-8")]).value_counts()
+                print(f"{int(labels.sum())} Paare nach Label:", labels.to_dict())
+
+            with guarded("7b. Alignment"):
+                if not step_done("align") and have_model() and gpu_or_skip("Alignment"):
+                    t0 = time.time()
+                    args = ["align", "--model", MODEL_DIR, "--pairs", PAIRS_FILE, "--target", TARGET, "--alphas", ALIGN_ALPHAS,
+                            "--untrained", "auto", "--n-boot", N_BOOT, "--seed", SEED, "--device", DEVICE, "--out", ALIGN_DIR]
+                    if SMOKE:
+                        args += ["--threads", 1]
+                    rc = run_cli("11_align", args)
+                    mark_step("align", "ok" if rc == 0 else "error", time.time() - t0, rc=rc)
+            """
+        ),
+        code(
+            r"""
+            # --- 7c. Alignment-Bericht: roh, nur Länge, residualisiert, Gewinn gegen die untrainierte Quelle ---
+            with guarded("7c. Alignment-Bericht"):
+                summ = read_json(os.path.join(ALIGN_DIR, "align_summary.json"), {}) or {}
+                ALIGN_SUMMARY = {k: summ.get(k) for k in ("n_pairs", "target", "summary", "covariates", "seconds")}
+                rows = []
+                for s in summ.get("summary", []):
+                    b = s["best_raw"]
+                    rows.append(dict(covariates=s["covariates"], alpha=s["alpha"], cell=f"L{int(b['layer_src'])}->L{int(b['layer_tgt'])}",
+                                     r2_raw=b["r2_raw"], r2_raw_untrained=b["r2_raw_untrained"], r2_length_only=b["r2_length_only"],
+                                     r2_resid=b["r2_resid"], r2_resid_untrained=b["r2_resid_untrained"], gain_resid=b["gain_resid"],
+                                     gain_resid_ci=f"[{b['gain_resid_ci_lo']:+.3f}; {b['gain_resid_ci_hi']:+.3f}]",
+                                     cells_gain_ci_above_0=f"{s['n_cells_gain_resid_ci_above_0']}/{s['n_cells']}"))
+                show(pd.DataFrame(rows).round(3))
+                ac = pd.read_csv(os.path.join(ALIGN_DIR, "align_controls.csv"))
+                sub = ac[(ac["covariates"] == ac["covariates"].iloc[-1]) & (ac["alpha"] == ac["alpha"].min())]
+                cols = [("r2_raw", "R² roh"), ("r2_length_only", "R² nur Länge"), ("r2_resid", "R² residualisiert"),
+                        ("gain_resid", "Gewinn resid. trainiert − untrainiert")]
+                fig, axes = plt.subplots(1, 4, figsize=(18, 3.6))
+                for ax, (col, lab) in zip(axes, cols):
+                    piv = sub.pivot_table(index="layer_src", columns="layer_tgt", values=col)
+                    im = ax.imshow(piv.to_numpy(dtype=float), aspect="auto", cmap="RdBu_r" if col == "gain_resid" else "viridis",
+                                   vmin=-0.3 if col == "gain_resid" else 0, vmax=0.3 if col == "gain_resid" else 1)
+                    ax.set_xticks(range(piv.shape[1]))
+                    ax.set_xticklabels(piv.columns)
+                    ax.set_yticks(range(piv.shape[0]))
+                    ax.set_yticklabels(piv.index)
+                    ax.set_xlabel("Ziel-Layer (Pythia)")
+                    ax.set_title(lab, fontsize=9)
+                    fig.colorbar(im, ax=ax, shrink=0.8)
+                axes[0].set_ylabel("Quell-Layer (Spurenmodell)")
+                fig.suptitle(f"Alignment, Kovariaten {sub['covariates'].iloc[0]}, Ridge α = {sub['alpha'].iloc[0]:g}", fontsize=10)
+                savefig("alignment_controls")
+                plt.show()
+            """
+        ),
+        md(
+            """
+            ## 8. Stufe L mit dem Spurenmodell als Quelle
+
+            8a prüft die Voraussetzung aus Präregistrierung 18 (Stand-in-Validierung, Notebook 11, gleiches
+            Zielmodell). 8b lädt das Zielmodell und ruft Stufe L mit `transplant_source="trace:<MODEL_DIR>"` und den
+            Shards des Sondenkorpus auf (Sonde mit dem eingefrorenen Merkmal und untrainiertem Zwilling,
+            residualisierte Alignments je Ziel-Layer, Transplantation A/B/C mit echten Paaren aus Trägertransaktion
+            und Stimulus gegen Zufalls-, Identitäts- und Permuted-Alignment-Kontrolle, B/T-Effekte mit
+            Familien-Bootstrap, `trace_verdict`). Der funktionale Transfertest (Kontrast 18) braucht Sprachpaare und
+            wird für eine Spurenquelle übersprungen (Manifest).
+            """
+        ),
+        code(
+            r"""
+            # --- 8a. Voraussetzung (Präregistrierung 18): Stand-in-Validierung aus Notebook 11 ----------------
+            # Maßgeblich ist verdict.csv (Kontrast 18: Transfer-Kriterien UND Vorzeichen für Residual und KV), nicht
+            # transfer_summary.validated; Selbstkonsistenz-Quellen (self, rotated_self) geben kein Urteil (validated = NaN).
+            # Stufe L prüft dasselbe selbst (Option trace_standin -> trace_verdict.counts_for_prereg).
+            with guarded("8a. Stand-in-Validierung"):
+                p = RunDir(RUNS_ROOT, "L", spec, mkdir=False).file("verdict.csv")
+                vd = pd.read_csv(p) if p.exists() and p.stat().st_size > 1 else pd.DataFrame()
+                if len(vd) and "validated" in vd:
+                    r = vd.iloc[0]
+                    _kind = str(r.get("source_kind", ""))
+                    STANDIN_VALIDATED = bool(str(r["validated"]).strip().lower() == "true"
+                                             and str(r.get("counts_for_prereg", "")).strip().lower() == "true"
+                                             and _kind not in ("self", "rotated_self"))
+                    print(f"Stand-in-Lauf {p.parent}: Quelle {_kind}, validated = {r['validated']}, counts_for_prereg = "
+                          f"{r.get('counts_for_prereg')} -> Voraussetzung erfüllt = {STANDIN_VALIDATED}")
+                else:
+                    STANDIN_VALIDATED = None
+                    print(f"Kein Stand-in-Urteil unter {p.parent} (Notebook 11 mit demselben MODEL/REVISION). Nach Präregistrierung 18 "
+                          "wird das Spurenmodell erst nach bestandener Stand-in-Validierung als Quelle gewertet; Stufe L läuft trotzdem.")
+            """
+        ),
+        code(
+            r"""
+            # --- 8b. Zielmodell laden ---------------------------------------------------------------------
+            from lsne.model import load_model
+
+            mb = None
+            with guarded("Zielmodell"):
+                if gpu_or_skip("Laden des Zielmodells"):
+                    mb = load_model(spec)
+                    print(f"{spec.tag()}: {mb.n_layers} Blöcke, d_model={mb.d_model}, device={mb.device}, dtype={mb.dtype}")
+            """
+        ),
+        substages_cell(),
+        code(
+            r"""
+            # --- 8c. Stufe L ausführen ----------------------------------------------------------------------
+            # CLI-Äquivalent (CLI_COMMAND): die Spuren-Optionen stehen als key=value hinter dem Modellverzeichnis,
+            #   python -m lsne.cli run --stage L --model EleutherAI/pythia-160m --revision step98000 --out <OUT_ROOT>/runs_trace \
+            #       --transplant-source "trace:<TRACE_ROOT>/trace_lm_blockgpt,shards=<PROBE_ITR>,k=5,standin=<Stand-in-Lauf>"
+            # (lsne.experiments.stage_l_transplant.parse_trace_spec; `lsne.cli run` hat keine --trace-*-Flags). Diese Zelle
+            # übergibt dieselben Optionen als trace_*-Schlüsselwörter (L_KW).
+            res_L = {}
+            if mb is not None and have_model():
+                with guarded("Sondenkorpus für Stufe L"):
+                    L_KW["trace_shards"] = probe_corpus()
+                res_L = run_stage("L", **L_KW)
+                print({k: len(v) for k, v in res_L.items()})
+            manifest_L = substage_report("L")
+            if manifest_L:
+                tr_info = manifest_L.get("trace") or {}
+                print("Quelle:", (manifest_L.get("source") or {}).get("name"), "| Shards:", tr_info.get("shards"), f"({tr_info.get('shards_from')})",
+                      "| Transaktionen:", tr_info.get("n_transactions"), "| eingefrorener Snapshot:", tr_info.get("frozen_layer"),
+                      "| Injektions-Layer:", tr_info.get("site_layer"), "| Richtung:", tr_info.get("direction_source"),
+                      "| SAE:", tr_info.get("sae_source"))
+            """
+        ),
+        code(
+            r"""
+            # --- 8d. Stufe L: Urteil, Sonde am eingefrorenen Snapshot, Alignment, Transplantationseffekte ------
+            with guarded("8d. Stufe-L-Bericht"):
+                tv = table("L", "trace_verdict")
+                if tv.empty:
+                    print("Kein trace_verdict (Stufe nicht gelaufen oder fehlgeschlagen; siehe Substufen-Bericht).")
+                else:
+                    show(tv[[c for c in ["mode", "probe_n_pairs", "auc_trained", "auc_untrained", "probe_delta", "probe_delta_ci_lo",
+                                         "probe_delta_ci_hi", "probe_ok", "align_r2_holdout", "align_gap", "align_ok", "align_gain_resid",
+                                         "align_gain_resid_ci_lo", "transplant_effect", "sharing_effect_claimed", "counts_for_prereg"]
+                             if c in tv.columns]])
+                    for _, r in tv.iterrows():
+                        print(f"  {r['mode']}: {r['claim']}")
+                tp_probe, eff = table("L", "trace_probe"), table("L", "trace_effects")
+                fig, axes = plt.subplots(1, 3, figsize=(17, 3.8))
+                if len(tp_probe):
+                    c = tp_probe.sort_values("layer")
+                    axes[0].plot(c["layer"], c["auc_trained"], "o-", label="trainiert")
+                    axes[0].plot(c["layer"], c["auc_untrained"], "s--", label="untrainiert")
+                    axes[0].errorbar(c["layer"], c["delta"], yerr=[c["delta"] - c["delta_ci_lo"], c["delta_ci_hi"] - c["delta"]], fmt="^",
+                                     color="C2", capsize=3, label="Δ [95-%-KI]")
+                    fr = c[truthy(c["frozen"])] if "frozen" in c else c.iloc[:0]
+                    for l in fr["layer"]:
+                        axes[0].axvline(l, color="r", lw=0.8, ls="--", label="eingefroren")
+                    axes[0].axhline(0, color="k", lw=0.6)
+                    axes[0].set_xlabel("Residual-Snapshot")
+                    axes[0].set_title("Sonde in Stufe L (Split-Half-AUC, Δ)", fontsize=9)
+                    axes[0].legend(fontsize=7)
+                for ax, q in zip(axes[1:], ["B_all", "T"]):
+                    e = eff[eff["quantity"] == q] if len(eff) else eff
+                    if not len(e):
+                        continue
+                    ctrls = [x for x in ["random", "permuted_alignment", "identity", "plain"] if x in set(e["control"])]
+                    for k, mode in enumerate([m for m in ["residual", "kv", "both"] if m in set(e["mode"])]):
+                        g = e[e["mode"] == mode].set_index("control").reindex(ctrls)
+                        x = np.arange(len(ctrls)) + (k - 1) * 0.25
+                        ax.errorbar(x, g["mean"], yerr=[g["mean"] - g["ci_low"], g["ci_high"] - g["mean"]], fmt="o", capsize=3, label=mode)
+                    ax.set_xticks(range(len(ctrls)))
+                    ax.set_xticklabels(ctrls, fontsize=8)
+                    ax.axhline(0, color="k", lw=0.6)
+                    ax.set_title(f"Transplantat − Kontrolle: {q} [Familien-Bootstrap-KI]", fontsize=9)
+                    ax.legend(fontsize=7)
+                savefig("stage_L_trace")
+                plt.show()
+                ctr = table("L", "trace_alignment_controls")
+                if len(ctr) and len(tv):
+                    fl = int(tv["frozen_layer"].iloc[0])
+                    show(ctr[ctr["layer_src"] == fl].round(3), n=20)
+                sh = table("L", "trace_sharing")
+                if len(sh):
+                    show(sh.pivot_table(index=["mode", "control"], columns=["measure", "condition"], values="value").round(4))
+            """
+        ),
+        code(
+            r"""
+            # --- Zusammenfassung: Ist gegen Plan, Kernzahlen, Urteil -> OUT_ROOT -------------------------
+            with guarded("Zusammenfassung schreiben"):
+                actual, status = {}, {}
+                for k, rec in STEP_LOG.items():
+                    grp = "probes" if k.startswith("probe_") else k
+                    actual[grp] = actual.get(grp, 0.0) + float(rec.get("wall_s") or 0.0)
+                    status.setdefault(grp, set()).add(str(rec.get("status")))
+                if "L" in report:
+                    actual["stage_L"] = float(report["L"].get("seconds", 0.0))
+                    status["stage_L"] = {str(report["L"].get("status"))}
+                plan = pd.DataFrame([dict(step=k, plan_h=f"{a:.2f}-{b:.2f}", actual_h=round(actual[k] / 3600, 3) if k in actual else None,
+                                          status=",".join(sorted(status.get(k, {"nicht gelaufen"}))))
+                                     for k, (a, b) in PLAN_HOURS.items()])
+                print("Ist gegen Plan (Stunden; 'reused' = in einer früheren Sitzung erledigt, Zeit dort in steps/<schritt>.json):")
+                show(plan, n=30)
+                tv = table("L", "trace_verdict")
+                claimed = bool(len(tv) and truthy(tv["sharing_effect_claimed"]).any())
+                _mb = globals().get("mb")
+                summary = dict(
+                    notebook=NOTEBOOK, stage=STAGE, smoke=bool(SMOKE), timestamp=now_utc(),
+                    model=spec.name, revision=spec.revision, dtype=spec.dtype, device=str(_mb.device) if _mb is not None else None,
+                    out_root=OUT_ROOT, trace_root=TRACE_ROOT, cache_dir=CACHE_DIR, runs_root=RUNS_TRACE, probe_corpus=PROBE_ITR,
+                    data=dict(block_from=BLOCK_FROM, block_to=BLOCK_TO, every=EVERY, tables=TABLES, val_frac=VAL_FRAC,
+                              source="ethPandaOps Xatu (https://ethpandaops.io), CC BY 4.0"),
+                    config=dict(size=SIZE, steps=STEPS, batch=BATCH, grad_accum=GRAD_ACCUM, block_size=BLOCK_SIZE, lr=LR,
+                                warmup=WARMUP, bf16=BF16,
+                                n_addresses=N_ADDRESSES, n_probe=N_PROBE, probe_shard_every=PROBE_SHARD_EVERY, n_pairs=N_PAIRS,
+                                align_alphas=ALIGN_ALPHAS, n_boot=N_BOOT, stage_l_kw=L_KW),
+                    frozen_feature=FROZEN, frozen_changed=FROZEN_CHANGED, standin_validated=STANDIN_VALIDATED,
+                    steps=STEP_LOG, plan_vs_actual=plan.to_dict("records"), vocab=VOCAB_INFO, oov_heldout=OOV, throughput=THROUGHPUT,
+                    train=TRAIN_INFO, eval={k: v for k, v in EVAL.items() if k != "corpus"}, probes=PROBE_SUMMARY, align=ALIGN_SUMMARY,
+                    report=report, stage_L=dict(verdict=tv.to_dict("records"), sharing_effect_claimed=claimed,
+                                                counts_for_prereg=bool(len(tv) and truthy(tv["counts_for_prereg"]).all()
+                                                                       and STANDIN_VALIDATED is True and not FROZEN_CHANGED)),
+                    tables={st: {n: int(len(df)) for n, df in r.items()} for st, r in results.items()},
+                    cli_commands=CLI_LOG, cli_command=CLI_COMMAND,
+                    figures=sorted(f for f in os.listdir(FIG_DIR) if f.endswith(".png")),
+                )
+                path = os.path.join(OUT_ROOT, f"summary_{NOTEBOOK}_{spec.tag().replace(':', '_').replace('@', '_')}.json")
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(C.to_jsonable(summary), f, indent=1, ensure_ascii=False)
+                print("Zusammenfassung:", path)
+                if STANDIN_VALIDATED is not True:
+                    print("Präregistrierung 18: Stand-in-Validierung fehlt oder nicht bestanden -> das Spurenmodell zählt nicht als Quelle.")
+                print("Stufe L:", "Effekt behauptet (siehe trace_verdict)" if claimed else
+                      "kein Anspruch (erwarteter Ausgang, siehe 'Realistische Erwartungen')")
+                print(json.dumps({k: v for k, v in C.to_jsonable(summary).items()
+                                  if k in ("eval", "probes", "stage_L", "plan_vs_actual")}, indent=1, ensure_ascii=False)[:4000])
+            """
+        ),
+    ]
+
+
 BUILDERS = {
     "00_setup_and_anchor": nb_00,
     "01_baseline_and_directions": nb_01,
@@ -2858,6 +4190,7 @@ BUILDERS = {
     "09_rdx_sharing": nb_09,
     "10_ttt_injection": nb_10,
     "11_transplant": nb_11,
+    "12_trace_source": nb_12,
 }
 
 

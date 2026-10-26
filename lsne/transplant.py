@@ -923,6 +923,18 @@ def transplant_kv(mb: ModelBundle, src: SourceModel, aligns: Union[Alignment, di
     return fn(mb, _target_ids(mb, prompt), H, placeholder_id=placeholder_id)
 
 
+def _random_key(pp: PromptPair, i: int) -> int:
+    """Seed key of the random-direction control of prompt ``i``: one key per *source item*
+    for paired prompts (its ``name`` / :func:`source_name`), so prompts that share a source
+    item -- the K=0 variant and its K=8/C1 partner on one carrier -- are dosed with the same
+    random direction, as the transplant arm doses them with the same ``v_src``; the prompt
+    index for plain prompts (the same text on both sides)."""
+    if not pp.paired:
+        return int(i)
+    key = str(pp.name or source_name(pp.source))
+    return int(zlib.crc32(key.encode("utf-8")) % 1_000_003)
+
+
 def transplant_experiment(mb: ModelBundle, src: SourceModel, align: Union[Alignment, dict], v_src, prompts: Sequence,
                           site: HookSite, eps: float, n_prefix: int = 8,
                           modes: Sequence[str] = ("residual", "kv", "both"),
@@ -949,7 +961,8 @@ def transplant_experiment(mb: ModelBundle, src: SourceModel, align: Union[Alignm
     runs with it.  The planted layers are recorded per row in ``kv_layers`` (comma-joined,
     empty in ``"residual"`` mode) and ``n_kv_layers``.  Arms:
     ``control="none"`` (the transplant) plus ``"random"`` (a seeded random source direction
-    of equal norm), ``"identity"`` (the target's own, undosed states at the same positions
+    of equal norm; one direction per source item of paired prompts, so prompts sharing a
+    carrier share it, :func:`_random_key`), ``"identity"`` (the target's own, undosed states at the same positions
     / a prefix of the target's own states) and ``"permuted_alignment"``
     (:func:`permute_alignment`).  Measurements: next-token ``entropy`` and ``logp_target``
     (prompts may be ``(text, target)`` pairs or ``targets`` given), the German fraction
@@ -1011,7 +1024,7 @@ def transplant_experiment(mb: ModelBundle, src: SourceModel, align: Union[Alignm
             v_dose = v_src
             use = aligns
             if control == "random":
-                v_dose = random_directions(v_src.numel(), 1, seed + 1000 * i + ci)[0]
+                v_dose = random_directions(v_src.numel(), 1, seed + 1000 * _random_key(pp, i) + ci)[0]
             elif control == "permuted_alignment":
                 use = {l: permute_alignment(a, seed + l) for l, a in aligns.items()}
             elif control not in ("none", "identity"):

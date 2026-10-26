@@ -283,13 +283,13 @@ def test_trace_source_implements_protocol(src, recs, drain, trained):
 
 def test_layer_matching_with_pythia(src, recs, mb):
     pairs = S.paired_items(recs)
-    assert len(pairs) == 14 and pairs[0][1] == text.render_text(pairs[0][0])
+    assert len(pairs) == 15 and pairs[0][1] == text.render_text(pairs[0][0])
     df = layer_matching(src, mb, pairs)
     assert len(df) == (src.n_layers + 1) * (mb.n_layers + 1)
     assert set(df["layer_src"]) == {0, 1, 2} and set(df["layer_tgt"]) == set(range(mb.n_layers + 1))
     for c in ("r2_train", "r2_holdout", "r2_permuted"):
         assert np.isfinite(df[c]).all(), c
-    assert (df["n_pairs"] == 14).all()
+    assert (df["n_pairs"] == 15).all()
 
 
 def test_sharing_direction(src, recs):
@@ -323,6 +323,144 @@ def test_holdout_auc_separable():
     assert d.meta["auc_holdout"] > 0.95 and d.meta["separation_d"] > 2
 
 
+# ======================================================================================
+# round-2 controls: untrained twin, probe criterion, alignment against length
+# ======================================================================================
+def test_untrained_twin_is_the_initialisation(src, recs, vocab, trained):
+    assert S.init_seed_of(trained["out"]) == 0 and S.init_seed_of("/nonexistent", default=5) == 5
+    tw = S.untrained_twin(src, seed=0)
+    ref = T.make_model(len(vocab), "tiny", seed=0)              # what the fixture model was trained from
+    tw_p, ref_p = dict(tw.mb.model.named_parameters()), dict(ref.named_parameters())
+    assert set(tw_p) == set(ref_p) and all(torch.equal(tw_p[k], ref_p[k]) for k in ref_p)
+    tr_p = dict(src.mb.model.named_parameters())
+    assert not all(torch.equal(tw_p[k], tr_p[k]) for k in tr_p)          # the trained weights are untouched
+    assert (tw.d_model, tw.n_layers, tw.max_len) == (src.d_model, src.n_layers, src.max_len)
+    assert tw.vocab is src.vocab and tw.name.endswith(":untrained(seed=0)") and isinstance(tw, SourceModel)
+    ids = src.encode(recs[1])
+    assert torch.equal(tw.encode(recs[1]), ids)
+    h, h0 = src.residuals(ids), tw.residuals(ids)
+    assert sorted(h0) == sorted(h) and not torch.allclose(h[2], h0[2])
+    assert not any(p.requires_grad for p in tw.mb.model.parameters())
+    other = S.untrained_twin(src, seed=1)
+    assert not torch.equal(other.mb.model.gpt_neox.embed_in.weight, tw.mb.model.gpt_neox.embed_in.weight)
+
+
+def test_masked_items(src, recs, drain):
+    items = S.masked_items(src, [drain, recs[1]], "dao")
+    assert items[0] == labels.mask_tokens(src.tokens(drain), "dao") and len(items[0]) == 512
+    assert not any(t == f"A:{a}" for t in items[0] for a in labels.DAO_ADDRESSES.values())
+    assert torch.equal(src.encode(items[1]), src.encode(recs[1])) or "[A_OOV]" in items[1]
+    assert src.encode(items[0]).shape == (1, 512)
+    assert S.masked_items(src, [recs[1]], "none")[0] == src.tokens(recs[1])
+
+
+def _states(n, d, shift, seed):
+    g = torch.Generator().manual_seed(seed)
+    pos = torch.randn(n, d, generator=g)
+    pos[:, 0] += shift
+    return pos, torch.randn(n, d, generator=g)
+
+
+def test_split_half_auc_matches_holdout_auc():
+    for seed in range(3):
+        a, b = _states(30, 6, 1.0, seed)
+        assert S.split_half_auc(a, b, seed=seed) == pytest.approx(S.holdout_auc(a, b, seed=seed), abs=1e-9)
+    assert np.isnan(S.split_half_auc(a[:3], b[:3]))
+    A, B = S.split_halves(30, 0)
+    assert sorted(np.concatenate([A, B]).tolist()) == list(range(30)) and len(A) == 15
+    assert S._auc_cols(np.array([3.0, 2.0]), np.array([1.0, 2.0]))[0] == pytest.approx(0.875)
+
+
+def test_probe_criterion_trained_vs_untrained():
+    n = 60
+    sp, sq = _states(n, 8, 2.0, 0)                  # "trained": class signal on axis 0
+    up, uq = _states(n, 8, 0.0, 1)                  # "untrained": no signal
+    kw = dict(n_boot=200, n_perm=50, n_random=50)
+    r = S.probe_criterion(sp, sq, up, uq, **kw)
+    assert r["auc_trained"] > 0.85 and 0.25 < r["auc_untrained"] < 0.75
+    assert r["delta"] == pytest.approx(r["auc_trained"] - r["auc_untrained"])
+    assert r["delta_ci_lo"] > 0 and r["delta_ci_lo"] <= r["delta_ci_hi"] and r["counts"]
+    assert r["delta_ci_eval_lo"] > 0 and r["auc_trained_ci_lo"] < r["auc_trained"] < r["auc_trained_ci_hi"] + 1e-9
+    assert r["perm_auc_p95"] < r["auc_trained"] and r["perm_p"] < 0.05 and r["perm_delta_p"] < 0.05
+    assert 0.5 <= r["random_dir_auc_mean"] <= r["random_dir_auc_p95"] <= r["random_dir_auc_max"] <= 1.0
+    assert r["auc_trained"] == pytest.approx(S.holdout_auc(sp, sq), abs=1e-9)
+    assert S.probe_criterion(sp, sq, up, uq, **kw) == r                          # deterministic
+    # identical states for both models: difference exactly 0, the CI contains 0 -> does not count
+    same = S.probe_criterion(sp, sq, sp, sq, **kw)
+    assert same["delta"] == 0 and same["delta_ci_lo"] == same["delta_ci_hi"] == 0 and not same["counts"]
+    # the untrained model separating as well as the trained one (the first run) -> does not count
+    tie = S.probe_criterion(sp, sq, *_states(n, 8, 2.0, 5), **kw)
+    assert tie["auc_untrained"] > 0.85 and tie["delta_ci_lo"] < 0 < tie["delta_ci_hi"] and not tie["counts"]
+    # Bonferroni columns with several tests; NaN with too few pairs
+    adj = S.probe_criterion(sp, sq, up, uq, n_tests=5, **kw)
+    assert adj["ci_level_adj"] == pytest.approx(0.99) and adj["delta_ci_lo_adj"] <= adj["delta_ci_lo"]
+    assert np.isnan(S.probe_criterion(sp[:3], sq[:3], up[:3], uq[:3])["delta"])
+
+
+def test_criterion_table():
+    sp, sq = _states(40, 8, 2.0, 0)
+    up, uq = _states(40, 8, 0.0, 1)
+    St = {0: torch.cat([sp, sq]), 1: torch.cat(_states(40, 8, 0.0, 2))}   # layer 1: no class signal
+    S0 = {0: torch.cat([up, uq]), 1: torch.cat([up, uq])}
+    tab = S.criterion_table(St, S0, 40, surface=dict(combined=0.9), n_boot=100, n_perm=20, n_random=20)
+    assert tab["layer"].tolist() == [0, 1] and (tab["n_pairs"] == 40).all()
+    assert bool(tab.loc[0, "counts"]) and not bool(tab.loc[1, "counts"])
+    assert tab.loc[0, "surface_auc"] == 0.9 and bool(tab.loc[0, "beats_surface"]) and not bool(tab.loc[1, "beats_surface"])
+    assert tab.loc[0, "ci_level_adj"] == pytest.approx(1 - 0.05 / 2)
+
+
+def test_alignment_split_residualize_and_covariates(recs):
+    from lsne.transplant import fit_alignment
+
+    for n, h in ((50, 0.2), (14, 0.2), (300, 0.2)):
+        hold, train = S.alignment_split(n, h, seed=0)
+        a = fit_alignment(np.random.default_rng(0).normal(size=(n, 3)), np.random.default_rng(1).normal(size=(n, 2)),
+                          holdout=h, seed=0)
+        assert hold.tolist() == a.meta["idx_holdout"] and len(train) == a.meta["n_train"]
+    rng = np.random.default_rng(0)
+    Z = rng.normal(size=(40, 2))
+    X = Z @ rng.normal(size=(2, 5)) + 0.1 * rng.normal(size=(40, 5)) + 3.0
+    tr = np.arange(30)
+    R = S.residualize(X, Z, tr)
+    Z1 = np.column_stack([np.ones(30), Z[tr]])
+    assert np.abs(Z1.T @ R[tr]).max() < 1e-8                       # orthogonal to [1, Z] on the training rows
+    assert np.abs(R).max() < 1.0 and R.shape == X.shape
+    cov = S.length_covariates(recs)
+    assert list(cov.columns) == ["n_tokens", "n_tokens_raw", "n_nodes", "n_value_calls"]
+    for r, (_, row) in zip(recs, cov.iterrows()):
+        f = labels.sharing_features(r)
+        # the covariate counts what the tokens show (reverted / call_code value calls included), the label
+        # feature only the effective value calls
+        assert row["n_nodes"] == f["n_nodes"] and row["n_value_calls"] == sum(1 for n in r.nodes() if n.value > 0)
+        assert row["n_value_calls"] >= f["n_value_calls"]
+        assert row["n_tokens_raw"] == len(itr.serialize(r)) and row["n_tokens"] == min(512, row["n_tokens_raw"])
+    Zm, names = S.covariate_matrix(cov)
+    assert Zm.shape == (len(recs), 3) and tuple(names) == S.LENGTH_COVARIATES
+    with pytest.raises(ValueError):
+        S.length_covariates(recs[:2], texts=["a", "b"])
+
+
+def test_alignment_controls_synthetic():
+    rng = np.random.default_rng(0)
+    N = 200
+    Z = rng.normal(size=(N, 2))                                     # "length"
+    content = rng.normal(size=(N, 3))                               # what only the trained source sees
+    Tt = {0: Z @ rng.normal(size=(2, 6)) + content @ rng.normal(size=(3, 6)) + 0.05 * rng.normal(size=(N, 6))}
+    Sx = {0: np.column_stack([Z, content]) @ rng.normal(size=(5, 8)) + 0.05 * rng.normal(size=(N, 8))}
+    S0 = {0: Z @ rng.normal(size=(2, 8)) + 0.05 * rng.normal(size=(N, 8))}
+    df = S.alignment_controls(Sx, S0, Tt, Z, alpha=1e-3, n_boot=200)
+    r = df.iloc[0]
+    assert len(df) == 1 and r["n_pairs"] == N and r["n_holdout"] == 40
+    assert r["r2_raw"] > 0.95 and 0.2 < r["r2_raw_untrained"] < 0.9 and 0.2 < r["r2_length_only"] < 0.9
+    assert r["r2_raw_untrained"] == pytest.approx(r["r2_length_only"], abs=0.05)
+    assert r["r2_resid"] > 0.9 and r["r2_resid_untrained"] < 0.1           # no length-free signal in the untrained one
+    assert r["gain_resid"] > 0.8 and r["gain_resid_ci_lo"] > 0.5 and r["gain_raw_ci_lo"] > 0
+    assert r["gain_raw_ci_lo"] <= r["gain_raw"] <= r["gain_raw_ci_hi"] + 1e-9
+    # a trained source that only knows length gains nothing after residualisation
+    df2 = S.alignment_controls(S0, S0, Tt, Z, alpha=1e-3, n_boot=50)
+    assert df2.iloc[0]["gain_resid"] == 0 and df2.iloc[0]["gain_resid_ci_lo"] == 0
+
+
 def test_paired_items_from_rows(recs):
     rows = [{"tokens": itr.serialize(r), "text": "hello"} for r in recs[:2]]
     assert [t for _, t in S.paired_items(rows)] == ["hello", "hello"]
@@ -335,20 +473,22 @@ def test_paired_items_from_rows(recs):
 # ======================================================================================
 # command line (serialize -> vocab -> train -> probe -> pair) on the fixture
 # ======================================================================================
-def test_cli_pipeline(tmp_path, recs):
+def test_cli_pipeline(tmp_path, recs, mb):
     itr_dir, voc, run, probe, pairs = (str(tmp_path / x) for x in ("itr", "vocab", "lm", "probe", "pairs.jsonl"))
     assert chain_cli.main(["serialize", "--cache", FIX, "--from", "1718000", "--to", "1921000", "--out", itr_dir,
                            "--records"]) == 0
     shards = chain_cli.list_shards(itr_dir)
     assert [os.path.basename(s) for s in shards] == ["itr-001718000.jsonl.gz", "itr-001920000.jsonl.gz"]
     rows = list(chain_cli.iter_rows(itr_dir))
-    assert len(rows) == 14
+    assert len(rows) == 15
     by = {r.tx_hash: r for r in recs}
     for row in rows:
         r = by[row["tx_hash"]]
         assert row["tokens"] == itr.serialize(r) and row["n_tokens"] == len(row["tokens"])
         assert row["era"] == labels.era_of(r.block_number) and row["text"] == text.render_text(r)
         assert row["features"]["fan_out_eth"] == labels.sharing_features(r)["fan_out_eth"]
+        assert row["features"]["fan_definition"] == labels.FAN_DEFINITION and row["features"]["visible_len"] == 512
+        assert row["features"]["fan_out_eth_visible"] <= row["features"]["fan_out_eth"]
         assert itr.TxRecord.from_dict(row["record"]).tx_hash == r.tx_hash
     mtime = os.path.getmtime(shards[0])
     assert chain_cli.main(["serialize", "--cache", FIX, "--from", "1718000", "--to", "1719000", "--out", itr_dir]) == 0
@@ -369,7 +509,7 @@ def test_cli_pipeline(tmp_path, recs):
                            "--block-size", "32", "--batch-size", "4", "--eval-every", "2", "--save-every", "2",
                            "--warmup", "1", "--val-frac", "0.3", "--device", "cpu"]) == 0
     man = json.load(open(os.path.join(run, "manifest.json")))
-    assert man["corpus"]["n_tx_train"] + man["corpus"]["n_tx_val"] == 14 and man["corpus"]["n_tx_truncated"] == 1
+    assert man["corpus"]["n_tx_train"] + man["corpus"]["n_tx_val"] == 15 and man["corpus"]["n_tx_truncated"] == 1
 
     assert chain_cli.main(["probe", "--model", run, "--in", itr_dir, "--kind", "dao", "--layer", "all",
                            "--out", probe, "--gas-bins", "1", "--device", "cpu"]) == 0
@@ -378,10 +518,32 @@ def test_cli_pipeline(tmp_path, recs):
     saved = torch.load(os.path.join(probe, "sharing_directions.pt"), weights_only=False)
     assert saved["kind"] == "dao" and saved["layers"][2]["vec"].shape == (64,)
     assert len(pd.read_csv(os.path.join(probe, "match_table.csv"))) == saved["n_pairs"]
+    # the probe specification and the model fingerprint travel with the direction
+    assert saved["k"] == 5 and saved["max_len"] == 512 and saved["split"] == "all"
+    assert saved["model_fingerprint"] == S.model_fingerprint(run) and saved["code_sha256"] == chain_cli.code_fingerprint()
+    rep0 = json.load(open(os.path.join(probe, "probe_report.json")))
+    ls = rep0["matching"]["lm_split"]
+    assert ls["val_frac"] == 0.3 and ls["n_items"] == 2 * saved["n_pairs"]
+    assert ls["n_items_lm_val"] + ls["n_items_lm_train"] == ls["n_items"]
+    assert rep0["matching"]["n_pairs_before_dedup"] - rep0["matching"]["n_pairs_dropped_duplicates"] == saved["n_pairs"]
+    assert json.load(open(os.path.join(probe, "manifest.json")))["code_sha256"] == chain_cli.code_fingerprint()
+    # held-out split only: every probe item is in the LM's validation split
+    probe_h = str(tmp_path / "probe_heldout")
+    chain_cli.main(["probe", "--model", run, "--in", itr_dir, "--kind", "dao", "--gas-bins", "1", "--split", "heldout",
+                    "--untrained", "none", "--out", probe_h, "--device", "cpu"])
+    mt_h = pd.read_csv(os.path.join(probe_h, "match_table.csv"))
+    assert all(S.is_lm_val(h, 0.3) for h in list(mt_h["pos_tx"]) + list(mt_h["neg_tx"]))
 
     assert chain_cli.main(["pair", "--in", itr_dir, "--n", "5", "--out", pairs]) == 0
     loaded = S.load_pairs(pairs)
     assert len(loaded) == 5 and all(isinstance(t, str) and t for _, t in loaded)
+    # transactions longer than the window are never paired (their text covers unseen nodes)
+    all_pairs = str(tmp_path / "all_pairs.jsonl")
+    assert chain_cli.main(["pair", "--in", itr_dir, "--n", "100", "--out", all_pairs]) == 0
+    got, hs = S.load_pairs(all_pairs, with_hashes=True)
+    assert len(got) == 14 and recs[0].tx_hash not in hs and all(len(t) <= 512 for t, _ in got)     # the drain: 1 409
+    assert chain_cli.main(["pair", "--in", itr_dir, "--n", "100", "--max-len", "0", "--out", all_pairs]) == 0
+    assert len(S.load_pairs(all_pairs)) == 15
     src = S.TraceLMSource(run, device="cpu")
     assert src.encode(loaded[0][0]).shape[0] == 1
     assert src.serialize_kw["include_reads"] is True
@@ -389,3 +551,89 @@ def test_cli_pipeline(tmp_path, recs):
     assert torch.equal(src.encode(recs[1]), src.encode(row))           # record == its shard tokens
     assert chain_cli.main(["pair", "--in", itr_dir, "--n", "4", "--out", pairs, "--balance", "--rerender",
                            "--address-style", "named"]) == 0
+
+    # default probe: the untrained twin and the criterion are part of the output
+    crit = pd.read_csv(os.path.join(probe, "criterion.csv"))
+    assert crit["layer"].tolist() == [0, 1, 2]
+    rep = json.load(open(os.path.join(probe, "probe_report.json")))
+    assert rep["untrained"] == "auto(seed=0)" and rep["settings"]["match"] == "gas"
+
+    # round 2: length-matched probe with the DAO identities masked, criterion trained - untrained
+    probe2 = str(tmp_path / "probe2")
+    assert chain_cli.main(["probe", "--model", run, "--in", itr_dir, "--kind", "dao", "--match", "length",
+                           "--length-ratio", "8", "--mask", "dao", "--out", probe2, "--device", "cpu",
+                           "--n-boot", "50", "--n-perm", "20", "--n-random", "20"]) == 0
+    crit = pd.read_csv(os.path.join(probe2, "criterion.csv"))
+    assert crit["layer"].tolist() == [0, 1, 2]
+    assert {"auc_trained", "auc_untrained", "delta", "delta_ci_lo", "delta_ci_hi", "delta_ci_eval_lo", "perm_auc_p95",
+            "perm_p", "random_dir_auc_p95", "surface_auc", "beats_surface", "counts", "counts_adj"} <= set(crit.columns)
+    assert np.allclose(crit["delta"], crit["auc_trained"] - crit["auc_untrained"], equal_nan=True)
+    assert crit["n_pairs"].iloc[0] == 3 and crit["delta"].isna().all()   # < 4 pairs: no estimate, never counts
+    assert not crit["counts"].any()
+    rep = json.load(open(os.path.join(probe2, "probe_report.json")))
+    assert rep["settings"]["mask"] == "dao" and rep["matching"]["matching"] == "era+log_length"
+    assert rep["matching"]["n_pairs"] == len(crit.iloc[0:0]) + int(crit["n_pairs"].iloc[0])
+    assert "length_smd" in rep["matching"] and "n_tokens" in rep["matching"]["balance"]
+    assert "n_a_oov" in rep["surface_baseline"] and rep["verdict"]["rule"].startswith("delta CI lower bound > 0")
+    mt = pd.read_csv(os.path.join(probe2, "match_table.csv"))
+    assert (np.abs(np.log(mt["pos_n_tokens"] / mt["neg_n_tokens"])) <= np.log(8) + 1e-9).all()
+    saved = torch.load(os.path.join(probe2, "sharing_directions.pt"), weights_only=False)
+    assert saved["mask"] == "dao" and saved["match"] == "length"
+    # an explicit control directory (checked for vocabulary / shape) and no control at all
+    probe3 = str(tmp_path / "probe3")
+    assert chain_cli.main(["probe", "--model", run, "--in", itr_dir, "--kind", "dao", "--gas-bins", "1",
+                           "--untrained", "none", "--out", probe3, "--device", "cpu"]) == 0
+    assert not os.path.exists(os.path.join(probe3, "criterion.csv"))
+    assert "criterion" not in json.load(open(os.path.join(probe3, "probe_report.json")))
+    assert chain_cli.main(["probe", "--model", run, "--in", itr_dir, "--kind", "dao", "--gas-bins", "1",
+                           "--untrained", run, "--n-boot", "20", "--n-perm", "5", "--n-random", "5",
+                           "--out", probe3, "--device", "cpu"]) == 0
+    same = pd.read_csv(os.path.join(probe3, "criterion.csv"))
+    assert ((same["delta"] == 0) | same["delta"].isna()).all() and not same["counts"].any()   # never counts
+    # too few matchable pairs -> exit code 1, but the match table and the report are written
+    probe4 = str(tmp_path / "probe4")
+    assert chain_cli.main(["probe", "--model", run, "--in", itr_dir, "--kind", "fanout", "--match", "length",
+                           "--out", probe4, "--device", "cpu"]) == 1
+    assert json.load(open(os.path.join(probe4, "probe_report.json")))["verdict"]["n_pairs"] == 0
+
+    # the alignment with length / untrained controls against pythia-14m
+    pairs14, al = str(tmp_path / "pairs14.jsonl"), str(tmp_path / "align")
+    assert chain_cli.main(["pair", "--in", itr_dir, "--n", "14", "--out", pairs14]) == 0
+    assert chain_cli.main(["align", "--model", run, "--pairs", pairs14, "--target",
+                           f"{mb.spec.name}@{mb.spec.revision}", "--alphas", "1,100", "--n-boot", "20",
+                           "--layers-src", "0,2", "--layers-tgt", "0,3", "--out", al, "--device", "cpu"]) == 0
+    res = pd.read_csv(os.path.join(al, "align_controls.csv"))
+    assert len(res) == 2 * 2 * 2 * 2                    # 2 covariate sets x 2 alphas x 2 x 2 layers
+    assert set(res["covariates"]) == {"len3", "len3+text"} and set(res["alpha"]) == {1.0, 100.0}
+    for c in ("r2_raw", "r2_raw_untrained", "r2_resid", "r2_resid_untrained", "r2_length_only"):
+        assert np.isfinite(res[c]).all(), c
+    assert np.allclose(res["gain_resid"], res["r2_resid"] - res["r2_resid_untrained"])
+    summ = json.load(open(os.path.join(al, "align_summary.json")))
+    assert summ["n_pairs"] == 14 and len(summ["summary"]) == 4 and summ["untrained"] == "auto(seed=0)"
+    assert summ["lm_split"]["val_frac"] == 0.3 and summ["lm_split"]["n_holdout"] == 3
+    assert summ["code_sha256"] == chain_cli.code_fingerprint()
+    # 3 hold-out pairs: no bootstrap CI (NaN) instead of absurd values
+    assert res[["gain_raw_ci_lo", "gain_resid_ci_lo"]].isna().all().all()
+    assert summ["covariates"]["len3+text"][-1] == "log_n_text_tokens"
+    cov = pd.read_csv(os.path.join(al, "length_covariates.csv"))
+    assert len(cov) == 14 and (cov["n_text_tokens"] > 0).all()
+
+
+def test_dedup_pairs_and_degenerate_bootstrap():
+    """Repeated visible sequences are not independent pairs; a tiny hold-out gives no CI."""
+    pos = [["a", "b"], ["c"], ["a", "b"], ["d"], ["e"], ["x"]]
+    neg = [["n1"], ["n2"], ["n3"], ["n1"], ["e"], ["y"]]
+    # pair 2 repeats pair 0's positive, pair 3 pair 0's negative, pair 4 has pos == neg
+    assert S.dedup_pairs(pos, neg) == [0, 1, 5]
+    rng = np.random.default_rng(0)
+    Y = rng.normal(size=(3, 4))
+    g, r1, r0 = S._boot_r2_gain(Y, Y + 0.1, Y + 0.2, 100, np.random.default_rng(1))
+    assert g.size == 0                                           # < MIN_HOLDOUT_BOOT rows: no bootstrap
+    Y = rng.normal(size=(40, 4))
+    g, r1, r0 = S._boot_r2_gain(Y, Y + 0.1 * rng.normal(size=Y.shape), Y + rng.normal(size=Y.shape), 200,
+                                np.random.default_rng(1))
+    assert g.shape == (200,) and np.isfinite(g).all() and (g > 0).mean() > 0.9
+    assert S.split_filter(["0x" + "0" * 63 + "1", "0x" + "f" * 64], "heldout", 0.1) == [True, False]
+    assert S.split_filter(["0x" + "0" * 63 + "1", "0x" + "f" * 64], "train", 0.1) == [False, True]
+    with pytest.raises(ValueError):
+        S.split_filter(["0x1"], "heldout", None)

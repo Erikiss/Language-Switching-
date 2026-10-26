@@ -42,7 +42,8 @@ Conventions shared by all stages (`lsne/experiments/common.py`):
 Inputs the user supplies (all optional; the stages run without them and say so in the
 manifest): `data/ttt/dao_fork` (+ `neutral`, `nofork`) for stage K, `data/atlas/*.txt`
 for stage I, `data/s4/axes.npz` for the ARI-orthogonal `ent` direction (`--axis-npz`),
-and a real source model for stage L (`--transplant-source model@revision`).
+and a real source model for stage L (`--transplant-source model@revision`, or a trace LM
+`--transplant-source "trace:<model_dir>,shards=<itr>,..."` with its ITR shards, see the stage-L section).
 
 ---
 
@@ -69,6 +70,7 @@ and a real source model for stage L (`--transplant-source model@revision`).
 | 16 | Empirical difficulty ranking: mean token NLL per Pile subfield (N ≥ 2000); rank of `protein_misfolding` | J | `pile_difficulty`, `pile_ranking`, `pile_rank_check` | `rank`, `in_hardest_third`, `hardest`, `counterpole` (the replacement rule applied) |
 | 17 | **TTT**: (i) memorisation speed vs matched controls, (ii) Δ sharing / Δ activity vs the three control arms, (iii) Δ T(K=8), Δ B(x) | K | `ttt_memorisation(_boot)`, `ttt_before_after`, `ttt_effects` | (i) `arm="injection-<control>"`, `quantity="steps_to_threshold"`; (ii) `measure ∈ {sharing_jaccard, activity_*}`; (iii) `measure ∈ {T_K8, B_lang_dom}`; `delta`, `delta_injection_minus_control`, `exceeds_all_controls` |
 | 18 | **Transplant**: alignment R² hold-out − permuted ≥ 0.2; cos(transferred, native axis) ≥ 0.3 in the best layer; same sign of the fD shift for residual substitution and KV planting as the native axis | L | `transfer_test`, `transfer_summary`, `transplant`, `transplant_summary`, `verdict` | per target layer `r2_gap`, `r2_gap_ok`, `cos_transferred_vs_native` vs `cos_null_*`, `cos_ok`, `sign_agreement`, `validated`; summary = best validated layer; per mode `sign_fD_vs_identity`, `sign_native`, `sign_agrees_with_native`; `verdict.validated` = transfer criteria AND sign agreement for `residual` and `kv`; the transplant runs at the best validated grid layer; sources `self`/`rotated_self` are plumbing checks (`counts_for_prereg=False`, no verdict); full runs default to `EleutherAI/pythia-70m@step143000` |
+| 18T | **Trace source** (DESIGN §4.9; PREREGISTRATION 18: counts only after a passed stand-in validation, the feature frozen in the source beforehand): sharing effect of the trace LM's direction transplanted into Pythia | L (`--transplant-source trace:<model_dir>`) | `trace_probe`, `trace_effects`, `trace_sharing`, `trace_verdict` | per mode `probe_ok` (pre-specified length-matched fan-out probe, `feature_frozen`, the probe criterion at the frozen source layer: bootstrap CI of split-half AUC trained − untrained twin above 0, `counts`, and `v_src` from that probe specification, `direction_spec_ok`), `align_ok` (length-residualised hold-out R² > 0 and gap ≥ 0.2 on every map the mode uses: the site layer for `residual`, every planted layer for `kv`, both for `both`), `transplant_effect` (B or T vs `random` and `permuted_alignment`, family-bootstrap CIs exclude 0, same sign, ≥ 3 families; the prompts cover one K=0 variant per family); `sharing_effect_claimed` = all three — never without the probe criterion; sharing index / activity deltas are descriptive (`sae_source`); `counts_for_prereg` needs a passed stand-in validation (option `standin`: the stand-in run's `verdict.validated`) and is False for fallbacks, foreign direction files and smoke runs |
 
 ° = the primary endpoint (§2). The manifests of G–L repeat this map under `prereg`.
 
@@ -183,22 +185,51 @@ corpus). Training = `ttt.test_time_train` on a deep copy (AdamW, grad clipping 1
 
 ## Stage L — cross-model transplant (`stage_l_transplant.py`)
 
-DESIGN §4.9, `docs/BLOCKGPT_FEASIBILITY.md`. Source = `l_source` / `--transplant-source`:
-`rotated_self` (default: the target's residuals through a seeded isometry 3·H·Q + 0.5,
-`transplant.RotatedSourceModel` — the alignment must undo Q, so the check is not
-tautological), `self` (plumbing only) or `model@revision` (an HF causal LM such as
-`EleutherAI/pythia-70m@step143000`). A BlockGPT-like trace model plugs into the same
-`SourceModel` interface. Paired items = the English / German unit sentences of the
-selected families (`common.family_text_pairs`, `l_n_texts` per language) + the tails.
+DESIGN §4.9, `docs/BLOCKGPT_FEASIBILITY.md`, `docs/TRACE_SOURCE.md`. Source = `l_source` /
+`--transplant-source`: `rotated_self` (default: the target's residuals through a seeded
+isometry 3·H·Q + 0.5, `transplant.RotatedSourceModel` — the alignment must undo Q, so the
+check is not tautological), `self` (plumbing only), `model@revision` (an HF causal LM such
+as `EleutherAI/pythia-70m@step143000`) or `trace:<model_dir>` (a trace LM written by
+`lsne.chain.train`, loaded as `lsne.chain.source.TraceLMSource`; see below). For the
+language sources the paired items are the English / German unit sentences of the selected
+families (`common.family_text_pairs`, `l_n_texts` per language) + the tails, and the same
+text goes into both models. Prompts of `transplant.transplant_experiment` may be plain
+strings (same text in both models), `(text, target)` tuples, or prompt pairs
+(`transplant.PromptPair`: the source encodes `source`, e.g. a transaction, the target
+encodes `text`).
 
 | Table | Content |
 |---|---|
-| `transfer_test` | `transplant.functional_transfer_test` per grid layer (source layer = same index): `cos_transferred_vs_native` vs `cos_null_vs_native` / `cos_null_max` / `z_cos_vs_null` (`l_n_null` permuted-pair draws), `r2_holdout, r2_permuted, r2_gap`, German-fraction shifts `delta_fD_transferred / _native`, `sign_agreement`, `readout_alive`, `n_ED_*`; flags `r2_gap_ok` (≥ 0.2), `cos_ok` (≥ 0.3), `validated` |
-| `transfer_summary` | the best layer (largest cosine among the validated layers, else overall), `n_validated_layers` |
-| `layer_matching` | `transplant.layer_matching` R² over source × target grid layers |
-| `alignments` | one `transplant.layer_alignments` map per target layer 0..L (what plants the KV prefix at every layer) |
-| `transplant` | `transplant.transplant_experiment` per prompt (K=0 contexts with their targets) × mode (residual / kv / both) × control (none / random / identity / permuted_alignment): `entropy, logp_target, fD, written_norm, kv_layers` |
-| `transplant_summary` | per mode: transplant minus each control (fD, logp), `sign_fD_vs_identity`, `sign_native`, `sign_agrees_with_native` (contrast 18, last clause) |
+| `transfer_test` | `transplant.functional_transfer_test` per grid layer (source layer = same index): `cos_transferred_vs_native` vs `cos_null_vs_native` / `cos_null_max` / `z_cos_vs_null` (`l_n_null` permuted-pair draws), `r2_holdout, r2_permuted, r2_gap`, German-fraction shifts `delta_fD_transferred / _native`, `sign_agreement`, `readout_alive`, `n_ED_*`; flags `r2_gap_ok` (≥ 0.2), `cos_ok` (≥ 0.3), `validated`. **Empty for a trace source** (needs paired language texts; manifest `functional_transfer.skipped`) |
+| `transfer_summary` | the best layer (largest cosine among the validated layers, else overall), `n_validated_layers` (empty for a trace source) |
+| `layer_matching` | `transplant.layer_matching` R² over source × target layers; trace source: Procrustes on length-residualised pooled states of (shard row, English text) pairs (`r2_*` beyond length, `r2_holdout_raw` for comparison, `residualised_on`) |
+| `alignments` | one map per target layer 0..L (what plants the KV prefix at every layer): `transplant.layer_alignments`; trace source: all from the frozen source layer, length-residualised (`lsne.chain.pairs.residualised_alignment`, intercept from the raw means) |
+| `transplant` | `transplant.transplant_experiment` per prompt × mode (residual / kv / both) × control (none / random / identity / permuted_alignment): `entropy, logp_target, fD, written_norm, kv_layers`, `paired`, `source_item`, `n_src_tokens`, `n_tgt_tokens`; the random control draws one direction per source item (prompts sharing a carrier share it); language sources: the K=0 contexts with their targets; trace source: prompt pairs (carrier transaction, K=0 variant and its K=8/C1 partner; one K=0 variant per family, round robin, option `n_prompts`; carrier = a matched probe negative, one per formulation), substitution of the last `l_n_prefix` positions, variant columns `tag, family, formulation, K, C, carrier` |
+| `transplant_summary` | per mode: transplant minus each control (fD, logp), `sign_fD_vs_identity`, `sign_native`, `sign_agrees_with_native` (contrast 18, last clause; no native fD shift for a trace source) |
+| `verdict` | contrast 18 (see the map above); trace source: one explanatory row (`functional_transfer="skipped"`, `counts_for_prereg=False`) |
+| `trace_probe` | trace source only: per source snapshot the probe criterion of the length-matched fan-out probe (net fan-out of the effective transfers, required on the visible 512-token window too; pairs with a repeated visible sequence dropped; `lsne.chain.source.criterion_table`: `auc_trained`, `auc_untrained` (untrained twin), `delta`, `delta_ci_lo/hi`, permutation / random-direction nulls, `surface_auc`, `counts`), `frozen` (the frozen layer, `trace_layer`, default the last snapshot), `k_requested`, `k_used`, `match`, `feature_frozen` (False when the probe had to fall back to era-only matching or k = 2), `length_smd`, `direction_source` (`probe:…` or `file:<sharing_directions.pt>`), `direction_spec_ok` (a file counts only when written by the same probe: kind fanout, match length, mask none, readout mean, same k / length ratio / window) |
+| `trace_probe_match` | the matched pairs (`lsne.chain.labels.probe_sets`, `match="length"`) |
+| `trace_alignment_controls` | `lsne.chain.source.alignment_controls` (ridge): raw / residualised hold-out R² of the trained model and of the untrained twin, `r2_length_only`, gains with bootstrap CIs |
+| `trace_bt` | per variant × mode × control: `logp_target`, `logp_plain` (unmodified model), `B = logp_target − logp_plain` |
+| `trace_T` | `T = logp(K8C1) − logp(K0)` per formulation × mode × control, `T_plain`, `dT` |
+| `trace_effects` | per mode × control (+ `plain`) × quantity (`B_all`, `B_K0`, `B_K8C1`, `T`, `fD`, `entropy`): transplant minus control, family cluster bootstrap (`mean, ci_low, ci_high, n_clusters`), `enough_clusters` (≥ 3), `ci_excludes_0` |
+| `trace_sharing` | `lsne.sharing` at the dossier site, last position, per arm and for the plain model: `sharing_jaccard` (active SAE latents K0 vs K8C1), `activity_frac_active / mean_mass / participation_ratio / n_active_mean` per condition; `sae_source` (`synthetic_random` in smoke runs: function test, not a finding) |
+| `trace_verdict` | per mode: `probe_ok`, `direction_spec_ok`, `align_ok` (`align_ok_site`, `n_planted_layers`, `n_planted_layers_ok`, `planted_layers_failing`), `transplant_effect`, `n_clusters`, `sharing_effect_claimed` (= all three; never True without the probe criterion), sharing / activity deltas vs the controls (descriptive), `standin_validated`, `counts_for_prereg`, `claim` (the reasons, including "only N families (< 3)" and why a run does not count for PREREGISTRATION 18) |
+
+Trace-source options (keywords `trace_<name>` from Python, `Limits.l_trace_<name>` when such a
+field exists, or — the command-line path, since `lsne.cli run` has no `--trace-*` flags —
+`key=value` items after the model directory:
+`--transplant-source "trace:<model_dir>,shards=<itr>,k=5,standin=runs/L/<model>@<rev>"`,
+`stage_l_transplant.parse_trace_spec`): `shards` (the ITR shards of
+`python -m lsne.chain.cli serialize`; default the `data` entry of the model's
+`manifest.json`), `direction` (a `sharing_directions.pt` of `lsne.chain.cli probe`, or
+`<model_dir>/sharing_directions.pt`), `layer`, `k` (5), `n_probe` (500; smoke 50), `n_pairs`
+(4 · `l_n_texts`; alignment pairs longer than the 512-token window are excluded),
+`length_ratio` (1.25), `limit`, `n_substitute` (`l_n_prefix`), `site_layer` (the grid layer
+nearest the middle), `n_prompts` (default one K=0 variant per selected family), `split`
+(`all` / `heldout` / `train`: transactions of the trace LM's hash split; the LM-split
+membership of probe and alignment items is in the manifest), `standin` (the stand-in run
+directory or its `verdict.csv`; PREREGISTRATION 18). Helpers: `lsne/chain/pairs.py`.
 
 If `lsne.transplant` is not importable the stage writes a manifest with `stub=True` and no
 tables.

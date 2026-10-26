@@ -115,7 +115,8 @@ def _serialize_chunk(job: tuple) -> dict:
     from .labels import sharing_features, sharing_label
     from .text import render_text
 
-    (start, cache, out_dir, block_from, block_to, overwrite, with_records, ser_kw, text_kw, label_k, gz) = job
+    (start, cache, out_dir, block_from, block_to, overwrite, with_records, ser_kw, text_kw, label_k, gz,
+     visible_len) = job
     path = shard_path(out_dir, start, gz)
     if not overwrite:
         for p in (shard_path(out_dir, start, True), shard_path(out_dir, start, False)):
@@ -128,7 +129,7 @@ def _serialize_chunk(job: tuple) -> dict:
         with _open_text(tmp, "wt") as fh:
             for r in recs:
                 toks = serialize(r, None, **ser_kw)
-                feat = sharing_features(r)
+                feat = sharing_features(r, visible_len=visible_len, serialize_kw=ser_kw)
                 row = dict(tx_hash=r.tx_hash, block_number=r.block_number, tx_index=r.tx_index, era=feat["era"],
                            label=sharing_label(feat, k=label_k), n_tokens=len(toks), tokens=toks, features=feat,
                            text=render_text(r, **text_kw))
@@ -154,16 +155,19 @@ def _serialize_chunk(job: tuple) -> dict:
 def serialize_chunks(cache: str, block_from: int, block_to: int, out_dir: str, overwrite: bool = False,
                      with_records: bool = False, serialize_kw: Optional[dict] = None,
                      text_kw: Optional[dict] = None, label_k: int = 5, workers: int = 1, gz: bool = True,
-                     log_fn=_say) -> pd.DataFrame:
+                     log_fn=_say, visible_len: Optional[int] = 512) -> pd.DataFrame:
     """Write one ITR shard per cached traces chunk covering ``[block_from, block_to)``
-    (gzipped JSON lines unless ``gz=False``; existing shards of either format are skipped)."""
+    (gzipped JSON lines unless ``gz=False``; existing shards of either format are skipped).
+    ``visible_len``: the features also hold the fan-out of the first ``visible_len`` tokens
+    (the trace LM's window; :func:`lsne.chain.labels.sharing_features`)."""
     from .xatu import cached_starts, chunk_starts
 
     wanted = set(chunk_starts(block_from, block_to))
     starts = [s for s in cached_starts(cache, "traces") if s in wanted]
     os.makedirs(out_dir, exist_ok=True)
     jobs = [(s, cache, out_dir, int(block_from), int(block_to), bool(overwrite), bool(with_records),
-             dict(serialize_kw or {}), dict(text_kw or {}), int(label_k), bool(gz)) for s in starts]
+             dict(serialize_kw or {}), dict(text_kw or {}), int(label_k), bool(gz),
+             None if visible_len is None else int(visible_len)) for s in starts]
     rows = []
     if int(workers) > 1 and len(jobs) > 1:
         with ProcessPoolExecutor(max_workers=int(workers)) as ex:
@@ -198,18 +202,45 @@ def cmd_download(a) -> int:
     return 0 if n_ok == len(df) else 2
 
 
+#: the source files whose content defines a trace result: the chain package and the lsne
+#: modules it imports (files edited elsewhere in the repository do not change the hash)
+CODE_FILES = ("chain/*.py", "transplant.py", "directions.py", "model.py", "config.py", "io.py", "generation.py")
+
+
+def code_fingerprint() -> str:
+    """sha256 (24 hex digits) over the source of :data:`CODE_FILES` (relative path + bytes),
+    recorded in the manifests and reports of this CLI: unlike the git sha it changes with
+    uncommitted edits, so a result can be traced to the code that produced it."""
+    import glob
+    import hashlib
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    files = sorted({p for pat in CODE_FILES for p in glob.glob(os.path.join(root, pat))})
+    h = hashlib.sha256()
+    for p in files:
+        h.update(os.path.relpath(p, root).encode() + b"\0")
+        with open(p, "rb") as fh:
+            h.update(fh.read())
+    return h.hexdigest()[:24]
+
+
 def cmd_serialize(a) -> int:
+    from .labels import FAN_DEFINITION
+
     ser_kw = dict(max_args=a.max_args, include_state=not a.no_state, include_reads=not a.no_reads,
                   include_logs=not a.no_logs, max_depth_token=a.max_depth_token)
     text_kw = dict(max_nodes=a.text_max_nodes, address_style=a.address_style)
+    vis = a.visible_len if a.visible_len and a.visible_len > 0 else None
     df = serialize_chunks(a.cache, a.block_from, a.block_to, a.out, overwrite=a.overwrite, with_records=a.records,
-                          serialize_kw=ser_kw, text_kw=text_kw, label_k=a.k, workers=a.workers, gz=not a.plain)
+                          serialize_kw=ser_kw, text_kw=text_kw, label_k=a.k, workers=a.workers, gz=not a.plain,
+                          visible_len=vis)
     if not len(df):
         _say(f"serialize: no cached traces chunks in [{a.block_from}, {a.block_to}) under {a.cache}")
         return 1
     with open(os.path.join(a.out, "serialize_params.json"), "w", encoding="utf-8") as fh:
-        json.dump(dict(serialize_kw=ser_kw, text_kw=text_kw, label_k=a.k, cache=a.cache,
-                       block_from=a.block_from, block_to=a.block_to, data_source="ethPandaOps Xatu (CC BY 4.0)"),
+        json.dump(dict(serialize_kw=ser_kw, text_kw=text_kw, label_k=a.k, cache=a.cache, visible_len=vis,
+                       fan_definition=FAN_DEFINITION, block_from=a.block_from, block_to=a.block_to,
+                       code_sha256=code_fingerprint(), data_source="ethPandaOps Xatu (CC BY 4.0)"),
                   fh, indent=1)
     new = df[~df["skipped"]]
     bad = df[df["error"].notna()]
@@ -369,6 +400,16 @@ def _jsonable(x):
     return x
 
 
+def _set_threads(n: int) -> None:
+    """``torch.set_num_threads(n)`` for ``n > 0``.  On a shared CPU several processes with the
+    default intra-op thread count oversubscribe the cores; the first run's machine measured
+    0.02 s per trace with 1 thread against 1 s with 4 threads under load."""
+    if n and int(n) > 0:
+        import torch
+
+        torch.set_num_threads(int(n))
+
+
 def _control_source(src, spec: str, init_seed: Optional[int], model_dir: str, device: str, max_len: int):
     """The untrained control of the same architecture and vocabulary: ``"auto"`` = the
     in-memory twin (:func:`lsne.chain.source.untrained_twin`, seed from the model manifest
@@ -390,26 +431,37 @@ def cmd_probe(a) -> int:
     import torch
 
     from ..io import write_manifest
-    from .labels import SURFACE_FEATURES_OOV, balance_table, probe_sets, standardized_mean_difference, \
-        surface_baseline_auc
-    from .source import TraceLMSource, criterion_table, direction_from_states, masked_items, pooled_states
+    from .labels import SURFACE_FEATURES_OOV, probe_sets, standardized_mean_difference, surface_baseline_auc
+    from .source import (TraceLMSource, criterion_table, dedup_pairs, direction_from_states, is_lm_val, lm_val_frac,
+                         masked_items, model_fingerprint, pooled_states, split_filter)
 
+    _set_threads(a.threads)
     df = _features_frame(a.inp, a.limit)
     if df.empty:
         _say("probe: no transactions")
         return 1
+    val_frac = lm_val_frac(a.model)
+    n_all = len(df)
+    if a.split != "all":
+        df = df[split_filter(df["tx_hash"].tolist(), a.split, val_frac)].reset_index(drop=True)
+        _say(f"probe: split={a.split} (LM val_frac {val_frac}): {len(df)} of {n_all} transactions")
+    if "visible_len" in df.columns and df["visible_len"].notna().any() and int(df["visible_len"].max()) != int(a.max_len):
+        _say(f"probe: WARNING the shards' visible fan-out was computed for {int(df['visible_len'].max())} tokens, "
+             f"the model window is --max-len {a.max_len}")
     recs = [SimpleNamespace(tx_hash=h) for h in df["tx_hash"]]
     eras = a.eras.split(",") if a.eras else None
     pos, neg, mt = probe_sets(recs, df, a.kind, a.n, seed=a.seed, k=a.k, eras=eras, gas_bins=a.gas_bins,
                               match=a.match, length_ratio=a.length_ratio,
                               length_cap=a.length_cap if a.length_cap and a.length_cap > 0 else None)
     os.makedirs(a.out, exist_ok=True)
-    mt.to_csv(os.path.join(a.out, "match_table.csv"), index=False)
     settings = dict(kind=a.kind, k=a.k, match=a.match, length_ratio=a.length_ratio if a.match == "length" else None,
+                    length_cap=a.length_cap if a.length_cap and a.length_cap > 0 else None,
                     gas_bins=a.gas_bins if a.match == "gas" else None, mask=a.mask, readout=a.readout, n_max=a.n,
-                    seed=a.seed, eras=eras, model=a.model, data=a.inp, max_len=a.max_len)
+                    seed=a.seed, eras=eras, model=a.model, data=a.inp, max_len=a.max_len, split=a.split,
+                    lm_val_frac=val_frac, dedup=not a.no_dedup, code_sha256=code_fingerprint())
     matching = {k: v for k, v in mt.attrs.items()}
     if len(pos) < 2:
+        mt.to_csv(os.path.join(a.out, "match_table.csv"), index=False)
         with open(os.path.join(a.out, "probe_report.json"), "w", encoding="utf-8") as fh:
             json.dump(_jsonable(dict(settings=settings, matching=matching, verdict=dict(n_pairs=len(pos)))), fh, indent=1)
         _say(f"probe: only {len(pos)} matched pairs for kind={a.kind} (match={a.match}, pool "
@@ -422,6 +474,25 @@ def cmd_probe(a) -> int:
     # vocabulary-mapped, truncated, identity-masked token lists (the same masking for both sets)
     items = masked_items(src, [rows[r.tx_hash] for r in pos] + [rows[r.tx_hash] for r in neg], a.mask)
     n = len(pos)
+    # identical visible sequences must not be counted as independent pairs (split halves, bootstrap)
+    keep = list(range(n)) if a.no_dedup else dedup_pairs(items[:n], items[n:])
+    matching["n_pairs_before_dedup"] = n
+    matching["n_pairs_dropped_duplicates"] = n - len(keep)
+    if len(keep) < n:
+        pos, neg = [pos[i] for i in keep], [neg[i] for i in keep]
+        items = [items[i] for i in keep] + [items[n + i] for i in keep]
+        mt = mt.iloc[keep].reset_index(drop=True).assign(pair=lambda d: np.arange(len(d)))
+        n = len(pos)
+    mt.to_csv(os.path.join(a.out, "match_table.csv"), index=False)
+    lm_val = [is_lm_val(r.tx_hash, val_frac) for r in pos + neg]
+    matching["lm_split"] = dict(val_frac=val_frac, n_items=2 * n, n_items_lm_val=int(sum(lm_val)),
+                                n_items_lm_train=int(2 * n - sum(lm_val)),
+                                n_pairs_both_lm_val=int(sum(1 for i in range(n) if lm_val[i] and lm_val[n + i])))
+    if n < 2:
+        with open(os.path.join(a.out, "probe_report.json"), "w", encoding="utf-8") as fh:
+            json.dump(_jsonable(dict(settings=settings, matching=matching, verdict=dict(n_pairs=n))), fh, indent=1)
+        _say(f"probe: only {n} matched pairs left after removing duplicate sequences; need >= 2")
+        return 1
     t0 = time.time()
     S = pooled_states(src, items, layers, a.readout)
     t_enc = time.time() - t0
@@ -437,7 +508,12 @@ def cmd_probe(a) -> int:
     sm = pd.DataFrame(summary)
     sm.to_csv(os.path.join(a.out, "probe_summary.csv"), index=False)
     torch.save(dict(layers=saved, kind=a.kind, readout=a.readout, model=a.model, n_pairs=n, d_model=src.d_model,
-                    n_layers=src.n_layers, mask=a.mask, match=a.match), os.path.join(a.out, "sharing_directions.pt"))
+                    n_layers=src.n_layers, mask=a.mask, match=a.match, k=a.k,
+                    length_ratio=a.length_ratio if a.match == "length" else None, max_len=a.max_len,
+                    length_cap=settings["length_cap"], visible=matching.get("visible"), split=a.split,
+                    eras=eras, dedup=not a.no_dedup, model_fingerprint=model_fingerprint(a.model),
+                    code_sha256=settings["code_sha256"]),
+               os.path.join(a.out, "sharing_directions.pt"))
     # balance of the visible (truncated, masked) sequences and the surface baseline on them
     vis_p, vis_q = [len(t) for t in items[:n]], [len(t) for t in items[n:]]
     matching["visible_length_smd"] = standardized_mean_difference(np.log(vis_p), np.log(vis_q))
@@ -464,7 +540,8 @@ def cmd_probe(a) -> int:
         json.dump(_jsonable(report), fh, indent=1)
     write_manifest(a.out, kind="trace_probe", probe_kind=a.kind, model=a.model, data=a.inp, n_pairs=n,
                    layers=layers, readout=a.readout, denoise_pcs=a.denoise_pcs, k=a.k, seed=a.seed, match=a.match,
-                   mask=a.mask, untrained=src0_name, seconds=round(time.time() - t0, 1))
+                   mask=a.mask, split=a.split, untrained=src0_name, seconds=round(time.time() - t0, 1),
+                   code_sha256=settings["code_sha256"], model_fingerprint=model_fingerprint(a.model))
     bal = matching.get("balance", {})
     _say(f"probe: {n} matched pairs ({a.kind}, match={matching.get('matching')}, mask={a.mask}; pool "
          f"{matching.get('pool_pos')} pos / {matching.get('pool_neg')} neg, {matching.get('n_matched_total')} matchable); "
@@ -486,13 +563,19 @@ def cmd_align(a) -> int:
     from ..io import write_manifest
     from ..model import load_model
     from ..transplant import paired_states
-    from .source import (TraceLMSource, alignment_controls, covariate_matrix, length_covariates, load_pairs,
-                         pooled_states)
+    from .source import (TraceLMSource, alignment_controls, alignment_split, covariate_matrix, is_lm_val,
+                         length_covariates, lm_val_frac, load_pairs, pooled_states, split_filter)
     from ..config import ModelSpec
 
-    pairs = load_pairs(a.pairs)
+    _set_threads(a.threads)
+    pairs, hashes = load_pairs(a.pairs, with_hashes=True)
+    val_frac = lm_val_frac(a.model)
+    if a.split != "all":
+        sel = split_filter(hashes, a.split, val_frac)
+        pairs = [p for p, ok in zip(pairs, sel) if ok]
+        hashes = [h for h, ok in zip(hashes, sel) if ok]
     if a.max_pairs:
-        pairs = pairs[: a.max_pairs]
+        pairs, hashes = pairs[: a.max_pairs], hashes[: a.max_pairs]
     if len(pairs) < 5:
         _say(f"align: only {len(pairs)} pairs")
         return 1
@@ -539,7 +622,12 @@ def cmd_align(a) -> int:
                          max_r2_length_only=float(g["r2_length_only"].max()),
                          n_cells_gain_resid_ci_above_0=int((g["gain_resid_ci_lo"] > 0).sum()),
                          n_cells=int(len(g))))
-    out = dict(pairs=a.pairs, n_pairs=len(pairs), target=a.target, target_rev=a.target_rev, model=a.model,
+    hold, _tr = alignment_split(len(pairs), a.holdout, a.seed)
+    lm_val = [is_lm_val(h, val_frac) if h else False for h in hashes]
+    lm_split = dict(val_frac=val_frac, split=a.split, n_pairs_lm_val=int(sum(lm_val)),
+                    n_holdout=int(len(hold)), n_holdout_lm_val=int(sum(lm_val[i] for i in hold)))
+    out = dict(pairs=a.pairs, n_pairs=len(pairs), lm_split=lm_split, code_sha256=code_fingerprint(),
+               target=a.target, target_rev=a.target_rev, model=a.model,
                untrained=src0_name, readout=a.readout, holdout=a.holdout, seed=a.seed, n_boot=a.n_boot,
                covariates={k: covariate_matrix(cov, text=v)[1] for k, v in covsets.items()},
                covariate_means=cov.mean().to_dict(), summary=summ,
@@ -547,7 +635,8 @@ def cmd_align(a) -> int:
     with open(os.path.join(a.out, "align_summary.json"), "w", encoding="utf-8") as fh:
         json.dump(_jsonable(out), fh, indent=1)
     write_manifest(a.out, kind="trace_align_controls", model=a.model, pairs=a.pairs, n_pairs=len(pairs),
-                   target=a.target, untrained=src0_name, alphas=a.alphas, holdout=a.holdout, seed=a.seed)
+                   target=a.target, untrained=src0_name, alphas=a.alphas, holdout=a.holdout, seed=a.seed,
+                   split=a.split, lm_split=lm_split, code_sha256=out["code_sha256"])
     for s in summ:
         b = s["best_raw"]
         _say(f"align [{s['covariates']}, alpha={s['alpha']:g}] best raw cell L{int(b['layer_src'])}->L{int(b['layer_tgt'])}: "
@@ -560,12 +649,24 @@ def cmd_align(a) -> int:
 
 
 def cmd_pair(a) -> int:
-    from .source import paired_items
+    from .source import lm_val_frac, paired_items, split_filter
 
-    keys = [(r["tx_hash"], r.get("label")) for r in iter_rows(a.inp, limit=a.limit)]
+    keys, n_long = [], 0
+    for r in iter_rows(a.inp, limit=a.limit):
+        n_tok = int(r["n_tokens"]) if r.get("n_tokens") is not None else len(r.get("tokens") or [])
+        if a.max_len and a.max_len > 0 and n_tok > a.max_len:
+            n_long += 1            # the text would describe nodes the trace LM's window does not show
+            continue
+        keys.append((r["tx_hash"], r.get("label")))
+    if a.split != "all":
+        vf = a.val_frac if a.val_frac is not None else (lm_val_frac(a.model) if a.model else None)
+        sel = split_filter([h for h, _ in keys], a.split, vf)
+        keys = [k for k, ok in zip(keys, sel) if ok]
     if not keys:
         _say("pair: no transactions")
         return 1
+    if n_long:
+        _say(f"pair: {n_long} transactions longer than --max-len {a.max_len} excluded")
     rng = np.random.default_rng(a.seed)
     if a.balance:
         by = {}
@@ -658,6 +759,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--text-max-nodes", type=int, default=12)
     s.add_argument("--address-style", default="short", choices=["short", "full", "named"])
     s.add_argument("--k", type=int, default=5, help="fan threshold of the sharing label")
+    s.add_argument("--visible-len", type=int, default=512,
+                   help="also store the fan-out of the first N ITR tokens (the trace LM's window; 0: skip)")
     s.set_defaults(func=cmd_serialize)
 
     v = sub.add_parser("vocab", help="build the vocabulary + HF tokenizer from ITR shards")
@@ -725,6 +828,11 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--limit", type=int, default=None)
     q.add_argument("--seed", type=int, default=0)
     q.add_argument("--device", default="auto")
+    q.add_argument("--threads", type=int, default=0, help="torch CPU threads (0: torch default; 1 on a shared CPU)")
+    q.add_argument("--split", default="all", choices=["all", "heldout", "train"],
+                   help="transactions of the LM's held-out / training split only (val_frac from the model manifest)")
+    q.add_argument("--no-dedup", action="store_true",
+                   help="keep pairs whose (masked, truncated) sequence repeats an earlier pair's")
     q.set_defaults(func=cmd_probe)
 
     al = sub.add_parser("align", help="alignment trace LM -> target LM with length / untrained controls")
@@ -745,7 +853,10 @@ def build_parser() -> argparse.ArgumentParser:
     al.add_argument("--max-len", type=int, default=512)
     al.add_argument("--seed", type=int, default=0)
     al.add_argument("--device", default="auto")
+    al.add_argument("--threads", type=int, default=0, help="torch CPU threads (0: torch default)")
     al.add_argument("--out", default="runs/trace_align")
+    al.add_argument("--split", default="all", choices=["all", "heldout", "train"],
+                    help="only pairs of the LM's held-out / training split (val_frac from the model manifest)")
     al.set_defaults(func=cmd_align)
 
     r = sub.add_parser("pair", help="(ITR, English text) pairs for the alignment with Pythia")
@@ -758,6 +869,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--max-nodes", type=int, default=12)
     r.add_argument("--address-style", default="short", choices=["short", "full", "named"])
     r.add_argument("--limit", type=int, default=None)
+    r.add_argument("--max-len", type=int, default=512,
+                   help="exclude transactions longer than the trace LM's window (their text covers unseen nodes; 0: keep)")
+    r.add_argument("--split", default="all", choices=["all", "heldout", "train"],
+                   help="only transactions of the LM's held-out / training split (needs --model or --val-frac)")
+    r.add_argument("--model", default=None, help="trace LM directory (its manifest gives the split's val_frac)")
+    r.add_argument("--val-frac", type=float, default=None)
     r.set_defaults(func=cmd_pair)
 
     b = sub.add_parser("bench", help="training throughput (tokens/s) per model size")
