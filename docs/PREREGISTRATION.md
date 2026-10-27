@@ -115,3 +115,43 @@ Mindesteffektgrenze nicht ausschließt, gilt als „offen“, nicht als Nullbefu
 Alle Phasendiagramme, Checkpoint-Sweeps, Skalierungsarme, SAE-Feature-Auswahl und
 FDT-Verhältnisse sind explorativ. Positive explorative Befunde werden als neue
 Hypothesen für eine spätere Bestätigung formuliert, nicht als Ergebnis dieses Tests.
+
+## 6. Nachträge nach Lauf 1 (27.10.2026, nach Sichtung der Daten)
+
+Der Tag `prereg-v1` wurde am 27.10.2026 **nachträglich** gesetzt, auf Commit `58ec270`
+(26.10.2026, 00:41 UTC). Das ist die letzte Änderung an diesem Dokument vor dem ersten Lauf
+(erster Lauf ab 26.10.2026, 12:45 UTC, Code-Stand `a018239`). Abschnitte 1–5 sind seitdem
+unverändert.
+
+Die folgenden Punkte wurden **nach** Sichtung von Lauf 1 festgelegt. Es sind Klarstellungen
+von Lücken des Textes oben, keine Änderungen der Hypothesen. Ergebnisse, die von ihnen
+abhängen, werden in der Auswertung als „nach Sichtung festgelegt“ gekennzeichnet. Umgesetzt
+sind sie in `lsne/prereg_eval.py` (Notebook 13, Code-Stand `97d4104`); Begründungen und
+Zahlen in `docs/RESULTS_RUN1.md` §4.
+
+1. **Mindesteffekte** werden am 95-%-Intervall beurteilt: erfüllt, wenn die untere Grenze
+   ≥ Mindesteffekt; ausgeschlossen, wenn die obere Grenze < Mindesteffekt; sonst „offen“.
+2. **Primärendpunkt, Zelle:** konfirmatorisch ist C1. Nur dort liegt die Injektion genau an
+   der präregistrierten Position (letztes Token von Einheit 9). Für C2/C3/seg hat der Code am
+   letzten deutschen Token injiziert; diese Zeilen sind Abweichungen und werden nicht
+   interpretiert.
+3. **Primärendpunkt, Dosis:** In Lauf 1 wurde keine Dosis auf DEV eingefroren, und gerechnet
+   wurden nur 0,01 / 0,05 / 0,1. Berichtet wird jede dieser Dosen einzeln, mit
+   Bonferroni-Korrektur über die Dosen. Die Dosen 0,001 / 0,0025 / 0,005 / 0,02 fehlen
+   (Abweichung).
+4. **BH-Gruppe:** Endpunkte 1–6, 8 und 9 (nur bei bestandenem G0), 10, 13 und 14, eine Zeile
+   je Teiltest. Die Gruppierung „Bonferroni je Endpunkt, dann BH über Endpunkte“ wird als
+   Sensitivität mitberichtet.
+5. **Endpunkt 3** wird einseitig in der Richtung aus DESIGN §4.1 getestet. Im gemeinsamen
+   Suffix kommt keine Leerraum-Position vor, daher misst R_ws+punct+boundary in Lauf 1
+   faktisch R_punct+boundary (Abweichung).
+6. **Endpunkt 6** wird einseitig im State-2143-Vorzeichen (+1) getestet; das Vorzeichen −1
+   ist Kontrolle.
+7. **Endpunkt 10(ii):** Zensierte Reihen, die über alle λ konstant sind, gehen mit ρ = 0 ein
+   statt verworfen zu werden; die Zeile „wie gelaufen“ bleibt als Sensitivität.
+8. **Endpunkt 13:** präregistriert ist eine Dosis (auf DEV eingefroren, sonst 0,05).
+9. **Endpunkt 15:** Der nach Regel 16 fällige Gegenpol `books` wurde in Lauf 1 nicht
+   angewandt; Endpunkt 15 ist für Lauf 1 explorativ.
+
+Noch offene Entscheidungen (Liste in `docs/RESULTS_RUN1.md` §5.5) werden, sobald getroffen,
+hier mit Datum ergänzt.

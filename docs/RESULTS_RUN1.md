@@ -32,9 +32,9 @@ den Drive-Daten gelaufen. Alles unten Genannte ist deshalb vorläufig.
 * Urteile: **gestützt** (supported), **nicht gestützt** (not_supported), **offen** (open),
   **nicht getestet** (not_tested), **nicht interpretierbar** (not_interpretable), **Gate
   verfehlt** (gate_failed), **Dokumentation** (kein Test).
-* „Diese Runde“ = die Korrekturen nach der Prüfung. Sie liegen in der Arbeitskopie des Branches
-  `claude/language-switching-non-equilibrium-ejpz0q` (Basis `76a4a5a`) und sind beim Schreiben
-  dieses Dokuments **nicht committet**. Colab sieht sie erst nach Commit und Push (§5.0).
+* „Diese Runde“ = die Korrekturen nach der Prüfung. Sie sind mit Commit `97d4104` auf dem Branch
+  `claude/language-switching-non-equilibrium-ejpz0q` (Basis `76a4a5a`) eingespielt und gepusht
+  (§5.0).
 
 ## Kurzfassung
 
@@ -616,7 +616,7 @@ vergleichbar:
 
 ## 4. Abweichungen von der Präregistrierung und bekannte Mängel
 
-„Behoben“ = in der Arbeitskopie dieser Runde (nicht committet, siehe Lesehinweise). Die
+„Behoben“ = mit Commit `97d4104` eingespielt. Die
 vorhandenen Lauftabellen ändern sich dadurch nicht. Was neue Werte braucht, steht in §5.
 
 ### 4.1 Auswertung und Statistik
@@ -676,9 +676,9 @@ vorhandenen Lauftabellen ändern sich dadurch nicht. Was neue Werte braucht, ste
 ### 5.0 Voraussetzung: Korrekturen auf den Branch bringen
 
 Die Notebooks klonen den Branch `claude/language-switching-non-equilibrium-ejpz0q` von GitHub. Die
-Korrekturen dieser Runde, `lsne/prereg_eval.py` und `notebooks/13_prereg_evaluation.ipynb` liegen
-nur in der Arbeitskopie (nicht committet, nicht gepusht). Ohne Commit und Push läuft Colab mit
-`76a4a5a`, und Notebook 13 existiert dort nicht.
+Korrekturen dieser Runde, `lsne/prereg_eval.py` und `notebooks/13_prereg_evaluation.ipynb` sind mit
+Commit `97d4104` gepusht (erledigt). Notebooks, die vorher gestartet wurden, liefen mit `76a4a5a`;
+dort existiert Notebook 13 nicht.
 
 Der laufende Sweep hat seinen Code beim Start geklont und bemerkt den Push nicht. Wird Notebook 05
 nach einem Abbruch neu gestartet, nutzt es den neuen Code. Laut Code dieser Runde bleiben die
