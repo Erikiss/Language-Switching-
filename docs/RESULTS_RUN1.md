@@ -717,7 +717,9 @@ Notebook 13 lässt sich auch mit `REVISION = "step143000"` explorativ für H/J b
 
 ### 5.2 Checkpoint-Sweep (Notebook 05, Konto B)
 
-* Nicht anfassen, bis er fertig ist (ETA etwa 13:10 UTC). Danach die D-Manifeste von step98000 und
+* **Erledigt** am 27.10.2026 um 13:21 UTC: 27 Checkpoints, 81 Teilschritte `ok`, 0 Fehler
+  (`summary_05_scale_and_checkpoints_shard4.json`).
+* Ursprünglicher Hinweis: Nicht anfassen, bis er fertig ist (ETA etwa 13:10 UTC). Danach die D-Manifeste von step98000 und
   step99000, `plan`/`runs` und `summary_05_scale_and_checkpoints_shard4.json` prüfen. Ist die
   Sitzung abgebrochen, Notebook 05 mit `REUSE = True` neu starten: fertige Paare werden
   übersprungen, D setzt aus `_resume` fort.
@@ -741,7 +743,7 @@ Allgemein gilt:
 | 1 | 11 (Stand-in) | neues Design (12 Prompts reihum, ε 0.3, `v_src` je Quell-Layer); der alte Lauf zählt nicht mehr als Voraussetzung für 18T | etwa 2 min (Lauf 1: 1.92 min) |
 | 2 | 12 ab Schritt 2 | `REUSE = True`, `FORCE_STEPS` leer: die Serialisierung setzt bei den fehlenden Chunks fort, der Split läuft erstmals, Vokabular bis Stufe L werden neu gerechnet, das Modell mit dem leeren Vokabular wird nach `….stale-<Zeit>` verschoben | etwa 3–6 h (CPU mit viel RAM für serialize/split/vocab, A100 für den Rest), etwa 40–70 CU |
 | 3 | 06 (G) | stratifiziertes n-Matching, euklidische T3-Layerwahl, `split`/`p_boot`; T5 nur mit D im selben Konto | Lauf 1: 37 min |
-| 4 | 07 (H), step98000 | Splits, Regel ρ = 0, `lambda_features_frozen`, `sign_as_expected` | etwa 7 min |
+| 4 | 07 (H), step98000 | Splits, Regel ρ = 0, `lambda_features_frozen`, `sign_as_expected`. **Nur einmal rechnen: auf Konto B mit SAE (§5.4)**, nicht zusätzlich auf Konto A. Sonst gibt es zwei H-Läufe bei 98k, und die Auswertung nimmt den, der zuletzt fertig wurde | etwa 7 min |
 | 5 | 08 (I) | eine präregistrierte Dosis, Intervallregel, `p_boot` (damit 13/14 in die BH-Gruppe kommen), Arm `residual_abs`, Head-Audit | Lauf 1: 8.76 min |
 | 6 | 07 (H), step99000 | Endpunkt 11 verlangt 98k/99k, nur 98k liegt vor | etwa 7 min |
 | 7 | 13 (CPU) | Auswertung nach den Neuläufen | Minuten |
@@ -759,12 +761,15 @@ Optional:
 
 Ziel: Endpunkt 10(i) und `sharing` am präregistrierten Checkpoint, verglichen mit 143k.
 
-1. **Nach dem Ende des Sweeps auf Konto B:** Notebook 01 mit `USE_SAE = True` bei `step98000`.
+1. **Auf Konto B (der Sweep ist fertig):** Notebook 01 mit `USE_SAE = True` bei `step98000`.
    Stufe B schreibt die SAE-Güte in `runs/B/pythia-160m@step98000/directions_meta.json`
    (`bank_meta.sae`: `fvu`, `certified` = fvu ≤ 0.4). H und J speichern sie nicht. Konto B hat
    noch keinen `runs/B@step98000`, die Bank, auf die sich D in Konto A beruft, bleibt also
    unberührt.
-2. Danach 07 und 09 mit `USE_SAE = True`, `REUSE = False`, `step98000`.
+2. Danach 07 und 09 mit `USE_SAE = True`, `REUSE = False`, `step98000`, ebenfalls auf Konto B. Sie
+   überschreiben die alten H- und J-Läufe von Lauf 1 dort. Dieser H-Lauf ersetzt Zeile 4 aus §5.3: Mit
+   SAE rechnet Stufe H dieselben Tabellen und zusätzlich die SAE-Spalten (die Zufallsrichtungen der
+   Bank hängen nicht am SAE).
 3. Lesart:
    * Ist das SAE bei 98k zertifiziert (FVU ≤ 0.4), ist 10(i) bei 98k auswertbar. Die Notebooks
      vermerken „nur bei step143000 zertifizierbar“; gemessen ist das bei 98k bisher nicht.
