@@ -4594,7 +4594,7 @@ def nb_13() -> list[tuple[str, str]]:
 
             Nach dem Einbinden erscheint sie als `/content/drive/MyDrive/LSNE_B`; die Konfigurationszelle nimmt
             `LSNE_B/runs` (und `LSNE_B/runs_trace`) dann automatisch dazu. Andere Wurzeln lassen sich im Feld
-            `RUN_ROOTS_TEXT` oder in der Eingabeaufforderung komma-getrennt angeben.
+            `RUN_ROOTS_TEXT` (komma-getrennt) oder mit `ASK = True` in einer Eingabeaufforderung angeben.
             """
         ),
         drive_cell(),
@@ -4609,7 +4609,7 @@ def nb_13() -> list[tuple[str, str]]:
             SEED = 0
             FROZEN_DOSE = None                 # auf DEV01-DEV04 eingefrorene Schadensdosis (z. B. 0.05); None = alle Dosen berichten
             RUN_ROOTS_TEXT = ""  # @param {type:"string"}
-            ASK = True                         # True: nach den Wurzeln fragen, wenn RUN_ROOTS_TEXT leer ist (Enter = Standard)
+            ASK = False                        # True: nach den Wurzeln fragen, wenn RUN_ROOTS_TEXT leer ist (Enter = Standard)
 
             MYDRIVE = "/content/drive/MyDrive"
             default_roots = [os.path.join(MYDRIVE, base, child) for base in ("LSNE", "LSNE_B") for child in ("runs", "runs_trace")
