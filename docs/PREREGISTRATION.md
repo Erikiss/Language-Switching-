@@ -118,10 +118,12 @@ Hypothesen für eine spätere Bestätigung formuliert, nicht als Ergebnis dieses
 
 ## 6. Nachträge nach Lauf 1 (27.10.2026, nach Sichtung der Daten)
 
-Der Tag `prereg-v1` wurde am 27.10.2026 **nachträglich** gesetzt, auf Commit `58ec270`
-(26.10.2026, 00:41 UTC). Das ist die letzte Änderung an diesem Dokument vor dem ersten Lauf
-(erster Lauf ab 26.10.2026, 12:45 UTC, Code-Stand `a018239`). Abschnitte 1–5 sind seitdem
-unverändert.
+Maßgeblicher Stand der Präregistrierung ist Commit `58ec270`
+(`58ec27063e5bfd237bca69523e5199dd00e27422`, 26.10.2026, 00:41 UTC). Das ist die letzte
+Änderung an diesem Dokument vor dem ersten Lauf (erster Lauf ab 26.10.2026, 12:45 UTC,
+Code-Stand `a018239`). Abschnitte 1–5 sind seitdem unverändert. Der Tag `prereg-v1` ist nur
+ein Lesezeichen auf diesen Commit und wird **nachträglich** gesetzt (Festlegung 27.10.2026);
+maßgeblich ist der Hash.
 
 Die folgenden Punkte wurden **nach** Sichtung von Lauf 1 festgelegt. Es sind Klarstellungen
 von Lücken des Textes oben, keine Änderungen der Hypothesen. Ergebnisse, die von ihnen
