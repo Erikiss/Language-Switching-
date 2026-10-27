@@ -48,6 +48,13 @@ the controlled probes, the length-residualised alignment and stage L with
 ``trace:<model_dir>``.  It shares the setup, Drive, runner and substage cells; its
 pipeline steps call ``python -m lsne.chain.cli`` in subprocesses (logs on Drive, step
 markers for resuming) and ``SMOKE = True`` runs every cell on the Xatu test fixture.
+
+Notebook 13 (``13_prereg_evaluation``, CPU runtime: no accelerator metadata) evaluates the
+pre-registered endpoints from the run directories already on Drive (``lsne.prereg_eval``):
+setup, Drive, the run roots (``MyDrive/LSNE/runs`` plus the ``LSNE_B`` shortcut of the
+second account, asked for in the configuration cell), the evaluation, the run / result
+tables, the markdown report, one overview figure and the summary json.  It loads no model
+and never opens the stage-F sweep.
 """
 from __future__ import annotations
 
@@ -82,7 +89,10 @@ NOTEBOOKS: dict[str, tuple[str, str]] = {
     "10_ttt_injection": ("K", "Test-Time-Training als strukturelle Injektion"),
     "11_transplant": ("L", "Cross-Modell-Transplantation"),
     "12_trace_source": ("L", "Spurenmodell 2016 als Quelle (A100)"),
+    "13_prereg_evaluation": ("A-L", "Präregistrierte Auswertung der vorhandenen Läufe"),
 }
+#: notebooks that need no GPU: Colab opens them on a CPU runtime (no accelerator metadata)
+CPU_NOTEBOOKS = ("13_prereg_evaluation",)
 
 
 # ======================================================================================
@@ -346,6 +356,18 @@ def runner_cell() -> tuple[str, str]:
         os.makedirs(FIG_DIR, exist_ok=True)
 
 
+        def stage_status(stage: str, rd, status: str) -> dict:
+            \"\"\"Report entry of a finished stage: a stale error.txt of an earlier failed run is removed
+            (the manifest says ok) and failed substages (G-L, manifest.json -> substages) are listed;
+            the status then reads ok_with_substage_errors / reused_with_substage_errors.\"\"\"
+            if C.clear_stale_error(rd.path):
+                print(f"Stufe {stage}: veraltete error.txt eines früheren Laufs entfernt ({rd.path})")
+            sub = C.substage_status(rd.path, status)
+            for name, err in sub["substage_errors"].items():
+                print(f"Stufe {stage}: Substufe {name} FEHLER: {err}")
+            return sub
+
+
         def run_stage(stage: str, reuse=None, **kw):
             \"\"\"Run one stage; on failure print the traceback, write error.txt and continue.\"\"\"
             reuse = REUSE if reuse is None else reuse
@@ -356,7 +378,7 @@ def runner_cell() -> tuple[str, str]:
                     m = read_manifest(rd)
                     if m.get("status") == "ok" and m.get("tables"):
                         results[stage] = {name: load_df(rd, name) for name in m["tables"]}
-                        report[stage] = dict(status="reused", run_dir=str(rd.path), seconds=0.0, error="")
+                        report[stage] = dict(run_dir=str(rd.path), seconds=0.0, error="", **stage_status(stage, rd, "reused"))
                         print(f"Stufe {stage}: vorhandene Ergebnisse geladen aus {rd.path} "
                               f"(REUSE=False erzwingt Neuberechnung)")
                         return results[stage]
@@ -365,8 +387,10 @@ def runner_cell() -> tuple[str, str]:
             print(f"Stufe {stage} ({STAGE_TITLES[stage]}) -> {rd.path}", flush=True)
             try:
                 results[stage] = STAGES[stage].run(cfg, mb, rd, ctx=ctx, limits=limits, **kw)
-                report[stage] = dict(status="ok", run_dir=str(rd.path), seconds=time.perf_counter() - t0, error="")
-                print(f"Stufe {stage} ok in {report[stage]['seconds']:.0f} s: {', '.join(sorted(results[stage]))}")
+                report[stage] = dict(run_dir=str(rd.path), seconds=time.perf_counter() - t0, error="",
+                                     **stage_status(stage, rd, "ok"))
+                print(f"Stufe {stage} {report[stage]['status']} in {report[stage]['seconds']:.0f} s: "
+                      f"{', '.join(sorted(results[stage]))}")
             except Exception as e:
                 traceback.print_exc()
                 C.write_error(rd, stage, e, cfg, mb)
@@ -418,11 +442,22 @@ def summary_cell() -> tuple[str, str]:
         with guarded("Zusammenfassung schreiben"):
             import datetime
 
+            # failed substages (stages G-L) from the manifests: a stage whose table is an empty default
+            # must not read plain "ok" in the summary (reused stages included)
+            for st, r in report.items():
+                if r.get("status") in ("ok", "reused") and r.get("run_dir"):
+                    r.update(C.substage_status(r["run_dir"], r["status"]))
+            substage_errors = {st: r["substage_errors"] for st, r in report.items() if r.get("substage_errors")}
+            status_overall = ("error" if any(r.get("status") == "error" for r in report.values())
+                              else "substage_errors" if substage_errors else "ok")
+            if substage_errors:
+                print("ACHTUNG, fehlgeschlagene Substufen:", substage_errors)
             summary = dict(
                 notebook=NOTEBOOK, stage=STAGE, model=spec.name, revision=spec.revision, dtype=spec.dtype,
                 device=str(mb.device), n_layers=mb.n_layers, d_model=mb.d_model, smoke=bool(SMOKE),
                 families=FAMILIES, seed=SEED, out_root=OUT_ROOT, runs_root=RUNS_ROOT, cli_command=CLI_COMMAND,
                 timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                status_overall=status_overall, substage_errors=substage_errors,
                 report=report,
                 tables={st: {n: int(len(df)) for n, df in r.items()} for st, r in results.items()},
                 figures=sorted(f for f in os.listdir(FIG_DIR) if f.endswith(".png")),
@@ -829,8 +864,12 @@ def nb_02() -> list[tuple[str, str]]:
                 plt.show()
                 boot = table("C", "contrasts_boot")
                 if len(boot):
-                    print("Vorab berechnete Kontraste (Stufe C, inkl. I pro Richtung/Dosis):")
-                    show(boot[boot["quantity"] == "T"])
+                    print("Vorab berechnete Kontraste (Stufe C, inkl. I pro Richtung/Dosis; split all = alle Familien "
+                          "gepoolt, test = F01-F12 × {A, B} und dev = DEV01-DEV04 als Familienmittel):")
+                    show(boot[boot["quantity"].isin(["T", "T_C3_minus_C1"])])
+                    if "preregistered" in boot:
+                        print("Bestätigungszeilen (preregistered: Kontraste 1, 2, 3, 6 auf den Testfamilien):")
+                        show(boot[boot["preregistered"].astype(str).str.lower().eq("true")], n=60)
             """
         ),
         code(
@@ -1820,6 +1859,9 @@ def nb_06() -> list[tuple[str, str]]:
             # (raw values of clouds with different n are not comparable; both are reported).
             with guarded("G1 Kontraktion"):
                 cb = table("G", "contraction_boot")
+                # confirmation set (test families F01-F12) when the run has it, else all families
+                split = "test" if "split" in cb and (cb["split"] == "test").any() else "all"
+                cb = cb[cb["split"] == split] if "split" in cb else cb
                 k_def = 5 if 5 in set(cb["k"]) else int(cb["k"].iloc[0])
                 fig, axes = plt.subplots(1, 2, figsize=(12, 4))
                 for ax, (q, ro) in zip(axes, [("d_log_volume", "mean"), ("d_participation_ratio", "last")]):
@@ -1832,7 +1874,8 @@ def nb_06() -> list[tuple[str, str]]:
                                     marker="o", ms=4, capsize=2, lw=2 if pre else 1, label=f"K={K} {Cc}" + (" (präregistriert)" if pre else ""))
                     ax.axhline(0, color="k", lw=0.6)
                     ax.set_xlabel("Snapshot ℓ")
-                    ax.set_title(f"{q} ({ro}-Readout, k={k_def}); 95 %-CI aus {limits.n_boot} Familien-Bootstraps", fontsize=9)
+                    ax.set_title(f"{q} ({ro}-Readout, k={k_def}, Familien: {split}); 95 %-CI aus {limits.n_boot} "
+                                 f"Familien-Bootstraps", fontsize=9)
                     ax.legend(fontsize=7)
                 savefig("g1_contraction")
                 plt.show()
@@ -1898,7 +1941,8 @@ def nb_06() -> list[tuple[str, str]]:
                 top = sb[sb["quantity"] == "cos_at_max_disp_layer"]
                 if len(top):
                     print("Präregistrierter Kontrast 9: Kosinus im Layer maximaler Verschiebung (Familien-Bootstrap):")
-                    show(top[["inject_site", "eps", "preregistered", "min_effect_met", "mean", "ci_low", "ci_high", "n_clusters"]])
+                    show(top[[c for c in ["inject_site", "eps", "split", "preregistered", "confirmatory", "min_effect_met", "mean",
+                                          "ci_low", "ci_high", "n_clusters"] if c in top.columns]])
             """
         ),
         code(
@@ -2047,8 +2091,11 @@ def nb_07() -> list[tuple[str, str]]:
             with guarded("Spearman-Korrelationen"):
                 lb = table("H", "lambda_boot")
                 pre = lb[truthy(lb["preregistered"])]
-                print("Präregistrierte Zeilen (target_logit; erwartete Vorzeichen: sae_fvu < 0, mahal_to_ref_mean < 0, steps_to_cross offen):")
-                show(pre[["discriminant", "quantity", "expected_sign", "sign_as_expected", "mean", "ci_low", "ci_high", "n_clusters"]])
+                print("Präregistrierte Zeilen (target_logit; erwartete Vorzeichen: sae_fvu < 0, mahal_to_ref_mean < 0, steps_to_cross offen; "
+                      "split all = alle Starts, dev = DEV01-DEV04, test = F01-F12 × {A, B} = Bestätigung):")
+                show(pre[[c for c in ["discriminant", "quantity", "split", "confirmatory", "expected_sign", "sign_as_expected", "mean",
+                                      "ci_low", "ci_high", "n_clusters", "n_constant_as_zero"] if c in pre.columns]])
+                lb = lb[lb["split"] == "all"] if "split" in lb else lb
                 quants = [q for q in ["steps_to_cross", "mahal_to_ref_mean", "knn_mean_dist", "sae_fvu", "local_log_volume", "B", "entropy",
                                       "kl_from_base", "path_length", "tortuosity"] if q in set(lb["quantity"])]
                 sub = lb[lb["quantity"].isin(quants)]
@@ -2100,6 +2147,11 @@ def nb_07() -> list[tuple[str, str]]:
                     print("Nur bei λ=0 aktiv (Artefakt-Kandidaten) bzw. nur bei λ>0 aktiv (Repräsentations-Kandidaten):")
                     show(fs[(fs["n_active_only_lambda0"] > 0) | (fs["n_active_only_lambda_pos"] > 0)]
                          .sort_values(["n_active_only_lambda_pos", "n_active_only_lambda0"], ascending=False), n=30)
+                    fz = table("H", "lambda_features_frozen")
+                    print(f"Kontrast 10: auf DEV01-DEV04 eingefrorene Kandidaten (|mittleres ρ| ≥ 0,7): {len(fz)}; "
+                          f"auf F01-F12 × {{A, B}} bestätigt: {int(truthy(fz['confirmed']).sum()) if len(fz) else 0}")
+                    if len(fz):
+                        show(fz.sort_values("rho_mean_dev"), n=40)
             """
         ),
         code(
@@ -2286,7 +2338,10 @@ def nb_08() -> list[tuple[str, str]]:
                 q = db[db["quantity"] == "B_cs_minus_lang_dom"]
                 if len(q):
                     print("Präregistrierter Kontrast 13: B(dom_culture_politics nach Gegensteuern) − B(lang_dom), Familien-Bootstrap, Mindesteffekt 0,05 nats:")
-                    show(q[["family_domain", "K", "C", "eps", "preregistered", "min_effect_met", "mean", "ci_low", "ci_high", "n_clusters"]])
+                    show(q[[c for c in ["family_domain", "K", "C", "eps", "preregistered", "min_effect_met", "verdict", "mean", "ci_low",
+                                        "ci_high", "n_clusters"] if c in q.columns]])
+                    print("min_effect_met nach der CI-Regel (ganzes Intervall ≥ 0,05 nats); präregistriert ist genau eine Dosis:",
+                          manifest_I.get("contrast_13_eps") if isinstance(globals().get("manifest_I"), dict) else "")
                     if not truthy(q["preregistered"]).any():
                         print("Hinweis: die präregistrierte Zeile braucht Kultur/Politik-Familien (F13–F16) im Lauf (FAMILIES = None).")
                 T = table("I", "direction_domain_T")
@@ -2349,7 +2404,8 @@ def nb_08() -> list[tuple[str, str]]:
                 savefig("head_steering")
                 plt.show()
                 if len(hb):
-                    print("B_head − B_residual pro (Richtung, Dosis), Familien-Bootstrap:")
+                    print("B_head − B_residual pro (Richtung, Dosis), Familien-Bootstrap; dose_match relative = gleiche relative Dosis "
+                          "(präregistrierter Wortlaut), absolute = gleiche absolute Norm ||δ|| wie der Head-Arm (delta_norm_ratio):")
                     show(hb)
                 if len(std):
                     print("Realisierte Richtung im Residualstrom (Kosinus) und Urbild-Fehler des Head-Arms:")
@@ -2479,6 +2535,11 @@ def nb_09() -> list[tuple[str, str]]:
                 show(rs.sort_values(["preregistered", "contrast", "basis"], ascending=[False, True, True]), n=60)
                 if "culture_politics_vs_misfolding" not in contrasts:
                     print("Hinweis: der präregistrierte Kontrast Kultur/Politik ↔ Fehlfaltung braucht die Familien F13–F16 und F19–F20 (FAMILIES = None).")
+                r16 = manifest_J.get("rule16") if isinstance(globals().get("manifest_J"), dict) else None
+                if r16:
+                    # Regel 16: ersetzt das Pile-Ranking den Gegenpol, ist Kontrast 15 gegen Fehlfaltung NICHT präregistrierte Form
+                    print("Regel 16 / Kontrast 15:", r16.get("note"), "| Gegenpol (Regel 16):", r16.get("counterpole_rule16"),
+                          "| ausgewerteter Pol:", r16.get("evaluated_pole"), "| präregistrierte Form:", r16.get("preregistered_form"))
                 print("Erklärter Anteil (nicht z) der Domänenachsen-Basis pro Layer:")
                 show(pooled[pooled["basis"] == "domain_axes"].pivot_table(index="contrast", columns="layer", values="explained"))
                 stab = table("J", "rdx_stability")
@@ -2895,6 +2956,17 @@ TRACE_PLAN_HOURS = {
     "oov_heldout": (0.05, 0.2), "train": (0.8, 1.5), "evaluate": (0.5, 0.75), "probes": (0.5, 1.0),
     "pair": (0.03, 0.15), "align": (0.1, 0.35), "stage_L": (0.33, 1.0),
 }
+#: prerequisites of every notebook-12 pipeline step (step markers under <TRACE_ROOT>/steps; the probe_<name>
+#: steps share "probe"): a step runs only after each prerequisite ended ok and produced something
+#: (TRACE_STEP_PRODUCT), and its marker is stale once a prerequisite finished after it
+TRACE_STEP_DEPS = {
+    "download": (), "serialize": ("download",), "split": ("serialize",), "vocab": ("split",),
+    "oov_heldout": ("vocab",), "train": ("serialize", "vocab"), "evaluate": ("train",), "probe": ("train",),
+    "pair": ("serialize",), "align": ("train", "pair"), "stage_L": ("train",),
+}
+#: marker field that must be > 0 before a step that ended ok counts as having produced something
+TRACE_STEP_PRODUCT = {"serialize": "n_shards", "split": "train_tx", "vocab": "train_tx", "oov_heldout": "n_val_tx",
+                      "train": "n_train_tx", "pair": "n_pairs"}
 
 
 def _trace_header() -> tuple[str, str]:
@@ -2945,17 +3017,29 @@ def _trace_header() -> tuple[str, str]:
         durchgereichte ETH und Rückzahlungen heben sich auf; auch im sichtbaren 512-Token-Fenster) gegen
         fan-out = 1, 1:1 innerhalb der Ära auf die ITR-Länge gematcht (Faktor 1,25), Difference-of-Means der
         gemittelten Residuen am letzten Snapshot. Die Richtung **zählt** nur, wenn das 95-%-Bootstrap-KI von Δ = AUC_trainiert − AUC_untrainiert
-        über 0 liegt und die trainierte AUC über dem 95-%-Quantil der Permutations-Null (`criterion.csv` →
-        `counts`; Kontrast `trace_probe` in Stufe L). Stufe L behauptet einen Effekt
+        über 0 liegt, die trainierte AUC über dem 95-%-Quantil der Permutations-Null (`criterion.csv` →
+        `counts`; Kontrast `trace_probe` in Stufe L) **und** über der Oberflächen-Baseline derselben Paare
+        (`beats_surface`, `counts_beyond_surface`; strengere Ergänzung vom 27.10.2026, in `frozen_feature.json`
+        unter `amendments` vermerkt, keine Änderung des Merkmals). Stufe L behauptet einen Effekt
         (`trace_verdict.sharing_effect_claimed`) nur, wenn zusätzlich das residualisierte Alignment
-        (Hold-out-R² > 0, Abstand zur Permutations-Null ≥ 0,2) und ein Effekt auf B oder T jenseits der
-        Zufalls- **und** der Permuted-Alignment-Kontrolle vorliegen. Eine Änderung des Merkmals nach dem Einfrieren wird erkannt und
+        (Hold-out-R² > 0, Abstand zur Permutations-Null ≥ 0,2) die untrainierte Kontrolle schlägt
+        (`align_beats_untrained`) und B oder T sich **in der vorab festgelegten Richtung** (B und T steigen,
+        `TRACE_EXPECTED_SIGN`) vom unveränderten Modell, von der Zufalls- **und** von der
+        Permuted-Alignment-Kontrolle unterscheidet; `trace_damage` hält fest, wie stark jede Kontrolle allein
+        log p(Ziel) gegenüber dem unveränderten Modell senkt. Eine Änderung des Merkmals nach dem Einfrieren wird erkannt und
         macht den Lauf explorativ.
 
-        Hinweise: Jede Zelle ist gegen Fehler abgesichert (Traceback, dann weiter). Alle Schritte sind
-        resumierbar: der Download überspringt vorhandene Dateien, die Serialisierung vorhandene Shards, das
-        Training setzt beim neuesten Checkpoint auf Drive fort, und mit `REUSE = True` werden erledigte Schritte
-        (Marker unter `trace_2016/steps/`) und eine fertige Stufe L übersprungen. Ohne GPU laufen nur die
+        Hinweise: Die Pipeline-Zellen (1–4b, 5a, 6a, 7a, 7b, 8b, 8c) **brechen ab** („Alle ausführen“ stoppt),
+        wenn ein Schritt scheitert oder eine Voraussetzung fehlt oder nichts erzeugt hat (Schritt-Marker unter
+        `trace_2016/steps/`, `STEP_DEPS`); die Bericht- und Plot-Zellen sind abgesichert (Traceback, dann weiter).
+        Die Zusammenfassung lässt sich nach einem Abbruch einzeln ausführen; `counts_for_prereg` verlangt, dass
+        jeder Schritt ok endete. Alle Schritte sind
+        resumierbar: der Download überspringt vorhandene Dateien, die Serialisierung vorhandene Shards (ein
+        gescheiterter Chunk oder ein toter Worker wird mit weniger Workern wiederholt, fehlende Chunks werden
+        genannt), das Training setzt beim neuesten Checkpoint auf Drive fort, und mit `REUSE = True` werden erledigte Schritte
+        (Marker unter `trace_2016/steps/`) und eine fertige Stufe L übersprungen; ein Marker, dessen Voraussetzung
+        später neu gerechnet wurde, gilt als veraltet (der Schritt läuft neu), und ein Modell mit anderem
+        Vokabular wird beiseitegelegt (`<modell>.stale-<Zeit>`, nichts wird gelöscht). Ohne GPU laufen nur die
         Schritte 1–3 (dafür genügt eine CPU-Laufzeit). `SMOKE = True` rechnet alles in wenigen Minuten auf der
         CPU mit der Test-Fixture (2 echte Chunks, 15 Transaktionen), einem `tiny`-Modell und `pythia-14m`
         (Rauchtest, keine wissenschaftliche Aussage).
@@ -3074,6 +3158,7 @@ def _trace_config_cell() -> tuple[str, str]:
         SAVE_EVERY, KEEP_CHECKPOINTS = 2_000, 2      # ein Checkpoint (Gewichte + AdamW) ≈ 1,2 GB auf Drive
         BF16 = "on"                        # "on" (A100) | "auto" (bf16, wenn die GPU es kann) | "off"
         TRAIN_DEVICE = "auto"
+        MAX_OOV_ADDRESS = 0.5              # Training bricht ab, wenn mehr Adressen der Trainings-Tx [A_OOV] sind (1 = keine Prüfung)
         A100_PEAK_FLOPS = 312e12           # bf16 dense (NVIDIA-Datenblatt): Bezug der Auslastung (MFU)
 
         # 5 Evaluation
@@ -3191,8 +3276,15 @@ def _trace_config_cell() -> tuple[str, str]:
                       direction="difference of means" if not TRACE_DIRECTION else f"file:{TRACE_DIRECTION}",
                       criterion="95% bootstrap CI of AUC_trained - AUC_untrained above 0 and AUC_trained above the "
                                 "permutation p95 (criterion.csv: counts)", size=SIZE)
+        # stricter-only amendments of the decision rule (never of the feature): recorded once with their date under
+        # "amendments" in frozen_feature.json; they do not make FROZEN_CHANGED (docs/TRACE_SOURCE.md §13)
+        FROZEN_AMENDMENTS = dict(
+            beats_surface="AUC_trained at the frozen snapshot also above the surface-baseline AUC of the same matched pairs "
+                          "(criterion.csv: beats_surface, counts_beyond_surface; trace_verdict.probe_ok); added 2026-10-27 "
+                          "after the first A100 run (surface AUC 0.993 > trained 0.967 at the frozen layer), stricter only")
         FROZEN_PATH = os.path.join(TRACE_ROOT, "frozen_feature.json")
         FROZEN_CHANGED = False
+        _now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         if os.path.exists(FROZEN_PATH):
             with open(FROZEN_PATH, encoding="utf-8") as _f:
                 _old = json.load(_f)
@@ -3203,9 +3295,16 @@ def _trace_config_cell() -> tuple[str, str]:
                       "\n  -> Stufe L und die Sonden gelten als EXPLORATIV (Präregistrierung 18).")
             else:
                 print("Eingefrorenes Merkmal unverändert seit", _old.get("frozen_at"))
+            _new = {k: dict(rule=v, amended_at=_now) for k, v in FROZEN_AMENDMENTS.items() if k not in (_old.get("amendments") or {})}
+            if _new:
+                _old.setdefault("amendments", {}).update(_new)
+                with open(FROZEN_PATH, "w", encoding="utf-8") as _f:
+                    json.dump(_old, _f, indent=1)
+                print("Strengere Ergänzung des Kriteriums vermerkt:", sorted(_new))
         else:
             with open(FROZEN_PATH, "w", encoding="utf-8") as _f:
-                json.dump(dict(spec=FROZEN, frozen_at=datetime.datetime.now(datetime.timezone.utc).isoformat()), _f, indent=1)
+                json.dump(dict(spec=FROZEN, frozen_at=_now,
+                               amendments={k: dict(rule=v, amended_at=_now) for k, v in FROZEN_AMENDMENTS.items()}), _f, indent=1)
             print("Merkmal eingefroren ->", FROZEN_PATH)
 
         # result holders (the summary cell never fails on a skipped step)
@@ -3257,12 +3356,38 @@ def _trace_helpers_cell() -> tuple[str, str]:
             return os.path.join(STEP_DIR, f"{name}.json")
 
 
+        #: prerequisites of every pipeline step and the marker field a step must have produced (> 0); see below
+        STEP_DEPS = {{STEP_DEPS}}
+        STEP_PRODUCT = {{STEP_PRODUCT}}
+        STEP_OK = ("ok", "reused", "skipped_smoke")
+
+
+        class StepFailed(RuntimeError):
+            # a pipeline step failed or a prerequisite is missing: pipeline() re-raises it and "Run all" stops there
+            pass
+
+
+        def step_group(name: str) -> str:
+            return "probe" if name.startswith("probe_") else name
+
+
+        def step_record(name: str) -> dict:
+            # this session's record of `name`, else the marker of an earlier session
+            return STEP_LOG.get(name) or read_json(step_file(name), {}) or {}
+
+
         def step_done(name: str) -> bool:
-            # True when an earlier session finished `name` (marker with status ok), REUSE is on and it is not forced
+            # True when an earlier session finished `name` (marker with status ok), REUSE is on, it is not forced and no
+            # prerequisite was recomputed after it (then the marker is stale and the step runs again)
             if not REUSE or name in FORCE_STEPS:
                 return False
             rec = read_json(step_file(name))
             if not rec or rec.get("status") != "ok":
+                return False
+            newer = [d for d in STEP_DEPS.get(step_group(name), ())
+                     if str(step_record(d).get("finished") or "") > str(rec.get("finished") or "")]
+            if newer:
+                print(f"[{name}] Marker vom {rec.get('finished')} ist veraltet: {newer} danach neu gerechnet -> wird neu berechnet")
                 return False
             STEP_LOG.setdefault(name, dict(rec, status="reused", wall_s_first_run=rec.get("wall_s"), wall_s=0.0))
             print(f"[{name}] bereits erledigt am {rec.get('finished')} ({rec.get('wall_s')} s); "
@@ -3276,6 +3401,55 @@ def _trace_helpers_cell() -> tuple[str, str]:
             with open(step_file(name), "w", encoding="utf-8") as f:
                 json.dump(C.to_jsonable(rec), f, indent=1)
             return rec
+
+
+        def require(name: str) -> None:
+            # raise StepFailed (and mark `name` as error) unless every prerequisite ended ok and produced something
+            bad = []
+            for dep in STEP_DEPS.get(step_group(name), ()):
+                rec = step_record(dep)
+                if rec.get("status") not in STEP_OK:
+                    bad.append(f"{dep}: {rec.get('status') or 'nicht gelaufen'}" + (f" ({rec['error']})" if rec.get("error") else ""))
+                elif dep in STEP_PRODUCT and rec.get("status") != "skipped_smoke" and not (rec.get(STEP_PRODUCT[dep]) or 0) > 0:
+                    bad.append(f"{dep}: {STEP_PRODUCT[dep]} = {rec.get(STEP_PRODUCT[dep])} (nichts erzeugt)")
+            if bad:
+                msg = f"[{name}] Voraussetzung fehlt: " + "; ".join(bad)
+                mark_step(name, "error", 0.0, error=msg)
+                raise StepFailed(msg + " -> den fehlgeschlagenen Schritt beheben und ab dort erneut ausführen")
+
+
+        def step_failed(name: str, msg: str, t0: float, **info):
+            # mark `name` as error and stop "Run all"
+            mark_step(name, "error", time.time() - t0, error=msg, **info)
+            raise StepFailed(f"[{name}] {msg}")
+
+
+        @contextlib.contextmanager
+        def pipeline(title: str, name: str = None):
+            # a pipeline section: unlike guarded(), every exception is re-raised so that "Run all" stops here instead of
+            # running later steps on missing inputs; the marker of `name` records the error (unless the section wrote one)
+            print("==", title)
+            t_in, t0 = now_utc(), time.time()
+            try:
+                yield
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                rec = STEP_LOG.get(name) if name else None
+                if name and not (rec and rec.get("status") == "error" and str(rec.get("finished") or "") >= t_in):
+                    mark_step(name, "error", time.time() - t0, error=repr(e)[:800])
+                print(f"[{title}] FEHLGESCHLAGEN: {e!r}\n  -> 'Alle ausführen' stoppt hier; die Ursache beheben und ab dieser "
+                      "Zelle erneut ausführen (erledigte Schritte werden übersprungen). Die Zusammenfassung (letzte Zelle) lässt "
+                      "sich einzeln ausführen.", flush=True)
+                raise
+
+
+        def stale_aside(path: str, why: str) -> str:
+            # move an output that belongs to other inputs out of the way (nothing is deleted)
+            dst = f"{path}.stale-{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+            shutil.move(path, dst)
+            print(f"{path} beiseitegelegt -> {dst} ({why})")
+            return dst
 
 
         def run_cli(name: str, args: list, module: str = "lsne.chain.cli") -> int:
@@ -3341,7 +3515,8 @@ def _trace_helpers_cell() -> tuple[str, str]:
                 shutil.copy(os.path.join(ITR, "serialize_params.json"), os.path.join(PROBE_ITR, "serialize_params.json"))
             print(f"Sondenkorpus: {len(keep)} von {len(shards)} Shards -> {PROBE_ITR}")
             return PROBE_ITR
-        """
+        """,
+        STEP_DEPS=repr(TRACE_STEP_DEPS), STEP_PRODUCT=repr(TRACE_STEP_PRODUCT),
     )
 
 
@@ -3402,7 +3577,7 @@ def nb_12() -> list[tuple[str, str]]:
             # --- 1. Download (resumierbar) --------------------------------------------------------------
             # CLI per range: python -m lsne.chain.cli download --from A --to B --every 1 --tables <TABLES> \
             #                    --cache <OUT_ROOT>/cache/xatu --workers 16 --retries 6
-            with guarded("1. Download"):
+            with pipeline("1. Download", "download"):
                 if SMOKE:
                     print("SMOKE: kein Download; Fixture-Chunks", cached_starts(CACHE_DIR, "traces"), "aus", CACHE_DIR)
                     STEP_LOG["download"] = dict(status="skipped_smoke", wall_s=0.0)
@@ -3422,10 +3597,11 @@ def nb_12() -> list[tuple[str, str]]:
                     dl = pd.concat(logs, ignore_index=True) if logs else pd.DataFrame(columns=["ok", "bytes"])
                     info = dict(n_files=int(len(dl)), n_ok=int(dl["ok"].astype(bool).sum()), gb=float(dl["bytes"].sum()) / 1e9,
                                 failed_ranges=failed)
-                    mark_step("download", "ok" if not failed else "error", time.time() - t0, **info)
                     print(info)
                     if failed:
-                        print("Fehlgeschlagene Bereiche: Zelle erneut ausführen (vorhandene Dateien werden übersprungen).")
+                        step_failed("download", f"{len(failed)} Bereiche fehlgeschlagen: {failed}; Zelle erneut ausführen "
+                                    "(vorhandene Dateien werden übersprungen)", t0, **info)
+                    mark_step("download", "ok", time.time() - t0, **info)
                 print("traces-Chunks im Cache:", len(cached_starts(CACHE_DIR, "traces")))
             """
         ),
@@ -3434,21 +3610,35 @@ def nb_12() -> list[tuple[str, str]]:
             ## 2. Serialisierung (ITR, BlockGPT-Format)
 
             Ein gzip-JSON-Lines-Shard pro Chunk mit Tokens, Teilen-Merkmalen, Ära, Label und englischem Text
-            (`render_text`); `--workers` Prozesse, vorhandene Shards werden übersprungen.
+            (`render_text`); `--workers` Prozesse, vorhandene Shards werden übersprungen. `serialize_params.json`
+            wird vor dem ersten Chunk geschrieben; ein gescheiterter Chunk oder ein toter Worker (`BrokenProcessPool`,
+            im ersten A100-Lauf fehlten danach 558 von 2 135 Chunks) wird mit halb so vielen Workern wiederholt, zuletzt
+            Chunk für Chunk mit einem Worker. Fehlt danach noch ein Chunk, endet die CLI mit Code 2 und nennt ihn, und
+            die Zelle bricht ab (erneut ausführen setzt bei den fehlenden Chunks fort).
             """
         ),
         code(
             r"""
             # --- 2. Serialisierung mit Worker-Prozessen ----------------------------------------------------
             # CLI: python -m lsne.chain.cli serialize --cache <CACHE_DIR> --from 778000 --to 2913000 --out <ITR> --workers <n>
-            with guarded("2. Serialisierung"):
+            with pipeline("2. Serialisierung", "serialize"):
                 if not step_done("serialize"):
+                    require("serialize")
                     t0 = time.time()
                     rc = run_cli("02_serialize", ["serialize", "--cache", CACHE_DIR, "--from", BLOCK_FROM, "--to", BLOCK_TO,
                                                   "--out", ITR, "--workers", SERIALIZE_WORKERS])
                     shards = list_shards(ITR) if os.path.isdir(ITR) else []
-                    mark_step("serialize", "ok" if rc == 0 and shards else "error", time.time() - t0, rc=rc, n_shards=len(shards),
-                              gb=sum(os.path.getsize(p) for p in shards) / 1e9)
+                    have = {int(SHARD_RE.match(os.path.basename(p)).group(1)) for p in shards}
+                    missing = sorted(s for s in cached_starts(CACHE_DIR, "traces") if BLOCK_FROM <= s < BLOCK_TO and s not in have)
+                    info = dict(rc=rc, n_shards=len(shards), n_missing=len(missing), missing=missing[:200],
+                                params=os.path.exists(os.path.join(ITR, "serialize_params.json")),
+                                gb=sum(os.path.getsize(p) for p in shards) / 1e9)
+                    if rc != 0 or not shards or missing or not info["params"]:
+                        step_failed("serialize", f"exit {rc}, {len(shards)} Shards, {len(missing)} Chunks fehlen "
+                                    f"({', '.join(map(str, missing[:12]))}{' ...' if len(missing) > 12 else ''}); Log "
+                                    f"{os.path.join(LOG_DIR, '02_serialize.log')}; Zelle erneut ausführen (vorhandene Shards "
+                                    "werden übersprungen), bei Speichermangel SERIALIZE_WORKERS senken", t0, **info)
+                    mark_step("serialize", "ok", time.time() - t0, **info)
                 shards = list_shards(ITR) if os.path.isdir(ITR) else []
                 print(f"{len(shards)} Shards, {sum(os.path.getsize(p) for p in shards) / 1e9:.2f} GB unter {ITR}")
             """
@@ -3474,6 +3664,13 @@ def nb_12() -> list[tuple[str, str]]:
                 counts_path = os.path.join(ITR_TRAIN, "split_counts.json")
                 counts = read_json(counts_path, {}) or {}
                 shards = list_shards(ITR)
+                # a train shard is only reused when its source shard is not newer (a re-serialised chunk is split again)
+                counts = {b: c for b, c in counts.items() if b in {os.path.basename(f).split(".jsonl")[0] for f in shards}}
+                for fn in shards:
+                    base = os.path.basename(fn).split(".jsonl")[0]
+                    out = os.path.join(ITR_TRAIN, base + ".jsonl.gz")
+                    if base in counts and os.path.exists(out) and os.path.getmtime(fn) > os.path.getmtime(out):
+                        counts.pop(base)
                 for i, fn in enumerate(shards, 1):
                     base = os.path.basename(fn).split(".jsonl")[0]
                     out = os.path.join(ITR_TRAIN, base + ".jsonl.gz")
@@ -3505,11 +3702,14 @@ def nb_12() -> list[tuple[str, str]]:
                 return {k: int(sum(c[k] for c in counts.values())) for k in ("train_tx", "val_tx", "train_tokens", "val_tokens")}
 
 
-            with guarded("3a. Hash-Split"):
+            with pipeline("3a. Hash-Split", "split"):
                 if not step_done("split"):
+                    require("split")
                     t0 = time.time()
                     tot = split_train_shards()
-                    mark_step("split", "ok", time.time() - t0, val_frac=VAL_FRAC, **tot)
+                    if not tot["train_tx"]:
+                        step_failed("split", f"0 Trainings-Tx aus {len(list_shards(ITR))} Shards", t0, val_frac=VAL_FRAC, **tot)
+                    mark_step("split", "ok", time.time() - t0, val_frac=VAL_FRAC, n_shards=len(list_shards(ITR_TRAIN)), **tot)
                 rec = read_json(step_file("split"), {}) or {}
                 print({k: rec.get(k) for k in ("train_tx", "val_tx", "train_tokens", "val_tokens", "val_frac")})
             """
@@ -3520,13 +3720,20 @@ def nb_12() -> list[tuple[str, str]]:
             # CLI: python -m lsne.chain.cli vocab --in <ITR_TRAIN> --out <VOCAB_DIR> --n-addresses 50000
             from lsne.chain.vocab import TraceVocab, oov_rates
 
-            with guarded("3b. Vokabular"):
+            with pipeline("3b. Vokabular", "vocab"):
                 if not step_done("vocab"):
+                    require("vocab")
                     t0 = time.time()
                     rc = run_cli("03b_vocab", ["vocab", "--in", ITR_TRAIN, "--out", VOCAB_DIR, "--n-addresses", N_ADDRESSES,
                                                "--n-selectors", N_SELECTORS, "--n-topics", N_TOPICS])
-                    mark_step("vocab", "ok" if rc == 0 else "error", time.time() - t0, rc=rc)
+                    _n = int(TraceVocab.load(VOCAB_DIR).meta.get("n_items", 0)) if rc == 0 else 0
+                    if rc != 0 or not _n:
+                        step_failed("vocab", f"exit {rc}, Vokabular aus {_n} Tx (Log {os.path.join(LOG_DIR, '03b_vocab.log')})",
+                                    t0, rc=rc, train_tx=_n)
+                    mark_step("vocab", "ok", time.time() - t0, rc=rc, train_tx=_n, size=len(TraceVocab.load(VOCAB_DIR)))
                 vocab = TraceVocab.load(VOCAB_DIR)
+                if not int(vocab.meta.get("n_items", 0)):
+                    step_failed("vocab", f"{VOCAB_DIR} wurde aus 0 Transaktionen gebaut", time.time(), train_tx=0)
                 _m = vocab.meta
                 VOCAB_INFO = dict(size=len(vocab), n_closed=_m.get("n_closed"), n_addresses=_m.get("n_addresses"),
                                   n_selectors=_m.get("n_selectors"), n_topics=_m.get("n_topics"),
@@ -3545,10 +3752,11 @@ def nb_12() -> list[tuple[str, str]]:
 
             from lsne.chain.cli import _merge_oov
 
-            with guarded("3c. Hold-out-OOV"):
+            with pipeline("3c. Hold-out-OOV", "oov_heldout"):
                 if step_done("oov_heldout"):
                     OOV = read_json(OOV_JSON, {}) or {}
                 else:
+                    require("oov_heldout")
                     t0 = time.time()
                     vocab = TraceVocab.load(VOCAB_DIR)
                     rx = re.compile(r'"tx_hash":\s*"(0x[0-9a-f]+)"')
@@ -3582,7 +3790,10 @@ def nb_12() -> list[tuple[str, str]]:
                                address_oov_vs_budget=budgets, distinct_heldout_addresses=len(addr), vocab_size=len(vocab))
                     with open(OOV_JSON, "w", encoding="utf-8") as f:
                         json.dump(C.to_jsonable(OOV), f, indent=1)
-                    mark_step("oov_heldout", "ok", time.time() - t0, n_val_tx=n_val)
+                    if not n_val:
+                        step_failed("oov_heldout", f"0 Validierungs-Tx (VAL_FRAC = {VAL_FRAC})", t0, n_val_tx=0)
+                    mark_step("oov_heldout", "ok", time.time() - t0, n_val_tx=n_val,
+                              rate_A=OOV["heldout"].get("rate_A"), rate_F=OOV["heldout"].get("rate_F"))
                 h = OOV.get("heldout", {})
                 print(f"Hold-out-OOV ({OOV.get('n_val_tx')} Tx): Adressen {h.get('rate_A', float('nan')):.2%}, "
                       f"Selektoren {h.get('rate_F', float('nan')):.2%}, Topics {h.get('rate_T', float('nan')):.2%}, "
@@ -3653,13 +3864,29 @@ def nb_12() -> list[tuple[str, str]]:
                     return False
 
 
-            with guarded("4b. Training"):
-                if train_finished():
+            def model_vocab_mismatch() -> str:
+                # why the model or checkpoints in MODEL_DIR belong to another vocabulary than VOCAB_DIR ("" = same / none)
+                v = TraceVocab.load(VOCAB_DIR)
+                if os.path.exists(os.path.join(MODEL_DIR, "vocab.json")):
+                    old = TraceVocab.load(MODEL_DIR)
+                    return "" if old.tokens == v.tokens else f"Modell mit anderem Vokabular ({len(old)} statt {len(v)} Tokens)"
+                ck = list_checkpoints(MODEL_DIR) if os.path.isdir(MODEL_DIR) else []
+                vs = (read_json(os.path.join(ck[-1][1], "config.json"), {}) or {}).get("vocab_size") if ck else None
+                return f"Checkpoint {ck[-1][1]} mit vocab_size {vs} statt {len(v)}" if ck and vs != len(v) else ""
+
+
+            with pipeline("4b. Training", "train"):
+                if step_done("train") and train_finished() and not model_vocab_mismatch():
                     print(f"Training abgeschlossen ({STEPS} Schritte):", MODEL_DIR, "| mehr Schritte: STEPS erhöhen (setzt fort); "
-                          "neues Training: MODEL_DIR löschen")
-                    STEP_LOG.setdefault("train", dict(status="reused", wall_s=0.0))
+                          "neues Training: FORCE_STEPS = {'train', ...}")
                 elif gpu_or_skip("Training"):
-                    ck = list_checkpoints(MODEL_DIR)
+                    require("train")
+                    # never resume or reuse a model of other inputs: a model with another vocabulary, or a finished model when
+                    # "train" is forced, is moved aside (a forced, unfinished training with the same vocabulary resumes)
+                    why = model_vocab_mismatch() or ("FORCE_STEPS" if "train" in FORCE_STEPS and train_finished() else "")
+                    if why and os.path.isdir(MODEL_DIR):
+                        stale_aside(MODEL_DIR, why)
+                    ck = list_checkpoints(MODEL_DIR) if os.path.isdir(MODEL_DIR) else []
                     print("Start bei Schritt", ck[-1][0] if ck else 0, "von", STEPS, f"(Checkpoints: {[s for s, _ in ck]})")
                     t0 = time.time()
                     rc = run_cli("06_train", ["train", "--in", ITR, "--vocab", VOCAB_DIR, "--size", SIZE, "--out", MODEL_DIR,
@@ -3668,8 +3895,14 @@ def nb_12() -> list[tuple[str, str]]:
                                               "--warmup", WARMUP, "--val-frac", VAL_FRAC, "--eval-every", EVAL_EVERY,
                                               "--eval-blocks", EVAL_BLOCKS, "--save-every", SAVE_EVERY,
                                               "--keep-checkpoints", KEEP_CHECKPOINTS, "--bf16", BF16, "--seed", SEED,
-                                              "--device", TRAIN_DEVICE])
-                    mark_step("train", "ok" if rc == 0 and train_finished() else "error", time.time() - t0, rc=rc)
+                                              "--device", TRAIN_DEVICE, "--max-oov-address", MAX_OOV_ADDRESS])
+                    _c = (read_json(os.path.join(MODEL_DIR, "manifest.json"), {}) or {}).get("corpus") or {}
+                    info = dict(rc=rc, n_train_tx=_c.get("n_tx_train"), oov_address_train=(_c.get("oov_train") or {}).get("rate_A"),
+                                vocab_size=len(TraceVocab.load(VOCAB_DIR)))
+                    if rc != 0 or not train_finished() or model_vocab_mismatch():
+                        step_failed("train", f"exit {rc} (Log {os.path.join(LOG_DIR, '06_train.log')}; exit 1 mit 'address OOV "
+                                    "rate': das Vokabular passt nicht zum Korpus)", t0, **info)
+                    mark_step("train", "ok", time.time() - t0, **info)
                 man = read_json(os.path.join(MODEL_DIR, "manifest.json"), {}) or {}
                 if man:
                     TRAIN_INFO = {k: man.get(k) for k in ("params", "hparams", "initial_val_loss", "final_val_loss", "tokens_seen",
@@ -3708,13 +3941,22 @@ def nb_12() -> list[tuple[str, str]]:
 
 
             def packed_blocks(vocab):
+                import hashlib
+
                 from lsne.chain.cli import corpus_blocks
 
                 os.makedirs(BLOCKS_DIR, exist_ok=True)
                 f_tr, f_va, f_st = (os.path.join(BLOCKS_DIR, n) for n in ("train.npy", "val.npy", "stats.json"))
+                # the cache belongs to one vocabulary and one shard set: blocks of another vocabulary are never reused
+                key = dict(vocab_sha=hashlib.sha256("\n".join(vocab.tokens).encode()).hexdigest()[:16],
+                           n_shards=len(list_shards(ITR)), block_size=int(BLOCK_SIZE), val_frac=float(VAL_FRAC))
                 if all(os.path.exists(p) for p in (f_tr, f_va, f_st)) and "evaluate" not in FORCE_STEPS:
-                    return np.load(f_tr, mmap_mode="r"), np.load(f_va), read_json(f_st, {})
+                    st = read_json(f_st, {}) or {}
+                    if all(st.get(k) == v for k, v in key.items()):
+                        return np.load(f_tr, mmap_mode="r"), np.load(f_va), st
+                    print("Blockcache gehört zu einem anderen Vokabular / Shard-Satz -> neu packen")
                 trb, vab, stats = corpus_blocks(ITR, vocab, BLOCK_SIZE, 512, VAL_FRAC)
+                stats.update(key)
                 for arr, p in ((trb.numpy(), f_tr), (vab.numpy(), f_va)):
                     np.save(p[:-4] + ".tmp.npy", arr)
                     os.replace(p[:-4] + ".tmp.npy", p)
@@ -3723,10 +3965,13 @@ def nb_12() -> list[tuple[str, str]]:
                 return np.load(f_tr, mmap_mode="r"), np.load(f_va), stats
 
 
-            with guarded("5a. Evaluation"):
+            with pipeline("5a. Evaluation", "evaluate"):
                 if step_done("evaluate"):
                     EVAL = read_json(EVAL_JSON, {}) or {}
-                elif have_model() and gpu_or_skip("Evaluation"):
+                elif gpu_or_skip("Evaluation"):
+                    require("evaluate")
+                    if not have_model():
+                        raise StepFailed(f"[evaluate] kein Modell unter {MODEL_DIR}")
                     from transformers import AutoModelForCausalLM
 
                     from lsne.chain.source import init_seed_of
@@ -3861,8 +4106,9 @@ def nb_12() -> list[tuple[str, str]]:
             bzw. nur die DAO-Adressen → `[A_OOV]`, in beiden Sets) und das **Kriterium trainiert − untrainiert**
             (`criterion.csv`: Split-Half-AUC beider Modelle, Δ mit Bootstrap-KI über gematchte Paare,
             Label-Permutation, Zufallsrichtungen, Oberflächen-Baseline; `counts` = KI über 0 und AUC über der
-            Permutations-Null, `counts_adj` mit Bonferroni über die Snapshots). Die erste Konfiguration ist das
-            eingefrorene Merkmal.
+            Permutations-Null, `counts_adj` mit Bonferroni über die Snapshots, `beats_surface` = trainierte AUC über
+            der Oberflächen-AUC, `counts_beyond_surface` = beides). Die erste Konfiguration ist das eingefrorene
+            Merkmal; es zählt nur mit `counts` **und** `beats_surface` am eingefrorenen Snapshot.
             """
         ),
         code(
@@ -3871,15 +4117,17 @@ def nb_12() -> list[tuple[str, str]]:
             # CLI: python -m lsne.chain.cli probe --model <MODEL_DIR> --in <PROBE_ITR> --kind fanout --k 5 --match length \
             #        --length-ratio 1.25 --mask none --n 2000 --untrained auto --out <PROBE_ROOT>/fanout_len_k5
             #      (ebenso --k 3, --k 2; --kind dao --mask all_addresses bzw. --mask dao)
-            with guarded("6a. Sonden"):
-                if have_model() and gpu_or_skip("Sonden"):
+            with pipeline("6a. Sonden"):
+                if gpu_or_skip("Sonden"):
                     PROBE_ITR = probe_corpus()
                     if FROZEN_CHANGED:
                         print("WARNUNG: eingefrorenes Merkmal geändert -> Sonden explorativ")
+                    failed = []
                     for pc in PROBE_CONFIGS:
                         name, out = f"probe_{pc['name']}", os.path.join(PROBE_ROOT, pc["name"])
                         if step_done(name):
                             continue
+                        require(name)
                         args = ["probe", "--model", MODEL_DIR, "--in", PROBE_ITR, "--kind", pc["kind"], "--k", pc.get("k", 5),
                                 "--match", "length", "--length-ratio", LENGTH_RATIO, "--mask", pc["mask"], "--n", N_PROBE,
                                 "--layer", "all", "--untrained", "auto", "--n-boot", N_BOOT, "--n-perm", N_PERM,
@@ -3890,8 +4138,14 @@ def nb_12() -> list[tuple[str, str]]:
                         rc = run_cli(f"09_{name}", args)
                         rep = read_json(os.path.join(out, "probe_report.json"), {}) or {}
                         n_pairs = (rep.get("verdict") or {}).get("n_pairs")
-                        # exit code 1 with a report = too few matched pairs: a result, not a failure
-                        mark_step(name, "ok" if rc == 0 or (rc == 1 and rep) else "error", time.time() - t0, rc=rc, n_pairs=n_pairs)
+                        # exit code 1 with a fresh report = too few matched pairs: a result, not a failure
+                        fresh = rep and os.path.getmtime(os.path.join(out, "probe_report.json")) >= t0 - 1
+                        ok = rc == 0 or (rc == 1 and fresh)
+                        mark_step(name, "ok" if ok else "error", time.time() - t0, rc=rc, n_pairs=n_pairs)
+                        if not ok:
+                            failed.append(f"{name} (exit {rc}, Log {os.path.join(LOG_DIR, f'09_{name}.log')})")
+                    if failed:
+                        raise StepFailed(f"Sonden fehlgeschlagen: {'; '.join(failed)}")
             """
         ),
         code(
@@ -3911,6 +4165,8 @@ def nb_12() -> list[tuple[str, str]]:
                                      length_smd=mt.get("length_smd"), surface_auc=surf.get("combined"), surface_best=surf.get("best_single"),
                                      layers_counting=ver.get("layers_counting", []),
                                      layers_counting_bonferroni=ver.get("layers_counting_bonferroni", []),
+                                     layers_beating_surface=ver.get("layers_beating_surface", []),
+                                     layers_counting_beyond_surface=ver.get("layers_counting_beyond_surface", []),
                                      max_delta=float(crit["delta"].max()) if len(crit) else float("nan")))
                 PROBE_SUMMARY = rows
                 show(pd.DataFrame(rows))
@@ -3943,10 +4199,14 @@ def nb_12() -> list[tuple[str, str]]:
                 if len(c):
                     layer = int(c["layer"].max()) if TRACE_LAYER is None else int(TRACE_LAYER)
                     row = c[c["layer"] == layer].iloc[0]
+                    # the frozen criterion: counts (trained - untrained, permutation null) AND beats_surface (amendment)
                     counts = str(row["counts"]).lower() == "true"
+                    beats = str(row.get("beats_surface", False)).lower() == "true"
                     print(f"Eingefrorenes Merkmal (fan-out >= {TRACE_K}, Snapshot {layer}): AUC {row['auc_trained']:.3f} trainiert / "
-                          f"{row['auc_untrained']:.3f} untrainiert, Δ {row['delta']:+.3f} [{row['delta_ci_lo']:+.3f}; {row['delta_ci_hi']:+.3f}] "
-                          f"-> {'ZÄHLT' if counts else 'zählt nicht'}" + (" (explorativ: Merkmal geändert)" if FROZEN_CHANGED else ""))
+                          f"{row['auc_untrained']:.3f} untrainiert / {float(row.get('surface_auc', float('nan'))):.3f} Oberfläche, "
+                          f"Δ {row['delta']:+.3f} [{row['delta_ci_lo']:+.3f}; {row['delta_ci_hi']:+.3f}], counts = {counts}, "
+                          f"beats_surface = {beats} -> {'ZÄHLT' if counts and beats else 'zählt nicht'}"
+                          + (" (explorativ: Merkmal geändert)" if FROZEN_CHANGED else ""))
                 else:
                     print("Eingefrorenes Merkmal: keine Kriteriumstabelle (zu wenige gematchte Paare oder Sonde nicht gelaufen).")
             """
@@ -3968,25 +4228,31 @@ def nb_12() -> list[tuple[str, str]]:
             # CLI: python -m lsne.chain.cli pair --in <PROBE_ITR> --n 2000 --balance --seed 0 --out <PAIRS_FILE>
             #      python -m lsne.chain.cli align --model <MODEL_DIR> --pairs <PAIRS_FILE> --target EleutherAI/pythia-160m@step98000 \
             #          --alphas 1,100 --untrained auto --out <ALIGN_DIR>
-            with guarded("7a. Paare"):
+            with pipeline("7a. Paare", "pair"):
                 if not step_done("pair"):
+                    require("pair")
                     PROBE_ITR = probe_corpus()
                     t0 = time.time()
                     rc = run_cli("10_pair", ["pair", "--in", PROBE_ITR, "--n", N_PAIRS, "--balance", "--seed", SEED, "--out", PAIRS_FILE])
                     n = sum(1 for _ in open(PAIRS_FILE, encoding="utf-8")) if os.path.exists(PAIRS_FILE) else 0
-                    mark_step("pair", "ok" if rc == 0 else "error", time.time() - t0, rc=rc, n_pairs=n)
+                    if rc != 0 or not n:
+                        step_failed("pair", f"exit {rc}, {n} Paare", t0, rc=rc, n_pairs=n)
+                    mark_step("pair", "ok", time.time() - t0, rc=rc, n_pairs=n)
                 labels = pd.Series([json.loads(l).get("label") for l in open(PAIRS_FILE, encoding="utf-8")]).value_counts()
                 print(f"{int(labels.sum())} Paare nach Label:", labels.to_dict())
 
-            with guarded("7b. Alignment"):
-                if not step_done("align") and have_model() and gpu_or_skip("Alignment"):
+            with pipeline("7b. Alignment", "align"):
+                if not step_done("align") and gpu_or_skip("Alignment"):
+                    require("align")
                     t0 = time.time()
                     args = ["align", "--model", MODEL_DIR, "--pairs", PAIRS_FILE, "--target", TARGET, "--alphas", ALIGN_ALPHAS,
                             "--untrained", "auto", "--n-boot", N_BOOT, "--seed", SEED, "--device", DEVICE, "--out", ALIGN_DIR]
                     if SMOKE:
                         args += ["--threads", 1]
                     rc = run_cli("11_align", args)
-                    mark_step("align", "ok" if rc == 0 else "error", time.time() - t0, rc=rc)
+                    if rc != 0:
+                        step_failed("align", f"exit {rc} (Log {os.path.join(LOG_DIR, '11_align.log')})", t0, rc=rc)
+                    mark_step("align", "ok", time.time() - t0, rc=rc)
             """
         ),
         code(
@@ -3996,12 +4262,15 @@ def nb_12() -> list[tuple[str, str]]:
                 summ = read_json(os.path.join(ALIGN_DIR, "align_summary.json"), {}) or {}
                 ALIGN_SUMMARY = {k: summ.get(k) for k in ("n_pairs", "target", "summary", "covariates", "seconds")}
                 rows = []
+
+                def num(x) -> float:
+                    return float("nan") if x is None else float(x)      # NaN (e.g. no CI with < 5 hold-out pairs) is null in json
                 for s in summ.get("summary", []):
                     b = s["best_raw"]
                     rows.append(dict(covariates=s["covariates"], alpha=s["alpha"], cell=f"L{int(b['layer_src'])}->L{int(b['layer_tgt'])}",
                                      r2_raw=b["r2_raw"], r2_raw_untrained=b["r2_raw_untrained"], r2_length_only=b["r2_length_only"],
                                      r2_resid=b["r2_resid"], r2_resid_untrained=b["r2_resid_untrained"], gain_resid=b["gain_resid"],
-                                     gain_resid_ci=f"[{b['gain_resid_ci_lo']:+.3f}; {b['gain_resid_ci_hi']:+.3f}]",
+                                     gain_resid_ci=f"[{num(b['gain_resid_ci_lo']):+.3f}; {num(b['gain_resid_ci_hi']):+.3f}]",
                                      cells_gain_ci_above_0=f"{s['n_cells_gain_resid_ci_above_0']}/{s['n_cells']}"))
                 show(pd.DataFrame(rows).round(3))
                 ac = pd.read_csv(os.path.join(ALIGN_DIR, "align_controls.csv"))
@@ -4035,8 +4304,10 @@ def nb_12() -> list[tuple[str, str]]:
             Shards des Sondenkorpus auf (Sonde mit dem eingefrorenen Merkmal und untrainiertem Zwilling,
             residualisierte Alignments je Ziel-Layer, Transplantation A/B/C mit echten Paaren aus Trägertransaktion
             und Stimulus gegen Zufalls-, Identitäts- und Permuted-Alignment-Kontrolle, B/T-Effekte mit
-            Familien-Bootstrap, `trace_verdict`). Der funktionale Transfertest (Kontrast 18) braucht Sprachpaare und
-            wird für eine Spurenquelle übersprungen (Manifest).
+            Familien-Bootstrap, `trace_damage` = jeder Arm minus das unveränderte Modell, `trace_verdict`: ein Effekt
+            zählt nur in der vorab festgelegten Richtung gegen das unveränderte Modell **und** beide Kontrollen und nur
+            mit einem Alignment, das die untrainierte Kontrolle schlägt). Der funktionale Transfertest (Kontrast 18)
+            braucht Sprachpaare und wird für eine Spurenquelle übersprungen (Manifest).
             """
         ),
         code(
@@ -4044,18 +4315,27 @@ def nb_12() -> list[tuple[str, str]]:
             # --- 8a. Voraussetzung (Präregistrierung 18): Stand-in-Validierung aus Notebook 11 ----------------
             # Maßgeblich ist verdict.csv (Kontrast 18: Transfer-Kriterien UND Vorzeichen für Residual und KV), nicht
             # transfer_summary.validated; Selbstkonsistenz-Quellen (self, rotated_self) geben kein Urteil (validated = NaN).
-            # Stufe L prüft dasselbe selbst (Option trace_standin -> trace_verdict.counts_for_prereg).
+            # Stufe L prüft dasselbe selbst (Option trace_standin -> trace_verdict.counts_for_prereg), einschließlich des
+            # Manifests: ein Stand-in-Lauf vor dem Fix vom 27.10.2026 (eps 1.0, Prompts nur aus der ersten Familie, layer-
+            # inkonsistentes v_src) zählt nicht -- dann zuerst Notebook 11 neu laufen lassen.
             with guarded("8a. Stand-in-Validierung"):
+                from lsne.experiments.stage_l_transplant import read_standin
                 p = RunDir(RUNS_ROOT, "L", spec, mkdir=False).file("verdict.csv")
                 vd = pd.read_csv(p) if p.exists() and p.stat().st_size > 1 else pd.DataFrame()
                 if len(vd) and "validated" in vd:
                     r = vd.iloc[0]
                     _kind = str(r.get("source_kind", ""))
+                    _si = read_standin(p.parent)               # verdict.csv + manifest.json (Design-Marker des Fixes)
                     STANDIN_VALIDATED = bool(str(r["validated"]).strip().lower() == "true"
                                              and str(r.get("counts_for_prereg", "")).strip().lower() == "true"
-                                             and _kind not in ("self", "rotated_self"))
+                                             and _kind not in ("self", "rotated_self") and _si["ok"])
                     print(f"Stand-in-Lauf {p.parent}: Quelle {_kind}, validated = {r['validated']}, counts_for_prereg = "
-                          f"{r.get('counts_for_prereg')} -> Voraussetzung erfüllt = {STANDIN_VALIDATED}")
+                          f"{r.get('counts_for_prereg')}, Dosis {_si.get('standin_eps')} -> Voraussetzung erfüllt = "
+                          f"{STANDIN_VALIDATED}" + ("" if _si["ok"] else f" ({_si['reason']})"))
+                    if not _si["ok"] and "rerun notebook 11" in str(_si["reason"]):
+                        print("Dieser Stand-in-Lauf stammt aus dem alten Design: Notebook 11 mit dem aktuellen Code neu laufen "
+                              "lassen (Dosis 0.3, 12 Prompts reihum über die Familien, v_src je Quell-Layer), dann dieses "
+                              "Notebook ab hier wiederholen.")
                 else:
                     STANDIN_VALIDATED = None
                     print(f"Kein Stand-in-Urteil unter {p.parent} (Notebook 11 mit demselben MODEL/REVISION). Nach Präregistrierung 18 "
@@ -4068,7 +4348,7 @@ def nb_12() -> list[tuple[str, str]]:
             from lsne.model import load_model
 
             mb = None
-            with guarded("Zielmodell"):
+            with pipeline("8b. Zielmodell"):
                 if gpu_or_skip("Laden des Zielmodells"):
                     mb = load_model(spec)
                     print(f"{spec.tag()}: {mb.n_layers} Blöcke, d_model={mb.d_model}, device={mb.device}, dtype={mb.dtype}")
@@ -4082,14 +4362,29 @@ def nb_12() -> list[tuple[str, str]]:
             #   python -m lsne.cli run --stage L --model EleutherAI/pythia-160m --revision step98000 --out <OUT_ROOT>/runs_trace \
             #       --transplant-source "trace:<TRACE_ROOT>/trace_lm_blockgpt,shards=<PROBE_ITR>,k=5,standin=<Stand-in-Lauf>"
             # (lsne.experiments.stage_l_transplant.parse_trace_spec; `lsne.cli run` hat keine --trace-*-Flags). Diese Zelle
-            # übergibt dieselben Optionen als trace_*-Schlüsselwörter (L_KW).
-            res_L = {}
-            if mb is not None and have_model():
-                with guarded("Sondenkorpus für Stufe L"):
+            # übergibt dieselben Optionen als trace_*-Schlüsselwörter (L_KW). Ein fertiger Lauf wird nur wiederverwendet, wenn
+            # sein Marker steps/stage_L.json nach dem Training geschrieben wurde (sonst gehört er zu einem anderen Modell).
+            res_L, manifest_L = {}, {}
+            with pipeline("8c. Stufe L", "stage_L"):
+                if mb is not None:
+                    reuse_L = step_done("stage_L")
+                    if not reuse_L:
+                        require("stage_L")
+                    t0 = time.time()
                     L_KW["trace_shards"] = probe_corpus()
-                res_L = run_stage("L", **L_KW)
-                print({k: len(v) for k, v in res_L.items()})
-            manifest_L = substage_report("L")
+                    res_L = run_stage("L", reuse=reuse_L, **L_KW)
+                    print({k: len(v) for k, v in res_L.items()})
+                    manifest_L = substage_report("L")
+                    _st, _sub = report.get("L", {}).get("status"), (manifest_L.get("substages") or {})
+                    info = dict(run_dir=report.get("L", {}).get("run_dir"), status_stage=_st, n_failed=_sub.get("n_failed"),
+                                substage_errors=sorted((_sub.get("errors") or {})))
+                    if _st not in ("ok", "reused") or _sub.get("n_failed"):
+                        step_failed("stage_L", f"Stufe L {_st}, {_sub.get('n_failed')} Substufen fehlgeschlagen "
+                                    f"{info['substage_errors']} ({report.get('L', {}).get('error') or 'substage_errors.txt'})", t0, **info)
+                    if _st == "ok":
+                        mark_step("stage_L", "ok", time.time() - t0, **info)
+                else:
+                    manifest_L = substage_report("L")
             if manifest_L:
                 tr_info = manifest_L.get("trace") or {}
                 print("Quelle:", (manifest_L.get("source") or {}).get("name"), "| Shards:", tr_info.get("shards"), f"({tr_info.get('shards_from')})",
@@ -4106,12 +4401,20 @@ def nb_12() -> list[tuple[str, str]]:
                 if tv.empty:
                     print("Kein trace_verdict (Stufe nicht gelaufen oder fehlgeschlagen; siehe Substufen-Bericht).")
                 else:
-                    show(tv[[c for c in ["mode", "probe_n_pairs", "auc_trained", "auc_untrained", "probe_delta", "probe_delta_ci_lo",
-                                         "probe_delta_ci_hi", "probe_ok", "align_r2_holdout", "align_gap", "align_ok", "align_gain_resid",
-                                         "align_gain_resid_ci_lo", "transplant_effect", "sharing_effect_claimed", "counts_for_prereg"]
+                    show(tv[[c for c in ["mode", "probe_n_pairs", "auc_trained", "auc_untrained", "probe_surface_auc", "probe_delta",
+                                         "probe_delta_ci_lo", "probe_delta_ci_hi", "probe_beats_surface", "probe_ok", "align_r2_holdout",
+                                         "align_gap", "align_ok", "align_gain_resid", "align_gain_resid_ci_lo", "align_beats_untrained",
+                                         "B_vs_plain", "B_vs_plain_ci_lo", "B_vs_plain_ci_hi", "B_vs_random", "B_vs_permuted",
+                                         "effect_B_vs_controls", "effect_B_vs_plain", "transplant_effect", "sharing_effect_claimed",
+                                         "lm_corpus_ok", "counts_for_prereg"]
                              if c in tv.columns]])
                     for _, r in tv.iterrows():
                         print(f"  {r['mode']}: {r['claim']}")
+                # every arm minus the unmodified model: how much each control damages log p(target) by itself
+                dmg = table("L", "trace_damage")
+                if len(dmg):
+                    show(dmg[dmg["quantity"].isin(["B_all", "T"])].pivot_table(index=["mode", "control"], columns="quantity",
+                                                                               values="mean").round(4))
                 tp_probe, eff = table("L", "trace_probe"), table("L", "trace_effects")
                 fig, axes = plt.subplots(1, 3, figsize=(17, 3.8))
                 if len(tp_probe):
@@ -4169,6 +4472,12 @@ def nb_12() -> list[tuple[str, str]]:
                                      for k, (a, b) in PLAN_HOURS.items()])
                 print("Ist gegen Plan (Stunden; 'reused' = in einer früheren Sitzung erledigt, Zeit dort in steps/<schritt>.json):")
                 show(plan, n=30)
+                # a run counts only when every planned step ended ok (or was reused) in this or an earlier session
+                steps_not_ok = {k: ",".join(sorted(status.get(k, {"nicht gelaufen"}))) for k in PLAN_HOURS
+                                if not (status.get(k) and status[k] <= set(STEP_OK))}
+                steps_ok = not steps_not_ok
+                if not steps_ok:
+                    print("Schritte nicht ok (der Lauf zählt nicht für Präregistrierung 18):", steps_not_ok)
                 tv = table("L", "trace_verdict")
                 claimed = bool(len(tv) and truthy(tv["sharing_effect_claimed"]).any())
                 _mb = globals().get("mb")
@@ -4182,12 +4491,15 @@ def nb_12() -> list[tuple[str, str]]:
                                 warmup=WARMUP, bf16=BF16,
                                 n_addresses=N_ADDRESSES, n_probe=N_PROBE, probe_shard_every=PROBE_SHARD_EVERY, n_pairs=N_PAIRS,
                                 align_alphas=ALIGN_ALPHAS, n_boot=N_BOOT, stage_l_kw=L_KW),
-                    frozen_feature=FROZEN, frozen_changed=FROZEN_CHANGED, standin_validated=STANDIN_VALIDATED,
+                    frozen_feature=FROZEN, frozen_amendments=FROZEN_AMENDMENTS, frozen_changed=FROZEN_CHANGED,
+                    standin_validated=STANDIN_VALIDATED,
                     steps=STEP_LOG, plan_vs_actual=plan.to_dict("records"), vocab=VOCAB_INFO, oov_heldout=OOV, throughput=THROUGHPUT,
                     train=TRAIN_INFO, eval={k: v for k, v in EVAL.items() if k != "corpus"}, probes=PROBE_SUMMARY, align=ALIGN_SUMMARY,
+                    substage_errors={st: r["substage_errors"] for st, r in report.items() if r.get("substage_errors")},
                     report=report, stage_L=dict(verdict=tv.to_dict("records"), sharing_effect_claimed=claimed,
-                                                counts_for_prereg=bool(len(tv) and truthy(tv["counts_for_prereg"]).all()
-                                                                       and STANDIN_VALIDATED is True and not FROZEN_CHANGED)),
+                                                counts_for_prereg=bool(steps_ok and len(tv) and truthy(tv["counts_for_prereg"]).all()
+                                                                       and STANDIN_VALIDATED is True and not FROZEN_CHANGED),
+                                                steps_ok=steps_ok, steps_not_ok=steps_not_ok),
                     tables={st: {n: int(len(df)) for n, df in r.items()} for st, r in results.items()},
                     cli_commands=CLI_LOG, cli_command=CLI_COMMAND,
                     figures=sorted(f for f in os.listdir(FIG_DIR) if f.endswith(".png")),
@@ -4207,6 +4519,261 @@ def nb_12() -> list[tuple[str, str]]:
     ]
 
 
+# ======================================================================================
+# 13 pre-registered evaluation of the finished runs (CPU; lsne.prereg_eval)
+# ======================================================================================
+def nb_13() -> list[tuple[str, str]]:
+    return [
+        md(
+            """
+            # LS-NEQ 13_prereg_evaluation — Präregistrierte Auswertung der vorhandenen Läufe
+
+            **Auswertung über die Stufen C, D, G–L** (`lsne.prereg_eval`, siehe `docs/PREREGISTRATION.md` §2–4 und
+            `docs/STAGES.md`). Dieses Notebook wird von `scripts/build_notebooks.py` erzeugt; Änderungen bitte dort
+            vornehmen und neu generieren (`python scripts/build_notebooks.py`).
+
+            **Zweck.** Die konfirmatorischen Endpunkte aus den Laufverzeichnissen berechnen, die schon auf Drive liegen —
+            ohne eine GPU-Stufe neu zu rechnen. Bestätigungsmenge: Testfamilien F01–F12 × Formulierungen {A, B}
+            (Entwicklungsfamilien DEV01–DEV04 bleiben außen vor); Statistik: Mittel der Familienmittel mit
+            Familien-Cluster-Bootstrap (10 000 Ziehungen, beide Formulierungen einer Familie gemeinsam gezogen);
+            Benjamini-Hochberg über die Sekundärgruppe 1–6, 8–9 (wenn G0 besteht), 10, 13 und 14 (8, 9, 13, 14 mit dem
+            `p_boot` ihrer Tabelle; Tabellen ohne `p_boot` bleiben unkorrigiert und höchstens „offen“). Mindesteffekte
+            entscheidet das Intervall (untere Grenze ≥ Mindesteffekt), nie der Punktschätzer.
+
+            **Laufzeit.** Eine **CPU-Laufzeit genügt** (Laufzeit → Laufzeittyp ändern → CPU): es wird kein Modell geladen.
+            Die Auswertung liest nur; der Checkpoint-Sweep (Notebook 05, Stufe F) wird nie geöffnet, ein noch laufender
+            Sweep wird also nicht gestört.
+
+            **Eingaben.** Die Laufwurzeln `<wurzel>/<stufe>/<modell>@<revision>/` mit `manifest.json` (`status: ok`):
+            standardmäßig `MyDrive/LSNE/runs` (+ `runs_trace`) und, falls vorhanden, `MyDrive/LSNE_B/runs` (+ `runs_trace`),
+            die Verknüpfung zum Ordner des zweiten Kontos (siehe nächste Zelle). Liegt eine Stufe unter mehreren Wurzeln,
+            gilt der neueste Lauf; Stufe L wird in den Stand-in-Lauf und den Spurenmodell-Lauf getrennt.
+
+            **Ausgaben.** `prereg_results.csv` (eine Zeile je Endpunkt und Unterzeile: `id, name, estimate, ci_low, ci_high,
+            p_two_sided, p_one_sided, n_families, n_rows, rule, verdict, bh_q, deviation_note` + `role, stage, direction,
+            bh_group, bh_q_endpoint, source, min_effect`), `prereg_results.md` (Bericht), `prereg_runs.csv` (gefundene Läufe) und
+            `prereg_meta.json` unter `<OUT_ROOT>/prereg_eval/<modell>@<revision>/`; eine Abbildung unter
+            `<OUT_ROOT>/figures/13_prereg_evaluation/`; am Ende eine kurze `summary_13_prereg_evaluation_*.json` in `OUT_ROOT`.
+
+            **Ablauf.** Setup → Drive → Wurzeln wählen → Auswertung → gefundene Läufe → Ergebnistabelle und Bericht →
+            Übersichtsabbildung → Zusammenfassung.
+
+            **Präregistrierung.** Primärer Endpunkt (§2): Δλ(K) = λ(K>0, `lang_dom`) − λ(K=0, `lang_dom`) aus Stufe D
+            (`damage`, Tiefen-Injektion), nur Zelle C1 (die einzige, deren Injektionsposition die präregistrierte ist:
+            letztes Token von Einheit 9), dieselbe Differenz für `rand` (Mittel über die Zufallsrichtungen) und die
+            Differenz der Differenzen; gestützt nur, wenn die untere KI-Grenze von Δλ(K=8) den Mindesteffekt 0,05
+            erreicht (dieselbe Intervallregel wie `damage_boot` in Stufe D), das KI der Differenz der Differenzen positiv
+            ist und die Punktschätzer monoton in K steigen; „offen“, wenn das Intervall den Mindesteffekt weder sichert
+            noch ausschließt. Ohne eine auf DEV eingefrorene Dosis werden alle präregistrierten Dosen berichtet.
+            C2/C3/seg erscheinen nur als Abweichungszeilen. §4: Läufe mit `audit_rel_err` > 1e-4 sind ungültig (Zeilen
+            `audit.D1`, `audit.C`). Kontrast 6: `ent` im Vorzeichen von State 2143 gegen Zufall, einseitig, über alle
+            Standardvarianten gepoolt; das umgekehrte Vorzeichen ist eine Kontrolle. Kontrast 7 (G0) ist ein Gate: verfehlt
+            es, werden 8–9 nicht interpretiert. 10 (ii)/(iii) werden auf den Testfamilien neu berechnet (konstante
+            zensierte Reihen zählen als ρ = 0, die Variante „wie gelaufen“ ist eine Sensitivitätszeile); 10f liest die auf
+            DEV eingefrorenen Merkmale (`lambda_features_frozen`). 11–18 werden aus ihren Tabellen übernommen (ein
+            `trace_verdict` nach der alten Regel wird neu beurteilt, nie übernommen); die bekannten Einschränkungen stehen
+            in `deviation_note`.
+
+            Hinweise: Die Zellen sind gegen Fehler abgesichert (ein fehlgeschlagener Abschnitt druckt den Traceback und das
+            Notebook läuft weiter). Fehlt eine Stufe, erscheint der Endpunkt mit `not_tested` und dem Grund.
+            """
+        ),
+        setup_cell(),
+        md(
+            """
+            ## Zweites Konto einbinden (`LSNE_B`)
+
+            Die Läufe liegen auf zwei Google-Konten. Damit dieses Notebook beide sieht, wird der Ordner des anderen
+            Kontos als **Verknüpfung** in die eigene Ablage gelegt:
+
+            1. Im anderen Konto den Ordner `LSNE` für dieses Konto freigeben (Lesezugriff genügt).
+            2. In diesem Konto in Google Drive „Für mich freigegeben“ öffnen, Rechtsklick auf `LSNE` →
+               „Organisieren“ → „Verknüpfung hinzufügen“ → „Meine Ablage“.
+            3. Die Verknüpfung in **`LSNE_B`** umbenennen (eine Verknüpfung namens `LSNE` würde mit dem eigenen
+               Ordner kollidieren).
+
+            Nach dem Einbinden erscheint sie als `/content/drive/MyDrive/LSNE_B`; die Konfigurationszelle nimmt
+            `LSNE_B/runs` (und `LSNE_B/runs_trace`) dann automatisch dazu. Andere Wurzeln lassen sich im Feld
+            `RUN_ROOTS_TEXT` oder in der Eingabeaufforderung komma-getrennt angeben.
+            """
+        ),
+        drive_cell(),
+        code(
+            """
+            # --- Konfiguration: Laufwurzeln und Auswertungsparameter -------------------------------
+            NOTEBOOK = "13_prereg_evaluation"
+            STAGE = "A-L"
+            MODEL_TAG = "pythia-160m"          # Modell-Tag der Laufverzeichnisse (<stufe>/<modell>@<revision>/)
+            REVISION = "step98000"             # step98000 (Bestätigungslauf); step99000 für die 99k-Hälfte von Kontrast 11
+            N_BOOT = 10000                     # präregistriert: 10 000 Familien-Bootstrap-Ziehungen
+            SEED = 0
+            FROZEN_DOSE = None                 # auf DEV01-DEV04 eingefrorene Schadensdosis (z. B. 0.05); None = alle Dosen berichten
+            RUN_ROOTS_TEXT = ""  # @param {type:"string"}
+            ASK = True                         # True: nach den Wurzeln fragen, wenn RUN_ROOTS_TEXT leer ist (Enter = Standard)
+
+            MYDRIVE = "/content/drive/MyDrive"
+            default_roots = [os.path.join(MYDRIVE, base, child) for base in ("LSNE", "LSNE_B") for child in ("runs", "runs_trace")
+                             if os.path.isdir(os.path.join(MYDRIVE, base, child))]
+            if not default_roots:              # outside Colab: the local runs root of lsne.io.drive_root()
+                default_roots = [RUNS_ROOT]
+            if ASK and not RUN_ROOTS_TEXT.strip():
+                try:
+                    RUN_ROOTS_TEXT = input(f"Laufwurzeln, komma-getrennt (Enter = {', '.join(default_roots)}): ")
+                except Exception:              # no stdin (headless execution): use the defaults
+                    RUN_ROOTS_TEXT = ""
+            RUN_ROOTS = [r.strip() for r in RUN_ROOTS_TEXT.split(",") if r.strip()] or default_roots
+            if os.path.isdir(MYDRIVE) and not os.path.isdir(os.path.join(MYDRIVE, "LSNE_B")):
+                print("Hinweis: kein MyDrive/LSNE_B -> die Läufe des zweiten Kontos fehlen (Verknüpfung siehe Markdown oben).")
+            EVAL_OUT = os.path.join(OUT_ROOT, "prereg_eval", f"{MODEL_TAG}@{REVISION}")
+            FIG_DIR = os.path.join(OUT_ROOT, "figures", NOTEBOOK)
+            os.makedirs(FIG_DIR, exist_ok=True)
+            CLI_COMMAND = ("python -m lsne.prereg_eval " + " ".join(f"--runs {r}" for r in RUN_ROOTS)
+                           + f" --out {EVAL_OUT} --model {MODEL_TAG} --revision {REVISION} --n-boot {N_BOOT} --seed {SEED}"
+                           + (f" --frozen-dose {FROZEN_DOSE}" if FROZEN_DOSE is not None else ""))
+            print("Laufwurzeln:")
+            for r in RUN_ROOTS:
+                print(f"  {r}  ({'vorhanden' if os.path.isdir(r) else 'FEHLT'})")
+            print("Ausgabe:", EVAL_OUT)
+            print("CLI-Äquivalent:\\n  " + CLI_COMMAND)
+            """
+        ),
+        code(
+            """
+            # --- Hilfsfunktionen: Anzeige und abgesicherte Abschnitte --------------------------------
+            import contextlib
+            import json
+            import traceback
+
+            import numpy as np
+            import pandas as pd
+            import matplotlib
+            import matplotlib.pyplot as plt
+
+
+            def show(df, n: int = 60):
+                \"\"\"display() in Jupyter / Colab, print() elsewhere.\"\"\"
+                if isinstance(df, pd.DataFrame):
+                    df = df.head(n)
+                try:
+                    display(df)          # noqa: F821 - provided by IPython
+                except NameError:
+                    print(df.to_string() if hasattr(df, "to_string") else df)
+
+
+            @contextlib.contextmanager
+            def guarded(title: str):
+                \"\"\"Print the traceback of a failing cell section and carry on.\"\"\"
+                print("==", title)
+                try:
+                    yield
+                except Exception:
+                    traceback.print_exc()
+                    print(f"[{title}] übersprungen (siehe Traceback)")
+            """
+        ),
+        code(
+            """
+            # --- Auswertung: alle präregistrierten Endpunkte aus den vorhandenen Tabellen -----------
+            # CLI-Äquivalent: python -m lsne.prereg_eval --runs <wurzel> [--runs <wurzel2>] --out <dir> --n-boot 10000
+            from lsne import prereg_eval as PE
+
+            res = PE.evaluate(RUN_ROOTS, model=MODEL_TAG, revision=REVISION, n_boot=N_BOOT, seed=SEED, frozen_dose=FROZEN_DOSE)
+            paths = PE.write_outputs(res, EVAL_OUT)
+            for k, p in paths.items():
+                print(f"{k:9s} {p}")
+            for n in res["meta"]["notes"]:
+                print("Hinweis:", n)
+            """
+        ),
+        code(
+            """
+            # --- Gefundene Läufe: welcher Lauf je Stufe verwendet wird ---------------------------
+            with guarded("Laufverzeichnisse"):
+                runs = res["runs"]
+                show(runs[["key", "used", "status", "timestamp", "n_boot", "path", "note"]], n=len(runs))
+                used = set(runs.loc[runs["used"].astype(bool), "key"])
+                missing = [k for k in PE.EVAL_KEYS if k not in used]
+                if missing:
+                    print("Keine verwendbaren Läufe für:", ", ".join(missing), "-> diese Endpunkte erscheinen als not_tested.")
+            """
+        ),
+        code(
+            """
+            # --- Ergebnistabelle (alle Endpunkte) und Bericht --------------------------------------
+            with guarded("Ergebnistabelle"):
+                tab = res["results"]
+                print("Urteile:", tab["verdict"].value_counts().to_dict())
+                print("BH-Gruppe:", res["bh"]["m"], "Tests; Endpunkt-Gruppierung (Sensitivität):", res["bh"]["m_endpoints"], "Endpunkte")
+                cols = ["id", "name", "estimate", "ci_low", "ci_high", "p_two_sided", "p_one_sided", "bh_q", "n_families",
+                        "n_rows", "verdict", "deviation_note"]
+                main = tab[tab["role"].isin(["primary", "audit", "secondary", "gate"])]
+                show(main[cols], n=len(main))
+                print("Weitere Zeilen (Komponenten, Abweichungen, bedingt, übernommen, Sensitivität):",
+                      int(len(tab) - len(main)), "-> siehe", paths["results"])
+            with guarded("Bericht (prereg_results.md)"):
+                text = paths["markdown"].read_text(encoding="utf-8")
+                try:
+                    from IPython.display import Markdown, display
+                    display(Markdown(text))
+                except ImportError:
+                    print(text[:6000])
+            """
+        ),
+        code(
+            """
+            # --- Übersicht: Schätzer mit 95 %-KI des Primär- und der Sekundärendpunkte ----------------
+            with guarded("Übersichtsabbildung"):
+                tab = res["results"]
+                sel = tab[tab["role"].isin(["primary", "secondary"]) & np.isfinite(tab["ci_low"].astype(float))]
+                if sel.empty:
+                    print("Keine Zeile mit Konfidenzintervall (fehlende Stufen?).")
+                else:
+                    colors = {"supported": "C2", "not_supported": "C3", "open": "C0", "not_interpretable": "grey"}
+                    fig, ax = plt.subplots(figsize=(8, 0.28 * len(sel) + 1.5))
+                    y = np.arange(len(sel))[::-1]
+                    for yi, (_, r) in zip(y, sel.iterrows()):
+                        c = colors.get(r["verdict"], "k")
+                        ax.plot([r["ci_low"], r["ci_high"]], [yi, yi], color=c, lw=2)
+                        ax.plot([r["estimate"]], [yi], "o", color=c, ms=4)
+                    ax.axvline(0, color="k", lw=0.6)
+                    ax.set_yticks(y)
+                    ax.set_yticklabels(sel["id"], fontsize=7)
+                    ax.set_xlabel("Schätzer [95 %-KI] (Einheit des Endpunkts)")
+                    ax.set_title("Präregistrierte Endpunkte: grün gestützt, rot nicht gestützt, blau offen", fontsize=9)
+                    path = os.path.join(FIG_DIR, f"endpoints_{MODEL_TAG}_{REVISION}.png")
+                    fig.savefig(path, dpi=120, bbox_inches="tight")
+                    print("Abbildung:", path)
+                    plt.show()
+            """
+        ),
+        code(
+            """
+            # --- Kurze Zusammenfassung nach OUT_ROOT schreiben -------------------------------------
+            with guarded("Zusammenfassung schreiben"):
+                import datetime
+
+                tab = res["results"]
+                summary = dict(
+                    notebook=NOTEBOOK, stage=STAGE, model=MODEL_TAG, revision=REVISION, n_boot=N_BOOT, seed=SEED,
+                    frozen_dose=FROZEN_DOSE, run_roots=RUN_ROOTS, out=EVAL_OUT, cli_command=CLI_COMMAND,
+                    timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    runs_used={k: p for k, p, u in zip(res["runs"]["key"], res["runs"]["path"], res["runs"]["used"]) if u},
+                    verdicts=tab["verdict"].value_counts().to_dict(),
+                    primary=tab[tab["role"] == "primary"][["id", "estimate", "ci_low", "ci_high", "verdict"]].to_dict("records"),
+                    bh=dict(m=res["bh"]["m"], m_endpoints=res["bh"]["m_endpoints"]),
+                    files={k: str(p) for k, p in paths.items()},
+                    figures=sorted(f for f in os.listdir(FIG_DIR) if f.endswith(".png")),
+                )
+                path = os.path.join(OUT_ROOT, f"summary_{NOTEBOOK}_{MODEL_TAG}_{REVISION}.json")
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(summary, f, indent=1, ensure_ascii=False, default=str)
+                print("Zusammenfassung:", path)
+                print(json.dumps(summary, indent=1, ensure_ascii=False, default=str)[:3000])
+            """
+        ),
+    ]
+
+
 BUILDERS = {
     "00_setup_and_anchor": nb_00,
     "01_baseline_and_directions": nb_01,
@@ -4221,6 +4788,7 @@ BUILDERS = {
     "10_ttt_injection": nb_10,
     "11_transplant": nb_11,
     "12_trace_source": nb_12,
+    "13_prereg_evaluation": nb_13,
 }
 
 
@@ -4231,11 +4799,12 @@ def build_notebook(stem: str) -> nbformat.NotebookNode:
     """Assemble one notebook (deterministic ids / metadata, validated)."""
     stage, title = NOTEBOOKS[stem]
     nb = new_notebook()
+    gpu = stem not in CPU_NOTEBOOKS
     nb.metadata = {
         "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
         "language_info": {"name": "python"},
-        "colab": {"name": f"{stem}.ipynb", "provenance": [], "gpuType": "A100"},
-        "accelerator": "GPU",
+        "colab": {"name": f"{stem}.ipynb", "provenance": [], **({"gpuType": "A100"} if gpu else {})},
+        **({"accelerator": "GPU"} if gpu else {}),
         "lsne": {"generator": "scripts/build_notebooks.py", "stage": stage, "title": title,
                  "git_url": GIT_URL, "git_branch": GIT_BRANCH},
     }

@@ -860,3 +860,42 @@ Modell, `pythia-14m@step98000`, Familien DEV01–DEV04,
 8 Prompts aus 4 Familien, Familien-Bootstrap mit 4 Clustern (`enough_clusters`), für `kv`
 und `both` verfehlen 4 der 7 gepflanzten Abbildungen das Alignment-Kriterium (Ziel-Layer 0,
 1, 2, 6), kein Anspruch, und `claim` nennt die fehlende Stand-in-Validierung.
+
+## 13. Fix-Runde 2: die Rohrleitung bricht laut ab, das Urteil wird strenger
+
+Stand 27.10.2026, nach der Prüfung des ersten A100-Laufs von Notebook 12 (`pythia-160m@step98000`).
+Was dort geschah: Die Serialisierung brach nach 1 550 protokollierten Chunks mit
+`concurrent.futures.process.BrokenProcessPool` ab (ein Worker starb; `ex.map` mit 12 Workern
+protokollierte in Einreichungsreihenfolge, 27 weitere Shards lagen ungeloggt auf Drive), 558 von
+2 135 Chunks fehlten (2 328 000, 2 329 000, 2 357 000–2 912 000), `serialize_params.json` wurde nie
+geschrieben. Die Zelle 3a scheiterte daran mit `FileNotFoundError`, `guarded()` verschluckte das,
+`itr_train/` blieb leer; `vocab` baute ein Vokabular aus 0 Transaktionen (4 Adressen, 0 Selektoren,
+0 Topics) und endete mit Code 0; Training (Adress-OOV 0,967), Evaluation, Sonden, Alignment und
+Stufe L liefen „ok“ darauf, und die Zusammenfassung setzte `counts_for_prereg = True`.
+
+| Befund | Korrektur |
+|---|---|
+| ein toter Worker beendet die ganze Serialisierung, fehlende Chunks ohne Liste, Optionen erst am Ende geschrieben | `serialize` schreibt `serialize_params.json` **vor** dem ersten Chunk (und verweigert das Fortsetzen in Shards mit anderen Optionen ohne `--overwrite`), reicht je Chunk ein Future ein und protokolliert jeden Chunk, sobald er fertig ist (`[k/n]`); ein gescheiterter Chunk oder ein Abbruch des Pools wird in weiteren Runden mit halb so vielen Workern wiederholt (12 → 6 → 3 → 1, `retry_schedule`), die letzte Runde serialisiert Chunk für Chunk mit einem Worker, der nach einem Absturz ersetzt wird (ein Chunk, der seinen Worker tötet, kostet nur sich selbst); fertige Shards werden nie neu geschrieben, Reste getöteter Worker (`*.tmp.*`) entfernt; fehlt danach ein Chunk, endet die CLI mit Code 2 und nennt jeden (`MISSING <start>: <Fehler>`) |
+| `vocab` aus 0 Transaktionen mit Code 0 | `vocab` endet mit Code 1 und schreibt nichts, wenn die Eingabe keine Shards oder keine Transaktion enthält |
+| Training mit Adress-OOV 0,967 | `train --max-oov-address` (Voreinstellung 0,5): liegt die Adress-OOV-Rate der *Trainings*transaktionen darüber, bricht `train` mit Code 1 ab, bevor ein Modell entsteht; das Manifest hält `corpus.oov_train` / `oov_val` fest |
+| Fehler in Pipeline-Zellen werden verschluckt, Folgeschritte laufen auf fehlenden Eingaben | Notebook 12: jede Pipeline-Zelle (1, 2, 3a–3c, 4b, 5a, 6a, 7a, 7b, 8b, 8c) läuft in `pipeline()` statt `guarded()`: jede Ausnahme wird im Schritt-Marker vermerkt und erneut ausgelöst, „Alle ausführen“ stoppt dort. Vor dem Rechnen prüft `require()` die Marker der Voraussetzungen (`STEP_DEPS`: Status ok/reused und ein Ergebnis > 0, z. B. `serialize.n_shards`, `split.train_tx`, `vocab.train_tx`); ein Schritt, dessen Ausgabe fehlt oder leer ist, endet als Fehler (`step_failed`). Ein Marker, dessen Voraussetzung später neu gerechnet wurde, ist veraltet (der Schritt läuft neu); ein Modell mit anderem Vokabular wird nicht fortgesetzt, sondern nach `<modell>.stale-<Zeit>` verschoben; der Blockcache der Evaluation gehört zu einem Vokabular; Stufe L wird nur mit einem Marker `steps/stage_L.json` jünger als das Training wiederverwendet |
+| `counts_for_prereg` trotz gescheiterter Schritte | Zusammenfassung: `counts_for_prereg` verlangt zusätzlich, dass jeder geplante Schritt ok endete (`stage_L.steps_ok`, `steps_not_ok`); Stufe L selbst verlangt einen gesunden Korpus des Spurenmodells (`lm_corpus_ok`: Adress-OOV ≤ 0,5 laut Modell-Manifest) |
+| kv-„Effekt“ nur, weil die Kontrollen mehr zerstören (B gegen Zufall +0,028, gegen Permuted-Alignment +2,76, gegen das unveränderte Modell −0,047) | `trace_verdict`: B oder T muss sich vom **unveränderten Modell**, von der Zufalls- **und** der Permuted-Alignment-Kontrolle unterscheiden, alle drei KIs ohne 0 **in der vorab festgelegten Richtung** (`TRACE_EXPECTED_SIGN`: B und T steigen — die übertragene Teilen-Richtung soll die Sprachwechselaufgabe erleichtern); zusätzlich `align_beats_untrained` (das residualisierte Alignment schlägt den untrainierten Zwilling). Neue Tabelle `trace_damage`: jeder Arm minus das unveränderte Modell (der Schaden, den eine Kontrolle allein anrichtet); im Urteil `B_damage_*` / `T_damage_*`, `B_vs_plain` mit KI, `effect_*_vs_plain`, `effect_*_vs_controls` (die alte Regel, zum Vergleich) |
+| Stand-in-Voraussetzung (Präregistrierung 18) aus dem alten Notebook-11-Lauf (Git 76a4a5a: eps 1,0 sättigt den Deutschanteil, 3 Prompts aus einer Familie, `v_src` nicht zur Quell-Layer der Abbildungen passend) | `read_standin` liest neben `verdict.csv` das Manifest des Stand-in-Laufs und verlangt die Marker des neuen Codes (`prompt_selection.rule = round_robin_families`, `transplant.v_src = layer_consistent…`); ein älterer Lauf zählt nicht („stand-in run predates the 27.10.2026 fix … rerun notebook 11“), auch nicht in Zelle 8a von Notebook 12 und nicht in `rejudge_trace` (liest den Stand-in vom vermerkten Pfad neu, statt das gespeicherte Ergebnis zu übernehmen) |
+| Dosis der Transplantation hing an `Limits.l_eps`, das für den Stand-in von 1,0 auf 0,3 sank | Die Spurenquelle dosiert mit eigener Konstante `TRACE_EPS = 1,0` (die Dosis, mit der der Pfad gebaut und der erste Lauf gerechnet wurde; Option `trace_eps` / `eps=` am Quell-String), unabhängig von `l_eps`; das Manifest vermerkt `transplant.eps` und `eps_source` |
+| Sonde am eingefrorenen Layer schlägt die Oberflächen-Baseline nicht (0,967 gegen 0,993) | Das Kriterium des eingefrorenen Merkmals verlangt zusätzlich `beats_surface` (trainierte AUC über der Oberflächen-AUC derselben Paare): `criterion.csv` → `counts_beyond_surface`, `probe_report.json` → `layers_counting_beyond_surface`, Stufe L → `probe_ok` und `probe_beats_surface`. Das ist eine **strengere Ergänzung der Entscheidungsregel**, keine Änderung des Merkmals: sie steht mit Datum unter `amendments` in `frozen_feature.json` (`FROZEN_AMENDMENTS`) und macht den Lauf nicht explorativ |
+
+**Wiederaufnahme des ersten Laufs.** Zuerst **Notebook 11 mit dem aktuellen Code neu laufen lassen**
+(gleiches `MODEL`/`REVISION`): der Stand-in-Lauf auf Drive stammt aus dem alten Design und zählt nicht
+mehr als Voraussetzung (Zelle 8a meldet „rerun notebook 11“). Danach in Notebook 12 mit
+`REUSE = True` und leerem `FORCE_STEPS` alle Zellen ausführen: die Serialisierung setzt bei den fehlenden Chunks fort (vorhandene Shards bleiben), der
+Split läuft erstmals, alle späteren Marker (Vokabular, Hold-out-OOV, Training, Evaluation, Sonden,
+Paare, Alignment) sind dadurch veraltet und werden neu gerechnet, das Modell mit dem leeren Vokabular
+wird nach `trace_lm_blockgpt.stale-<Zeit>` verschoben und Stufe L (ohne `stage_L`-Marker) neu
+gerechnet. Ein bestehender Stufe-L-Lauf lässt sich ohne Modell neu beurteilen:
+`lsne.experiments.stage_l_transplant.rejudge_trace(<runs_trace/L/…>)` (liest die Tabellen und das
+Manifest, baut `trace_damage` aus `trace_bt` / `trace_T` nach). Nach den Zahlen der Prüfung (nicht
+auf den Drive-Tabellen selbst ausgeführt) ergibt die neue Regel für den ersten Lauf in allen drei Modi
+„no claim“ (Sonde ohne `beats_surface`, Alignment ohne Gewinn gegen den untrainierten Zwilling, kv nur
+gegen die Kontrollen, nicht gegen das unveränderte Modell) und `counts_for_prereg = False`
+(Korpus-OOV 0,967 laut Modell-Manifest).

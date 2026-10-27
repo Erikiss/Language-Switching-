@@ -17,7 +17,21 @@ contrasts_boot       family cluster bootstrap of T per (K, C), of I per
                      (K, C, dir_family, sign, eps) and of the attribution excess
                      R_class - R_random per (K, C, layer, class) (``quantity="R_excess"``;
                      the row with ``class == "delim"`` is the pre-registered contrast 3
-                     R_ws+punct+boundary - R_random, PREREGISTRATION.md section 3)
+                     R_ws+punct+boundary - R_random, PREREGISTRATION.md section 3).
+                     ``split="all"`` rows pool every standard family at the row level
+                     (``stat_level="row"``, the rows written before the split existed);
+                     ``split="test"`` (the confirmation set F01-F12 x {A, B}) and
+                     ``split="dev"`` (DEV01-DEV04) rows are the pre-registered family-mean
+                     statistic (``stat_level="cluster"``).  Paired rows (family means at
+                     every split): ``quantity="T_C3_minus_C1"`` = T(K, C3) - T(K, C1) per
+                     formulation (contrast 2 at K=8) and ``quantity="B_ent_minus_rand"`` =
+                     B(ent) - mean B(rand) per variant, per (K, C, sign, eps) and pooled over
+                     every K, C (``K=-1, C="all"``; contrast 6).  ``preregistered`` marks the
+                     cells of contrasts 1 (T, K=8, C1), 2 (K=8), 3 (``delim``) and 6 (the pooled
+                     rows; the dose is not frozen by PREREGISTRATION, it is chosen on the dev
+                     rows) on every split, ``confirmatory`` the same cells on the test split
+                     (the confirmation statistic); ``p_boot`` = two-sided bootstrap p-value of
+                     a zero mean (BH input)
 attribution          counterfactual position patching K=0 -> K=8/C1 and K=0 -> K=28/seg
                      (original family: K=0 -> largest K) on the block inputs of the
                      pre-registered layer grid :func:`attribution_layer_grid` ({2, 5, 8, 11}
@@ -45,7 +59,7 @@ from ..config import LAYER_GRID_160M, RunConfig, HookSite
 from ..dynamics import last_logits
 from ..model import Injector, ModelBundle, make_dose_delta, next_token_stats, run_with_cache
 from ..patching import counterfactual_attribution, grad_x_act
-from ..stats import cluster_bootstrap
+from ..stats import bootstrap_p_two_sided, cluster_bootstrap, paired_contrast
 from . import common as C
 
 GRID_FAMILIES = ("ent", "lang_dom", "freq", "rand")
@@ -179,13 +193,51 @@ def contrast_rows(summary: pd.DataFrame) -> pd.DataFrame:
 
 #: Columns of ``contrasts_boot``: T / I rows carry ``layer=-1`` and ``class=""``, the
 #: attribution rows (``quantity="R_excess"``) carry ``dir_family=""``, ``sign=0``, ``eps=0``.
+#: ``split`` / ``stat_level`` / ``preregistered`` / ``confirmatory`` / ``p_boot`` were appended
+#: later (module notes).
 BOOT_COLS = ["quantity", "K", "C", "dir_family", "sign", "eps", "layer", "class", "mean", "ci_low", "ci_high", "se",
-             "n_clusters", "n_rows"]
+             "n_clusters", "n_rows", "split", "stat_level", "preregistered", "confirmatory", "p_boot"]
+#: Splits of the family-mean rows next to the pooled row-level ``split="all"`` rows.
+FAMILY_MEAN_SPLITS = ("test", "dev")
+#: The K of the pre-registered contrasts 1 and 2 (T(8, C1); T(8, C3) - T(8, C1)).
+PREREG_K = 8
 
 
-def bootstrap_contrasts(contrasts: pd.DataFrame, n_boot: int, seed: int) -> pd.DataFrame:
+def _boot_record(r: dict, quantity: str, K, Cc, split: str, stat_level: str, preregistered: bool = False,
+                 dir_family: str = "", sign: int = 0, eps: float = 0.0, layer: int = -1, cls: str = "") -> dict:
+    """One :data:`BOOT_COLS` row from a :func:`lsne.stats.cluster_bootstrap` /
+    :func:`lsne.stats.paired_contrast` result."""
+    return dict(quantity=quantity, K=int(K), C=str(Cc), dir_family=dir_family, sign=int(sign), eps=float(eps),
+                layer=int(layer), **{"class": cls}, mean=r["mean"], ci_low=r["ci_low"], ci_high=r["ci_high"], se=r["se"],
+                n_clusters=r["n_clusters"], n_rows=r["n_rows"], split=split, stat_level=stat_level,
+                preregistered=bool(preregistered), confirmatory=bool(preregistered and split == "test"),
+                p_boot=r["p_boot"] if "p_boot" in r else bootstrap_p_two_sided(r["boot"], 0.0))
+
+
+def _split_parts(df: pd.DataFrame, splits) -> list[tuple[str, pd.DataFrame]]:
+    """``(split, rows)`` of the splits with at least one row (:func:`~lsne.experiments.common.split_mask`)."""
+    out = []
+    for split in splits:
+        part = df[C.split_mask(df, split)]
+        if len(part):
+            out.append((split, part))
+    return out
+
+
+def t_source(contrasts: pd.DataFrame) -> pd.DataFrame:
+    """One contrasts row per standard mixed variant carrying its T (T does not depend on the
+    direction or the dose: the eps == 0, sign +1 row of the first direction family)."""
+    std = contrasts[contrasts["kind"] == "standard"]
+    t_src = std[(std["eps"] == 0.0) & (std["sign"] == 1)].drop_duplicates(["tag", "dir_family"])
+    return t_src.drop_duplicates(["tag"])
+
+
+def bootstrap_contrasts(contrasts: pd.DataFrame, n_boot: int, seed: int,
+                        splits=FAMILY_MEAN_SPLITS) -> pd.DataFrame:
     """Family cluster bootstrap of T per (K, C) and of I per (K, C, dir_family, sign, eps)
-    over the standard families (columns :data:`BOOT_COLS`)."""
+    over the standard families (columns :data:`BOOT_COLS`): the pooled ``split="all"`` rows
+    (every standard family, row level) and the family-mean rows of ``splits``
+    (``stat_level="cluster"``; ``preregistered`` on the T(8, C1) rows, contrast 1)."""
     cols = BOOT_COLS
     if contrasts.empty:
         return pd.DataFrame(columns=cols)
@@ -193,20 +245,63 @@ def bootstrap_contrasts(contrasts: pd.DataFrame, n_boot: int, seed: int) -> pd.D
     std = contrasts[contrasts["kind"] == "standard"]
     if std.empty:
         return pd.DataFrame(columns=cols)
-    # T does not depend on the direction: one row per (K, C) from the eps == 0 rows of one family
-    t_src = std[(std["eps"] == 0.0) & (std["sign"] == 1)].drop_duplicates(["tag", "dir_family"])
-    t_src = t_src.drop_duplicates(["tag"])
+    t_src = t_source(contrasts)
     for (K, Cc), g in t_src.groupby(["K", "C"], sort=True):
         r = cluster_bootstrap(g, "T", "family", n_boot=n_boot, seed=seed)
-        rows.append(dict(quantity="T", K=int(K), C=Cc, dir_family="", sign=0, eps=0.0, layer=-1, **{"class": ""},
-                         mean=r["mean"], ci_low=r["ci_low"], ci_high=r["ci_high"], se=r["se"],
-                         n_clusters=r["n_clusters"], n_rows=r["n_rows"]))
+        pre = (int(K), str(Cc)) == (PREREG_K, "C1")
+        rows.append(_boot_record(r, "T", K, Cc, "all", "row", preregistered=pre))
+        for split, part in _split_parts(g, splits):
+            r = cluster_bootstrap(part, "T", "family", n_boot=n_boot, seed=seed, stat_level="cluster")
+            rows.append(_boot_record(r, "T", K, Cc, split, "cluster", preregistered=pre))
     for (K, Cc, fam, sign, eps), g in std[std["eps"] > 0].groupby(["K", "C", "dir_family", "sign", "eps"], sort=True):
         r = cluster_bootstrap(g, "I", "family", n_boot=n_boot, seed=seed)
-        rows.append(dict(quantity="I", K=int(K), C=Cc, dir_family=fam, sign=int(sign), eps=float(eps), layer=-1,
-                         **{"class": ""}, mean=r["mean"], ci_low=r["ci_low"], ci_high=r["ci_high"], se=r["se"],
-                         n_clusters=r["n_clusters"], n_rows=r["n_rows"]))
+        rows.append(_boot_record(r, "I", K, Cc, "all", "row", dir_family=fam, sign=sign, eps=eps))
+        for split, part in _split_parts(g, splits):
+            r = cluster_bootstrap(part, "I", "family", n_boot=n_boot, seed=seed, stat_level="cluster")
+            rows.append(_boot_record(r, "I", K, Cc, split, "cluster", dir_family=fam, sign=sign, eps=eps))
     return pd.DataFrame(rows, columns=cols)
+
+
+def bootstrap_paired(contrasts: pd.DataFrame, summary: pd.DataFrame, n_boot: int, seed: int,
+                     splits=C.SPLITS) -> pd.DataFrame:
+    """Paired family-mean contrasts (columns :data:`BOOT_COLS`, ``stat_level="cluster"``,
+    every split of ``splits`` with rows):
+
+    * ``T_C3_minus_C1``: T(K, C3) - T(K, C1) per formulation (paired on family x formulation,
+      :func:`lsne.stats.paired_contrast`) for every K with both levels; contrast 2 at K=8;
+    * ``B_ent_minus_rand``: B(ent) - mean B(rand) of the same variant (``grid_summary``: the
+      ``rand`` row is the mean over the random directions) per (K, C, sign, eps) and pooled over
+      every standard variant (``K=-1``, ``C="all"``, the contrast-6 rows)."""
+    rows = []
+    t_src = t_source(contrasts) if len(contrasts) else contrasts
+    if len(t_src):
+        for K in sorted(set(t_src["K"].astype(int))):
+            g = t_src[(t_src["K"].astype(int) == K) & t_src["C"].isin(["C1", "C3"])]
+            if set(g["C"]) != {"C1", "C3"}:
+                continue
+            for split, part in _split_parts(g, splits):
+                r = paired_contrast(part, "T", "C", "C3", "C1", ["family", "formulation"], "family",
+                                    n_boot=n_boot, seed=seed, stat_level="cluster")
+                if r["n_pairs"] == 0:
+                    continue
+                r = dict(r, n_rows=r["n_pairs"])
+                rows.append(_boot_record(r, "T_C3_minus_C1", K, "C3-C1", split, "cluster",
+                                         preregistered=(K == PREREG_K)))
+    if len(summary) and {"ent", "rand"} <= set(summary["dir_family"]):
+        keys = ["tag", "family", "formulation", "K", "C", "sign", "eps"]
+        std = summary[(summary["kind"] == "standard") & (summary["eps"] > 0)]
+        ent = std[std["dir_family"] == "ent"][keys + ["B"]]
+        rnd = std[std["dir_family"] == "rand"][keys + ["B"]]
+        d = ent.merge(rnd, on=keys, suffixes=("_ent", "_rand"))
+        d["dB"] = d["B_ent"] - d["B_rand"]
+        cells = [((int(K), str(Cc), int(sg), float(e)), g) for (K, Cc, sg, e), g in d.groupby(["K", "C", "sign", "eps"], sort=True)]
+        cells += [((-1, "all", int(sg), float(e)), g) for (sg, e), g in d.groupby(["sign", "eps"], sort=True)]
+        for (K, Cc, sg, e), g in cells:
+            for split, part in _split_parts(g, splits):
+                r = cluster_bootstrap(part, "dB", "family", n_boot=n_boot, seed=seed, stat_level="cluster")
+                rows.append(_boot_record(r, "B_ent_minus_rand", K, Cc, split, "cluster", dir_family="ent", sign=sg, eps=e,
+                                         preregistered=(K == -1)))
+    return pd.DataFrame(rows, columns=BOOT_COLS)
 
 
 ATT_CONTRAST_COLS = ["pair", "family", "formulation", "tag_mixed", "K", "C", "kind", "site", "layer", "class",
@@ -240,19 +335,24 @@ def attribution_contrasts(att: pd.DataFrame) -> pd.DataFrame:
     return out[ATT_CONTRAST_COLS].reset_index(drop=True)
 
 
-def bootstrap_attribution(att_con: pd.DataFrame, n_boot: int, seed: int) -> pd.DataFrame:
+def bootstrap_attribution(att_con: pd.DataFrame, n_boot: int, seed: int,
+                          splits=FAMILY_MEAN_SPLITS) -> pd.DataFrame:
     """Family cluster bootstrap of ``R_excess`` per (K, C, layer, class) over the standard
-    families (``quantity="R_excess"``, columns :data:`BOOT_COLS`); the ``class == "delim"``
-    rows are the pre-registered contrast 3 per layer of the attribution grid."""
+    families (``quantity="R_excess"``, columns :data:`BOOT_COLS`): the pooled row-level
+    ``split="all"`` rows and the family-mean rows of ``splits``; the ``class == "delim"``
+    rows are the pre-registered contrast 3 per layer of the attribution grid (``preregistered``;
+    ``confirmatory`` on the test split)."""
     if att_con.empty:
         return pd.DataFrame(columns=BOOT_COLS)
     std = att_con[att_con["kind"] == "standard"]
     rows = []
     for (K, Cc, layer, cls), g in std.groupby(["K", "C", "layer", "class"], sort=True):
         r = cluster_bootstrap(g, "R_excess", "family", n_boot=n_boot, seed=seed)
-        rows.append(dict(quantity="R_excess", K=int(K), C=str(Cc), dir_family="", sign=0, eps=0.0, layer=int(layer),
-                         **{"class": str(cls)}, mean=r["mean"], ci_low=r["ci_low"], ci_high=r["ci_high"], se=r["se"],
-                         n_clusters=r["n_clusters"], n_rows=r["n_rows"]))
+        pre = str(cls) == C.PREREG_PATCH_CLASS
+        rows.append(_boot_record(r, "R_excess", K, Cc, "all", "row", layer=layer, cls=str(cls), preregistered=pre))
+        for split, part in _split_parts(g, splits):
+            r = cluster_bootstrap(part, "R_excess", "family", n_boot=n_boot, seed=seed, stat_level="cluster")
+            rows.append(_boot_record(r, "R_excess", K, Cc, split, "cluster", layer=layer, cls=str(cls), preregistered=pre))
     return pd.DataFrame(rows, columns=BOOT_COLS)
 
 
@@ -420,7 +520,8 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
         columns=GRID_COLS))
     summary = summarise_grid(grid)
     contrasts = contrast_rows(summary)
-    boot = bootstrap_contrasts(contrasts, n_boot=limits.n_boot, seed=cfg.seed)
+    boot = pd.concat([bootstrap_contrasts(contrasts, n_boot=limits.n_boot, seed=cfg.seed),
+                      bootstrap_paired(contrasts, summary, n_boot=limits.n_boot, seed=cfg.seed)], ignore_index=True)
 
     att = res.chunked("attribution", pairs, lambda ps: attribution_table(
         mb, allv, sites, n_random=limits.n_random_patch, seed=cfg.seed, enabled=limits.progress, pairs=ps))
@@ -440,6 +541,13 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
                          doses=list(cfg.doses), layer_grid=[int(l) for l in lgrid],
                          patch_classes=list(C.PATCH_CLASSES), prereg_patch_class=C.PREREG_PATCH_CLASS,
                          n_variants=len(variants), n_pairs=len(pairs),
-                         resumed_checkpoints=len(res.loaded), grid_batch_size=grid_batch)
+                         resumed_checkpoints=len(res.loaded), grid_batch_size=grid_batch,
+                         boot=dict(n_boot=int(limits.n_boot), splits=list(C.SPLITS),
+                                   test_families=list(C.TEST_FAMILIES), test_formulations=list(C.TEST_FORMULATIONS),
+                                   dev_families=list(C.DEV_FAMILIES),
+                                   stat_level=dict(all="row (pooled rows) / cluster (paired rows)", test="cluster",
+                                                   dev="cluster"),
+                                   paired=["T_C3_minus_C1", "B_ent_minus_rand"]),
+                         audit=C.audit_summary(grid))
     res.clear()
     return out

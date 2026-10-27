@@ -282,14 +282,21 @@ ethPandaOps Xatu, **CC BY 4.0** (Namensnennung „Data: ethPandaOps Xatu
 Stand-in-Lauf von Notebook 11 mit demselben `MODEL`/`REVISION` bestanden ist: maßgeblich ist
 `runs/L/<modell>@<rev>/verdict.csv` (Kontrast 18: `validated` True — Transfer-Kriterien und
 Vorzeichengleichheit für Residual und KV — und `counts_for_prereg` True; Selbstkonsistenz-Quellen
-`self`/`rotated_self` geben kein Urteil), nicht `transfer_summary.validated`. Abschnitt 8a prüft
+`self`/`rotated_self` geben kein Urteil), nicht `transfer_summary.validated`; zudem muss der
+Stand-in-Lauf mit dem Code ab 27.10.2026 geschrieben sein (Manifest: Prompts reihum über die
+Familien, `v_src` je Quell-Layer — ein älterer Lauf mit eps 1,0 und Prompts aus einer Familie zählt
+nicht: **Notebook 11 zuerst neu laufen lassen**, dann Notebook 12). Abschnitt 8a prüft
 das, Stufe L prüft es selbst (Option `standin` → `trace_verdict.counts_for_prereg`), und die
 Zusammenfassung vermerkt es (`standin_validated`, `stage_L.counts_for_prereg`). Das
 Merkmal „Teilen“ (Netto-fan-out ≥ 5 gegen 1, längengematcht, letzter Snapshot, Kriterium
 trainiert − untrainiert) wird beim ersten Ausführen der Konfigurationszelle nach
 `trace_2016/frozen_feature.json` geschrieben; eine spätere Änderung wird erkannt und macht
-Sonden und Stufe L explorativ. Erwarteter Ausgang nach dem CPU-Lauf: „no claim“ (das
-untrainierte Modell trennt die Sonden genauso gut) — ein Ergebnis, kein Fehler.
+Sonden und Stufe L explorativ (strengere Ergänzungen der Entscheidungsregel, etwa seit 27.10.2026
+`beats_surface`, stehen mit Datum unter `amendments` und ändern das Merkmal nicht). Erwarteter Ausgang nach dem CPU-Lauf: „no claim“ (das
+untrainierte Modell trennt die Sonden genauso gut) — ein Ergebnis, kein Fehler. Die Pipeline-Zellen
+brechen bei einem gescheiterten Schritt oder einer fehlenden Voraussetzung ab, statt weiterzulaufen
+(`docs/TRACE_SOURCE.md` §13); nach dem ersten A100-Lauf genügt es, mit `REUSE = True` alle Zellen erneut
+auszuführen (veraltete Schritte rechnen neu, das Modell mit dem leeren Vokabular wird beiseitegelegt).
 
 **Sitzungen.**
 
@@ -364,7 +371,8 @@ python -m lsne.cli run --stage L --model EleutherAI/pythia-160m --revision step9
 
 Die Spuren-Optionen der Stufe L stehen als `key=value` hinter dem Modellverzeichnis
 (`shards`, `direction`, `layer`, `k`, `n_probe`, `n_pairs`, `length_ratio`, `site_layer`,
-`n_prompts`, `split`, `standin`, …; `lsne.cli run` hat keine `--trace-*`-Flags); `standin`
+`n_prompts`, `split`, `standin`, `eps` (Dosis der Transplantation, Voreinstellung `TRACE_EPS` = 1,0,
+unabhängig von der Stand-in-Dosis `l_eps`), …; `lsne.cli run` hat keine `--trace-*`-Flags); `standin`
 zeigt auf den Stand-in-Lauf (Notebook 11), ohne ihn zählt kein Ergebnis für
 Präregistrierung 18. Für Sonden und Paare ohne Trainingsdaten des Spurenmodells:
 `probe … --split heldout`, `pair … --split heldout --model $OUT/trace_lm_blockgpt` und in Stufe L
@@ -387,4 +395,45 @@ Verzeichnis mit Links auf jeden 4. Shard übergeben (wie das Notebook).
 | `probe: only N matched pairs … need >= 2` | Zu wenige längengematchte Paare: der Netto-fan-out ≥ 5 (Empfänger mit Netto-Zufluss über die wirksamen Transfers, sichtbar im 512-Token-Fenster) ist 2016 extrem selten (CPU-Stichprobe: 4 von 225 854 Transaktionen); das ist ein Ergebnis und wird so markiert. Stufe L fällt dann auf eine gelockerte Sonde zurück und behauptet nichts (`feature_frozen = False`). |
 | `labels_df comes from an older serialisation (fan definition ['value_gt_0'] …)` | Die Shards stammen von vor Fix-Runde 1 (Brutto-fan-out ohne Netto-Flüsse und ohne Fenster-Merkmale, Logs/Diffs am ersten Knoten): `python -m lsne.chain.cli serialize … --overwrite` (bzw. die Serialisierungs-Marker löschen), danach Split, Vokabular und Training neu. |
 | `WARNUNG: das eingefrorene Merkmal wurde geändert` | `TRACE_K`, `TRACE_LAYER`, `LENGTH_RATIO`, `TRACE_DIRECTION` oder die fan-out-Definition (`fan_definition`, seit Fix-Runde 1 `net_effective`; `visible_window`) weichen von `frozen_feature.json` ab: der Lauf ist explorativ (Präregistrierung 18). Ein vor Fix-Runde 1 eingefrorenes Merkmal ist damit immer „geändert“; vor dem ersten echten Lauf `frozen_feature.json` bewusst neu schreiben (löschen) und das dokumentieren. |
-| Stufe L lädt per `REUSE` einen alten Lauf | `REUSE = False` oder `runs_trace/L/…` löschen. |
+| 8a: `stand-in run predates the 27.10.2026 fix … rerun notebook 11` | Der Stand-in-Lauf auf Drive stammt aus dem alten Design (eps 1,0, 3 Prompts aus einer Familie, layer-inkonsistentes `v_src`): Notebook 11 mit dem aktuellen Code und demselben `MODEL`/`REVISION` neu laufen lassen, dann Notebook 12 ab Zelle 8a wiederholen. Sonst bleibt `counts_for_prereg` False. |
+| Stufe L lädt per `REUSE` einen alten Lauf | Seit Fix-Runde 2 nur, wenn `steps/stage_L.json` ok ist und nach dem Training geschrieben wurde; sonst rechnet 8c neu. Erzwingen: `FORCE_STEPS = {"stage_L"}` oder `REUSE = False`. |
+| `StepFailed: [<schritt>] …` / `FEHLGESCHLAGEN`, „Alle ausführen“ stoppt | Gewollt (Fix-Runde 2, `docs/TRACE_SOURCE.md` §13): ein Schritt ist gescheitert oder eine Voraussetzung fehlt bzw. hat nichts erzeugt (`Voraussetzung fehlt: serialize: error …`). Ursache im genannten Log unter `logs/` beheben und ab dieser Zelle erneut ausführen; erledigte Schritte werden übersprungen. Die Zusammenfassung (letzte Zelle) lässt sich einzeln ausführen; `counts_for_prereg` bleibt dann False (`stage_L.steps_not_ok`). |
+| `serialize: ERROR N of M chunks missing … MISSING <start>: BrokenProcessPool` | Ein Worker starb (meist Speicher) auch nach den Wiederholungen mit weniger Workern: `SERIALIZE_WORKERS` senken (z. B. 4) oder eine Laufzeit mit mehr RAM wählen und Zelle 2 erneut ausführen; nur die fehlenden Chunks werden serialisiert. |
+| `serialize: the shards … were written with other options` | Die vorhandenen Shards stammen von anderen Serialisierungsoptionen: mit `--overwrite` neu schreiben (bzw. `itr/` umbenennen), nie mischen. `--overwrite` entfernt die alten Shards dieser Chunks, bevor es die neuen Optionen schreibt: ein Chunk, der dabei scheitert, fehlt (Code 2, `MISSING …`) und wird beim nächsten Aufruf — auch ohne `--overwrite` — neu geschrieben, statt mit den alten Optionen liegen zu bleiben. |
+| `vocab: ERROR … hold 0 transactions` / `no ITR shards` | Der Hash-Split (3a) hat nichts geschrieben: Marker `steps/split.json` und `itr_train/` prüfen; 3a erneut ausführen. |
+| `train: ERROR address OOV rate … exceeds 0.5` | Das Vokabular gehört nicht zum Korpus (anderer Split, leeres oder altes Vokabular): 3a/3b neu (`FORCE_STEPS = {"split", "vocab"}`). `MAX_OOV_ADDRESS = 1` schaltet die Prüfung ab (nur zur Diagnose). |
+| `trace_lm_blockgpt beiseitegelegt -> ….stale-<Zeit>` | Das vorhandene Modell wurde mit einem anderen Vokabular trainiert (oder `train` erzwungen): es wird nicht fortgesetzt, sondern verschoben; nichts wird gelöscht. Alte `.stale-*`-Verzeichnisse können nach Prüfung gelöscht werden. |
+
+## 11. Präregistrierte Auswertung (Notebook 13, CPU)
+
+`notebooks/13_prereg_evaluation.ipynb` berechnet die konfirmatorischen Endpunkte aus den
+Laufverzeichnissen, die schon auf Drive liegen (`lsne.prereg_eval`; Tabellenkarte in
+`docs/STAGES.md`, Abschnitt „Pre-registered evaluation“). Es lädt kein Modell; eine
+**CPU-Laufzeit** genügt, und der Checkpoint-Sweep (Stufe F) wird nie geöffnet, ein laufendes
+Notebook 05 wird also nicht gestört.
+
+1. **Zweites Konto einbinden.** Liegen die Läufe auf zwei Konten, im anderen Konto den Ordner
+   `LSNE` freigeben, im eigenen Konto unter „Für mich freigegeben“ → Rechtsklick → „Organisieren“
+   → „Verknüpfung hinzufügen“ → „Meine Ablage“ und die Verknüpfung in `LSNE_B` umbenennen.
+2. **Notebook öffnen und alle Zellen ausführen.** Die Konfigurationszelle fragt nach den
+   Laufwurzeln; Enter übernimmt die vorhandenen unter `MyDrive/LSNE/{runs,runs_trace}` und
+   `MyDrive/LSNE_B/{runs,runs_trace}`. Weitere Wurzeln (z. B. `MyDrive/LSNE/runs_ttt`) komma-getrennt
+   angeben. Liegt eine Stufe unter mehreren Wurzeln, gilt der neueste Lauf (`prereg_runs.csv`
+   nennt die übrigen).
+3. **Ergebnis.** `MyDrive/LSNE/prereg_eval/pythia-160m@step98000/prereg_results.{csv,md}`,
+   `prereg_runs.csv`, `prereg_meta.json`, eine Übersichtsabbildung und
+   `summary_13_prereg_evaluation_*.json`.
+
+CLI-Äquivalent (jede Maschine mit Zugriff auf die Laufverzeichnisse):
+
+```
+python -m lsne.prereg_eval --runs /content/drive/MyDrive/LSNE/runs \
+    --runs /content/drive/MyDrive/LSNE_B/runs --out /content/drive/MyDrive/LSNE/prereg_eval/pythia-160m@step98000
+```
+
+Lesart: `not_tested` nennt den Grund (Stufe fehlt, Tabelle fehlt, keine Zeilen der
+Bestätigungsmenge); `not_interpretable` heißt, die Präregistrierung erlaubt keine Deutung (G0
+verfehlt, Lauf durch das Audit ungültig, Platzhalter-Korpus, synthetisches SAE,
+Abweichungszeilen C2/C3/seg des Primärendpunkts). Ohne eine auf DEV01–DEV04 eingefrorene
+Schadensdosis (`FROZEN_DOSE` bzw. `--frozen-dose`) wird der Primärendpunkt für jede
+präregistrierte Dosis einzeln berichtet; die Notiz nennt die Bonferroni-Korrektur über die Dosen.

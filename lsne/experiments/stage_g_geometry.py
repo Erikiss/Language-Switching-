@@ -32,11 +32,15 @@ contraction       contrast 8 (G1) per family x mixed condition x site x readout 
                   ``d_log_volume = log_volume(K, C) - log_volume(K=0)`` and
                   ``d_participation_ratio``, both *raw* (the geometry-table values; the
                   clouds differ in n, and the log-volume depends on n) and *n-matched*
-                  (``Limits.g_n_subsample`` seeded subsets of the mixed cloud of the K=0
-                  cloud's size, averaged; the confirmatory quantity)
+                  (``Limits.g_n_subsample`` seeded draws of one realization per formulation
+                  of the K=0 cloud - stratified, so the matched mixed cloud has the K=0
+                  cloud's composition, ``n_match="stratified_formulation"`` - averaged; the
+                  confirmatory quantity)
 contraction_boot  family cluster bootstrap of the n-matched contrasts per
-                  (K, C, site, readout, k, quantity); the pre-registered rows are
-                  K=8 / C1 / k=5 with readout ``mean`` (log-volume) and ``last`` (PR)
+                  (K, C, site, readout, k, quantity) and ``split`` (``all`` = every family,
+                  ``test`` = F01-F12; a cloud pools the formulations of its family); the
+                  pre-registered cells are K=8 / C1 / k=5 with readout ``mean``
+                  (log-volume) and ``last`` (PR), ``confirmatory`` = those cells on ``test``
 position_traj     T2 (:func:`lsne.trajectory.position_trajectory`) per group at the
                   first, middle and dossier snapshots (``Limits.g_position_sites``)
 steering          T3 / contrast 9 (:func:`lsne.trajectory.steering_tracks_switching`) per
@@ -46,9 +50,14 @@ steering          T3 / contrast 9 (:func:`lsne.trajectory.steering_tracks_switch
                   cosine of the steering displacement with ``mean(K=8) - mean(K=0)`` per
                   snapshot vs ``cfg.n_random_dirs`` random directions
 steering_boot     family bootstrap of ``cos_steer_vs_K`` and of its excess over the random
-                  mean per (inject site, snapshot, eps), plus ``quantity =
-                  "cos_at_max_disp_layer"``: the cosine at the snapshot of maximal discrete
-                  displacement (the pre-registered layer; minimum effect cos >= 0.3)
+                  mean per (inject site, snapshot, eps) and ``split`` (``all`` / ``test``), plus
+                  ``quantity = "cos_at_max_disp_layer"``: the cosine at the snapshot of maximal
+                  discrete displacement (the pre-registered layer; minimum effect cos >= 0.3).
+                  That snapshot is the argmax of the Euclidean ``norm_K`` = ||mean(K=8) -
+                  mean(K=0)|| (``max_disp_criterion``): the Mahalanobis ``disp_mahal_K`` uses a
+                  rank-32 covariance of ~36 pooled states and is the same constant at every
+                  snapshot (sqrt((N-1)(1/n0 + 1/nK)), the simplex limit), so its argmax is
+                  floating-point noise (kept as ``max_disp_snapshot_mahal`` for comparison)
 coupling          T5 (:func:`lsne.trajectory.couple_with_dynamics`): Spearman correlation
                   over layers between ``delta_log_volume`` and the per-layer damage growth
                   rate ``lambda_l = ln D(l+1) - ln D(l)`` (stage D ``damage_profile``, depth
@@ -79,6 +88,11 @@ PREREG_K, PREREG_C = 8, "C1"
 PREREG_DEFLATE_K = 5
 PREREG_STEER_EPS = 0.05
 PREREG_MIN_COS = 0.3
+#: Splits of the G bootstraps: every family and the test families F01-F12 (the clouds of a family
+#: pool its formulations, so the split is decided by the family).
+BOOT_SPLITS = ("all", "test")
+#: Criterion of the T3 layer of maximal discrete displacement (see the module notes).
+MAX_DISP_CRITERION = "norm_K"
 
 
 # --------------------------------------------------------------------------------------
@@ -240,16 +254,42 @@ def g0_tables(mb: ModelBundle, groups: dict, mono_D: dict, sites: Sequence[HookS
 # --------------------------------------------------------------------------------------
 # contraction contrast (G1, contrast 8)
 # --------------------------------------------------------------------------------------
+def stratified_draw(ref_forms: Sequence[str], mixed_forms: Sequence[str], rng) -> Optional[np.ndarray]:
+    """Row indices of a mixed sub-cloud with the composition of the K=0 cloud: for every
+    formulation as many distinct mixed realizations of that formulation as the reference has rows
+    of it (one per formulation for the K=0 clouds); None when a formulation has too few.  Without
+    formulation labels (all equal) this is the plain draw of ``len(ref_forms)`` distinct rows."""
+    by_form: dict[str, list[int]] = {}
+    for i, f in enumerate(mixed_forms):
+        by_form.setdefault(str(f), []).append(i)
+    need: dict[str, int] = {}
+    for f in ref_forms:
+        need[str(f)] = need.get(str(f), 0) + 1
+    if any(len(by_form.get(f, [])) < m for f, m in need.items()):
+        return None
+    idx: list[int] = []
+    for f, m in need.items():
+        idx.extend(int(i) for i in rng.choice(by_form[f], size=m, replace=False))
+    return np.array(idx, dtype=int)
+
+
 def contraction_tables(geom: pd.DataFrame, states: dict, groups: dict, deflate_k: Sequence[int],
-                       n_subsample: int, seed: int, n_boot: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+                       n_subsample: int, seed: int, n_boot: int,
+                       splits: Sequence[str] = BOOT_SPLITS) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Raw and n-matched log-volume / PR contrasts of every mixed cloud against the K=0
-    cloud of its family (see module notes) and their family bootstrap."""
+    cloud of its family (see module notes) and their family bootstrap per split.
+
+    The n-matched mixed cloud draws one realization per row of the K=0 cloud among the
+    realizations of the same formulation (:func:`stratified_draw`; formulations of the
+    reference without a mixed realization are left out of both clouds); one draw when every
+    formulation has a single realization, else ``n_subsample`` seeded draws, averaged."""
     cols = ["family", "K", "C", "site", "layer", "readout", "k", "n_mixed", "n_ref", "log_volume_mixed", "log_volume_ref",
             "d_log_volume_raw", "d_log_volume", "pr_mixed", "pr_ref", "d_participation_ratio_raw",
-            "d_participation_ratio", "n_subsample", "preregistered"]
+            "d_participation_ratio", "n_subsample", "preregistered", "n_match", "n_strata"]
     rows: list[dict] = []
     keys = list(groups.keys())
     rng = np.random.default_rng(int(seed))
+    forms = {g: [str(getattr(v, "formulation", "")) for v in vs] for g, vs in groups.items()}
     gidx = geom.set_index(["site", "readout", "k", "group"]) if len(geom) else None
     for (site_key, ro), by_group in states.items():
         if ro not in ("mean", "last"):
@@ -271,6 +311,11 @@ def contraction_tables(geom: pd.DataFrame, states: dict, groups: dict, deflate_k
                 if ref not in slices:
                     continue
                 G0, GK = Xk[slices[ref]], Xk[slices[g]]
+                ref_forms, mix_forms = forms.get(ref, []), forms.get(g, [])
+                if len(ref_forms) != G0.shape[0] or len(mix_forms) != GK.shape[0]:   # no formulation labels
+                    ref_forms, mix_forms = [""] * G0.shape[0], [""] * GK.shape[0]
+                keep = [i for i, f in enumerate(ref_forms) if f in set(mix_forms)]
+                G0, ref_forms = G0[keep], [ref_forms[i] for i in keep]
                 n0, nK = G0.shape[0], GK.shape[0]
                 lv0, pr0 = log_volume(G0), participation_ratio(G0)
                 raw_lv = raw_pr = np.nan
@@ -285,10 +330,14 @@ def contraction_tables(geom: pd.DataFrame, states: dict, groups: dict, deflate_k
                 if n0 < 2 or nK < n0:
                     lvK, prK, nsub = np.nan, np.nan, 0
                 else:
-                    nsub = 1 if nK == n0 else int(max(1, n_subsample))
+                    single = all(mix_forms.count(f) == ref_forms.count(f) for f in set(ref_forms))   # one choice only
+                    nsub = 1 if (nK == n0 or single) else int(max(1, n_subsample))
                     lvs, prs = [], []
                     for _ in range(nsub):
-                        idx = np.arange(nK) if nK == n0 else rng.choice(nK, size=n0, replace=False)
+                        idx = stratified_draw(ref_forms, mix_forms, rng)
+                        if idx is None:
+                            lvs, prs = [np.nan], [np.nan]
+                            break
                         lvs.append(log_volume(GK[idx]))
                         prs.append(participation_ratio(GK[idx]))
                     with warnings.catch_warnings():          # a zero-variance cloud (block-0 last token) has PR = NaN
@@ -298,17 +347,20 @@ def contraction_tables(geom: pd.DataFrame, states: dict, groups: dict, deflate_k
                                  k=int(k), n_mixed=int(nK), n_ref=int(n0), log_volume_mixed=lvK, log_volume_ref=lv0,
                                  d_log_volume_raw=raw_lv, d_log_volume=lvK - lv0, pr_mixed=prK, pr_ref=pr0,
                                  d_participation_ratio_raw=raw_pr, d_participation_ratio=prK - pr0, n_subsample=nsub,
-                                 preregistered=bool(int(K) == PREREG_K and str(Cc) == PREREG_C and int(k) == PREREG_DEFLATE_K)))
+                                 preregistered=bool(int(K) == PREREG_K and str(Cc) == PREREG_C and int(k) == PREREG_DEFLATE_K),
+                                 n_match="stratified_formulation", n_strata=len(set(ref_forms))))
     con = pd.DataFrame(rows, columns=cols)
     bcols = ["quantity", "K", "C", "site", "layer", "readout", "k", "preregistered", "mean", "ci_low", "ci_high", "se",
-             "n_clusters", "n_rows"]
+             "n_clusters", "n_rows", "split", "confirmatory", "p_boot"]
     brows: list[dict] = []
     if len(con):
         for (K, Cc, site_key, ro, k), g in con.groupby(["K", "C", "site", "readout", "k"], sort=True):
             for q, ro_pre in (("d_log_volume", "mean"), ("d_participation_ratio", "last")):
                 pre = bool(int(K) == PREREG_K and str(Cc) == PREREG_C and int(k) == PREREG_DEFLATE_K and ro == ro_pre)
-                brows.append(C.boot_row(g, q, n_boot, seed, quantity=q, K=int(K), C=str(Cc), site=site_key,
-                                        layer=layer_index(site_key), readout=ro, k=int(k), preregistered=pre))
+                for r in C.split_boot_rows(g, q, n_boot, seed, splits=splits, formulation_col=None, with_p=True,
+                                           quantity=q, K=int(K), C=str(Cc), site=site_key, layer=layer_index(site_key),
+                                           readout=ro, k=int(k), preregistered=pre):
+                    brows.append(dict(r, confirmatory=bool(pre and r["split"] == "test")))
     return con, pd.DataFrame(brows, columns=bcols)
 
 
@@ -359,8 +411,22 @@ def steering_directions(cfg: RunConfig, mb: ModelBundle, variants, bank, ctx, li
     return out
 
 
+def max_disp_snapshots(df: pd.DataFrame) -> tuple[str, str]:
+    """``(snapshot, snapshot_mahal)`` of the maximal discrete displacement mean(K=8) - mean(K=0)
+    in one family's T3 rows: the argmax of the Euclidean ``norm_K`` (the T3 layer,
+    :data:`MAX_DISP_CRITERION`) and, for comparison, of ``disp_mahal_K`` (degenerate: a rank-32
+    whitening of ~36 pooled states puts every snapshot at the same simplex distance)."""
+    out = []
+    for col in (MAX_DISP_CRITERION, "disp_mahal_K"):
+        d = df.drop_duplicates("snapshot").set_index("snapshot")[col].astype(float)
+        d = d[np.isfinite(d)]
+        out.append(str(d.idxmax()) if len(d) else "")
+    return out[0], out[1]
+
+
 def steering_tables(mb: ModelBundle, groups: dict, directions: dict[str, object], eps_list: Sequence[float],
-                    n_random: int, seed: int, n_boot: int, enabled: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+                    n_random: int, seed: int, n_boot: int, enabled: bool = True,
+                    splits: Sequence[str] = BOOT_SPLITS) -> tuple[pd.DataFrame, pd.DataFrame]:
     fams = sorted({k[0] for k in groups})
     frames = []
     todo = [(fid, key) for fid in fams for key in directions]
@@ -377,34 +443,38 @@ def steering_tables(mb: ModelBundle, groups: dict, directions: dict[str, object]
         df["cos_excess"] = df["cos_steer_vs_K"] - df["cos_rand_mean"]
         df["preregistered"] = np.isclose(df["eps"], PREREG_STEER_EPS)
         # the snapshot of maximal discrete displacement (per family, inject site): the pre-registered layer
-        d = df.drop_duplicates("snapshot").set_index("snapshot")["disp_mahal_K"]
-        d = d[np.isfinite(d)]
-        best = str(d.idxmax()) if len(d) else ""
+        best, best_mahal = max_disp_snapshots(df)
         df["max_disp_snapshot"] = best
         df["at_max_disp_layer"] = df["snapshot"] == best
+        df["max_disp_criterion"] = MAX_DISP_CRITERION
+        df["max_disp_snapshot_mahal"] = best_mahal
         frames.append(df)
     cols = ["family", "inject_site", "direction", "snapshot", "layer", "eps", "cos_steer_vs_K", "cos_rand_mean", "cos_rand_sd",
             "norm_steer", "norm_K", "disp_mahal_steer", "disp_mahal_K", "cos_dir_vs_K", "n_K0", "n_K", "n_random",
-            "cos_excess", "preregistered", "max_disp_snapshot", "at_max_disp_layer"]
+            "cos_excess", "preregistered", "max_disp_snapshot", "at_max_disp_layer", "max_disp_criterion",
+            "max_disp_snapshot_mahal"]
+    bcols = ["quantity", "inject_site", "snapshot", "layer", "eps", "preregistered", "min_effect_met", "mean", "ci_low",
+             "ci_high", "se", "n_clusters", "n_rows", "split", "confirmatory", "p_boot"]
     if not frames:
-        return pd.DataFrame(columns=cols), pd.DataFrame(columns=["quantity", "inject_site", "snapshot", "layer", "eps",
-                                                                 "preregistered", "min_effect_met", "mean", "ci_low",
-                                                                 "ci_high", "se", "n_clusters", "n_rows"])
+        return pd.DataFrame(columns=cols), pd.DataFrame(columns=bcols)
     st = pd.concat(frames, ignore_index=True)[cols]
     brows = []
     for (isk, snap, eps), g in st.groupby(["inject_site", "snapshot", "eps"], sort=True):
         for q in ("cos_steer_vs_K", "cos_excess"):
-            r = C.boot_row(g, q, n_boot, seed, quantity=q, inject_site=isk, snapshot=snap, layer=int(g["layer"].iloc[0]),
-                           eps=float(eps), preregistered=bool(np.isclose(eps, PREREG_STEER_EPS)))
-            r["min_effect_met"] = bool(np.isfinite(r["mean"]) and r["mean"] >= PREREG_MIN_COS) if q == "cos_steer_vs_K" else None
-            brows.append(r)
+            pre = bool(np.isclose(eps, PREREG_STEER_EPS))
+            for r in C.split_boot_rows(g, q, n_boot, seed, splits=splits, formulation_col=None, with_p=True, quantity=q,
+                                       inject_site=isk, snapshot=snap, layer=int(g["layer"].iloc[0]), eps=float(eps),
+                                       preregistered=pre):
+                r["min_effect_met"] = bool(np.isfinite(r["mean"]) and r["mean"] >= PREREG_MIN_COS) if q == "cos_steer_vs_K" else None
+                brows.append(dict(r, confirmatory=False))
     for (isk, eps), g in st[st["at_max_disp_layer"]].groupby(["inject_site", "eps"], sort=True):
-        r = C.boot_row(g, "cos_steer_vs_K", n_boot, seed, quantity="cos_at_max_disp_layer", inject_site=isk, snapshot="per_family",
-                       layer=-1, eps=float(eps), preregistered=bool(np.isclose(eps, PREREG_STEER_EPS)))
-        r["min_effect_met"] = bool(np.isfinite(r["mean"]) and r["mean"] >= PREREG_MIN_COS)
-        brows.append(r)
-    boot = pd.DataFrame(brows, columns=["quantity", "inject_site", "snapshot", "layer", "eps", "preregistered", "min_effect_met",
-                                        "mean", "ci_low", "ci_high", "se", "n_clusters", "n_rows"])
+        pre = bool(np.isclose(eps, PREREG_STEER_EPS))
+        for r in C.split_boot_rows(g, "cos_steer_vs_K", n_boot, seed, splits=splits, formulation_col=None, with_p=True,
+                                   quantity="cos_at_max_disp_layer", inject_site=isk, snapshot="per_family", layer=-1,
+                                   eps=float(eps), preregistered=pre):
+            r["min_effect_met"] = bool(np.isfinite(r["mean"]) and r["mean"] >= PREREG_MIN_COS)
+            brows.append(dict(r, confirmatory=bool(pre and r["split"] == "test")))
+    boot = pd.DataFrame(brows, columns=bcols)
     return st, boot
 
 
@@ -489,6 +559,9 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
                           position_sites=[s.key for s in psites], steering_sites={k: getattr(d, "name", "") for k, d in dirs.items()},
                           steer_eps=eps_list, g0_gate=(gate.iloc[0].to_dict() if len(gate) else None),
                           stage_d_available=C.stage_run_dir(cfg, "D") is not None, substages=sub.report(),
+                          boot_splits=list(BOOT_SPLITS), test_families=list(C.TEST_FAMILIES),
+                          n_match="stratified_formulation", max_disp_criterion=MAX_DISP_CRITERION,
                           prereg=dict(contrast_7="g0_gate.pass_all / pass_middle (core_order_ok in >= 50% of snapshots)",
-                                      contrast_8="contraction_boot rows with preregistered=True",
-                                      contrast_9="steering_boot quantity=cos_at_max_disp_layer, eps=0.05"))
+                                      contrast_8="contraction_boot rows with preregistered=True (confirmatory: split=test)",
+                                      contrast_9="steering_boot quantity=cos_at_max_disp_layer, eps=0.05 (confirmatory: "
+                                                 "split=test; layer = argmax of the Euclidean norm_K)"))

@@ -13,9 +13,13 @@ G H I J K L, see docs/STAGES.md) and shares the stimulus bank / direction bank b
 them.  Every stage is wrapped in ``try/except``: a failing stage writes ``error.txt`` and
 a manifest with ``status='error'`` into its run directory and the next stage still runs,
 so a Colab run always yields partial results; stages G-L additionally capture failures
-per substage.  ``--smoke`` sets every limit for a short CPU run with pythia-14m (one
-family, three variants, tiny generation / path / training budgets; stage F re-runs the
-same model/revision only); the per-stage durations are printed at the end.
+per substage (the run report then says ``ok_with_substage_errors`` and lists them, and a
+stale ``error.txt`` of an earlier failed run is removed once a stage ends ok).  Such a stage
+ran and wrote its tables: the final line counts it as run (naming the substage errors), and
+the exit code is 1 only when every requested stage failed outright (``status='error'``).
+``--smoke`` sets every limit for a short CPU run with pythia-14m (one family, three
+variants, tiny generation / path / training budgets; stage F re-runs the same
+model/revision only); the per-stage durations are printed at the end.
 
 ``merge`` concatenates all same-named csv files below ``--root`` (any depth, including
 the stage-F sub-run directories of all shards) into ``<out>/<name>.csv`` with the
@@ -158,9 +162,13 @@ def run_stages(cfg: RunConfig, limits: C.Limits, stages: Sequence[str], mb=None,
         print(f"[lsne] stage {st} ({STAGE_TITLES[st]}) -> {rd.path}", flush=True)
         try:
             tables = STAGES[st].run(cfg, mb, rd, ctx=ctx, limits=limits, **kw)
-            report[st] = dict(status="ok", run_dir=str(rd.path), seconds=time.perf_counter() - t0,
-                              tables=sorted(tables), error="")
-            print(f"[lsne] stage {st} ok in {report[st]['seconds']:.1f} s: {', '.join(sorted(tables))}", flush=True)
+            sub = C.substage_status(rd.path)       # "ok_with_substage_errors" when a substage failed
+            report[st] = dict(status=sub["status"], run_dir=str(rd.path), seconds=time.perf_counter() - t0,
+                              tables=sorted(tables), error="", n_failed_substages=sub["n_failed_substages"],
+                              substage_errors=sub["substage_errors"])
+            print(f"[lsne] stage {st} {sub['status']} in {report[st]['seconds']:.1f} s: {', '.join(sorted(tables))}", flush=True)
+            for name, err in sub["substage_errors"].items():
+                print(f"[lsne]   substage {st}/{name} FAILED: {err}", file=sys.stderr, flush=True)
         except Exception as e:  # noqa: BLE001 - keep the other stages running
             C.write_error(rd, st, e, cfg, mb)
             report[st] = dict(status="error", run_dir=str(rd.path), seconds=time.perf_counter() - t0, tables=[],
@@ -199,8 +207,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(json.dumps(dict(cfg=C.to_jsonable(cfg), limits=C.to_jsonable(limits), stages=report),
                                        indent=1), encoding="utf-8")
-    n_err = sum(1 for r in report.values() if r["status"] != "ok")
-    print(f"[lsne] done: {len(report) - n_err}/{len(report)} stages ok; report {summary_path}", flush=True)
+    # a stage that finished with a failed optional substage wrote its tables: it ran, it is no failure
+    n_err = sum(1 for r in report.values() if r["status"] == "error")
+    n_sub = sum(1 for r in report.values() if str(r["status"]).endswith("_with_substage_errors"))
+    print(f"[lsne] done: {len(report) - n_err}/{len(report)} stages ran ({n_sub} with substage errors); "
+          f"report {summary_path}", flush=True)
     return 1 if n_err and n_err == len(report) else 0
 
 

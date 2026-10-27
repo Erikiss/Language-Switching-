@@ -6,6 +6,8 @@ Nicht-Gleichgewichts-Gitterphysik. Python-Paket `lsne`, Colab-Notebooks `noteboo
 Versuchsdesign `docs/DESIGN.md`, Präregistrierung `docs/PREREGISTRATION.md`,
 Modulverträge `docs/SPEC.md`.
 
+Ergebnisse und Prüfung des ersten Colab-Laufs (pythia-160m@step98000, vorläufig): `docs/RESULTS_RUN1.md`.
+
 Das Dossier „State 2143“ zeigt einen reproduzierbaren lokalen Eingriffseffekt (ein
 Schritt der Dosis ε entlang des Entropiegradienten am Eingang von Block 11), aber keinen
 Sprachwechselmechanismus: der Originalkontext enthält null Sprachwechsel. Dieses
@@ -187,6 +189,7 @@ Details, Herleitung und Grenzen: `docs/TNCO_INTEGRATION.md`.
 | `notebooks/09_rdx_sharing.ipynb` | J | Pile-Schwierigkeitsrangfolge (Gegenpol), RDX-z-Karten pro Kontrast × Basis × Layer, Stabilität, Sharing-Index und Netzwerkaktivität |
 | `notebooks/10_ttt_injection.ipynb` | K | Korpora (Platzhalter markiert), Memorisationsgeschwindigkeit, Trainingsverlauf, Vorher/Nachher-Effekte gegen drei Kontrollarme |
 | `notebooks/11_transplant.ipynb` | L | Funktionaler Transfertest pro Layer, Layer-Matching, Residual-Substitution / KV-Pflanzung / beides gegen Kontrollen |
+| `notebooks/13_prereg_evaluation.ipynb` | C, D, G–L (CPU) | Präregistrierte Auswertung der vorhandenen Läufe beider Konten (`lsne.prereg_eval`): Primärendpunkt, Sekundärendpunkte mit BH, G0-Gate, übernommene 11–18 (`docs/RUNBOOK_COLAB.md` §11) |
 
 Jedes Notebook klont den Branch `claude/language-switching-non-equilibrium-ejpz0q` dieses
 Repositories nach `/content/lsne-repo`, installiert `requirements.txt` + `pip install -e .`,
@@ -378,7 +381,8 @@ zu, die ihn tragen.
 ```
 lsne/            Paket: config, anchor, pile_fetch, model, stimuli, lang_id, directions, sae, patching,
                  dynamics, generation, tn_lattice, geometry, trajectory, lambda_dynamics, atlas, heads,
-                 rdx, pile_domains, sharing, ttt, transplant, stats, io, cli
+                 rdx, pile_domains, sharing, ttt, transplant, stats, io, cli,
+                 prereg_eval (präregistrierte Auswertung vorhandener Läufe, CPU)
 lsne/chain       Quelladapter für ein BlockGPT-artiges Spurenmodell (Xatu-Traces 2016, docs/TRACE_SOURCE_SPEC.md)
 lsne/experiments Stufen A-L (run() je Stufe) + common (Limits, Stimulusbank, Richtungsbank, Substufen, Familiengruppen)
 data/stimuli     Familien F01-F20, DEV01-DEV04 (Formulierungen A-D), original_2143.json, SCHEMA.md, review.csv
@@ -387,7 +391,7 @@ data/ttt, data/atlas, data/s4   Ablagen für die Eingaben des Auftraggebers (nur
 docs/            DESIGN.md, PREREGISTRATION.md, SPEC.md, STAGES.md, RUNBOOK_COLAB.md, TNCO_INTEGRATION.md,
                  BLOCKGPT_FEASIBILITY.md, TRACE_SOURCE_SPEC.md, ROUND2_ITEMS.md
 jobs/shards.yaml Rechenplan (7 Shards)
-notebooks/       generierte Colab-Notebooks 00-11
+notebooks/       generierte Colab-Notebooks 00-13
 scripts/         build_notebooks.py
 tests/           pytest (CPU, pythia-14m); test_experiments_smoke.py = Rauchtest A-L über die CLI
 ```

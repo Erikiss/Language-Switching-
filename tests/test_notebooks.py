@@ -19,6 +19,12 @@ passes must exist in the parser of ``lsne.chain.cli``.  Its headless smoke execu
 the Xatu fixture is marked ``slow``.  The committed notebooks must also be byte-identical
 to the generator output.
 
+Notebook 13 (``13_prereg_evaluation``, CPU runtime without accelerator metadata) has its own
+tests: the skeleton (header, the ``LSNE_B`` shortcut note, the run roots asked for in the
+configuration cell, the evaluation through ``lsne.prereg_eval``), the CLI equivalent (only
+options of ``python -m lsne.prereg_eval``) and a headless execution on a tiny synthetic run
+root (no model, so it is not marked ``slow``; skipped without a Jupyter kernel).
+
 ``test_notebook_runs_headless_in_smoke_mode`` (marked ``slow``) executes notebooks 00 and
 06 with ``SMOKE = True`` (pythia-14m, DEV01) through nbclient inside this checkout: every
 cell must run without an uncaught error, the stage manifest must say ``ok`` and the
@@ -70,8 +76,10 @@ STAGE_TABLES = {
 HEADLESS = ["00_setup_and_anchor", "06_geometry_trajectory"]
 #: notebooks outside the A-L stage sequence (same skeleton conventions, own tests)
 TRACE_NB = "12_trace_source"
-ALL = EXPECTED + [TRACE_NB]
+PREREG_NB = "13_prereg_evaluation"
+ALL = EXPECTED + [TRACE_NB, PREREG_NB]
 STAGE_OF["12"] = "L"
+STAGE_OF["13"] = "A-L"
 
 
 @pytest.fixture(scope="module")
@@ -111,6 +119,17 @@ def test_generator_covers_all_notebooks(builder):
     assert [builder.NOTEBOOKS[s][0] for s in EXPECTED] == list("ABCDEFGHIJKL")
     assert [STAGE_OF[s[:2]] for s in EXPECTED] == list("ABCDEFGHIJKL")
     assert builder.NOTEBOOKS[TRACE_NB][0] == "L"
+    assert builder.NOTEBOOKS[PREREG_NB][0] == "A-L"
+
+
+@pytest.mark.parametrize("stem", ALL)
+def test_gpu_metadata_except_cpu_notebooks(regenerated, stem):
+    """Every stage notebook opens on an A100 runtime; the evaluation notebook needs no GPU."""
+    meta = nbformat.read(regenerated / f"{stem}.ipynb", as_version=4).metadata
+    if stem == PREREG_NB:
+        assert "accelerator" not in meta and "gpuType" not in meta["colab"]
+    else:
+        assert meta["accelerator"] == "GPU" and meta["colab"]["gpuType"] == "A100"
 
 
 @pytest.mark.parametrize("stem", ALL)
@@ -304,11 +323,13 @@ def test_trace_source_notebook_pipeline(regenerated, builder):
               "corpus_blocks", "criterion.csv", "align_controls.csv", "def probe_corpus(", "os.symlink"):
         assert s in src, s
     # stage L with the trace source, its tables and the pre-registration 18 prerequisite
-    for s in ('run_stage("L", **L_KW)', 'transplant_source=f"trace:{MODEL_DIR}"', "trace_shards=", "trace_k=",
+    for s in ('run_stage("L", reuse=reuse_L, **L_KW)', 'transplant_source=f"trace:{MODEL_DIR}"', "trace_shards=", "trace_k=",
               "trace_standin=STANDIN_DIR", '--transplant-source \\"trace:{MODEL_DIR},{_spec_opts}', 'substage_report("L")',
               'table("L", "trace_verdict")', 'table("L", "trace_probe")', 'table("L", "trace_effects")',
               'table("L", "trace_alignment_controls")', 'table("L", "trace_sharing")', 'file("verdict.csv")',
-              "STANDIN_VALIDATED", '"counts_for_prereg"', '("self", "rotated_self")'):
+              "STANDIN_VALIDATED", '"counts_for_prereg"', '("self", "rotated_self")',
+              # a stand-in run of the old design (manifest without the 27.10.2026 markers) does not count
+              "read_standin(p.parent)", '_si["ok"]', "Notebook 11 mit dem aktuellen Code neu laufen"):
         assert s in src, s
     # the stand-in prerequisite is read from verdict.csv (contrast 18), never from transfer_summary.validated
     assert "transfer_summary.csv" not in src and "--trace-shards" not in src
@@ -320,6 +341,136 @@ def test_trace_source_notebook_pipeline(regenerated, builder):
     lo, hi = sum(a for a, _ in plan.values()), sum(b for _, b in plan.values())
     md_all = "\n".join(c.source for c in nb.cells if c.cell_type == "markdown")
     assert f"≈ {lo:.1f}–{hi:.1f} h".replace(".", ",") in md_all
+
+
+def test_trace_notebook_pipeline_cells_fail_loudly(regenerated, builder):
+    """Every pipeline cell of notebook 12 (one that runs a CLI step or writes a step marker) uses
+    pipeline() -- which re-raises -- instead of guarded(), checks its prerequisites (require) and
+    stops on a failed step (step_failed / StepFailed); the summary counts a run only when every
+    planned step ended ok, and the frozen criterion requires beating the surface baseline."""
+    import re
+
+    nb = _trace_nb(regenerated)
+    cells = [c.source for c in nb.cells if c.cell_type == "code"]
+    helpers = next(s for s in cells if s.startswith("# --- Hilfsfunktionen"))
+    for s in ("class StepFailed(RuntimeError)", "def pipeline(", "def require(", "def step_failed(", "def stale_aside(",
+              "except Exception as e:", "raise\n", "veraltet"):
+        assert s in helpers, s
+    assert f"STEP_DEPS = {builder.TRACE_STEP_DEPS!r}" in helpers
+    assert f"STEP_PRODUCT = {builder.TRACE_STEP_PRODUCT!r}" in helpers
+    plan = set(builder.TRACE_PLAN_HOURS)
+    assert {("probe" if k == "probes" else k) for k in plan} == set(builder.TRACE_STEP_DEPS)
+    steps = [s for s in cells if not s.startswith("# --- Hilfsfunktionen") and ("run_cli(" in s or "mark_step(" in s)]
+    assert len(steps) >= 9
+    for s in steps:
+        head = s.splitlines()[0]
+        assert "with guarded(" not in s, head
+        assert "with pipeline(" in s, head
+        if "Download" not in head:
+            assert "require(" in s, head
+        assert "step_failed(" in s or "raise StepFailed" in s, head
+    names = set(re.findall(r'with pipeline\("[^"]+", "([A-Za-z_]+)"\)', "\n".join(cells)))
+    assert names >= {"download", "serialize", "split", "vocab", "oov_heldout", "train", "evaluate", "pair", "align", "stage_L"}
+    src = _code(nb)
+    assert '"--max-oov-address", MAX_OOV_ADDRESS' in src and "MAX_OOV_ADDRESS = 0.5" in _config_source(nb)
+    assert "counts_for_prereg=bool(steps_ok and len(tv)" in src and "steps_not_ok=steps_not_ok" in src
+    assert "FROZEN_AMENDMENTS = dict(" in src and "beats_surface" in src and "counts and beats" in src
+    assert 'table("L", "trace_damage")' in src and "model_vocab_mismatch()" in src
+
+
+def _exec_cell(nb, marker: str, ns: dict, smoke: bool = False) -> None:
+    hits = [c.source for c in nb.cells if c.cell_type == "code" and marker in c.source]
+    assert len(hits) == 1, marker
+    src = hits[0].replace("SMOKE = False", "SMOKE = True") if smoke else hits[0]
+    exec(compile(src, marker, "exec"), ns)
+
+
+def test_trace_notebook_cells_stop_and_recover(regenerated, tmp_path, monkeypatch, capsys):
+    """Notebook 12's cells executed in this process (SMOKE, Xatu fixture, CLI steps as subprocesses):
+    a failed serialisation stops the split and the vocabulary (the first A100 run went on and
+    built a vocabulary from 0 transactions); after the cause is fixed the same cells recover; a
+    recomputed prerequisite makes later markers stale; a model trained with another vocabulary
+    is moved aside instead of resumed; the summary does not count a run with missing steps."""
+    pytest.importorskip("matplotlib")
+    monkeypatch.setenv("MPLBACKEND", "Agg")
+    from lsne.chain.cli import list_shards
+
+    nb = _trace_nb(regenerated)
+    out = tmp_path / "lsne_out"
+    ns = {"__name__": "__main__", "os": __import__("os"), "sys": sys, "REPO_DIR": str(REPO), "OUT_ROOT": str(out),
+          "RUNS_ROOT": str(out / "runs")}
+    (out / "runs").mkdir(parents=True)
+    _exec_cell(nb, "SMOKE = False", ns, smoke=True)
+    for marker in ("# --- Runner:", "# --- Hilfsfunktionen", "# --- Substufen-Bericht"):
+        _exec_cell(nb, marker, ns)
+    StepFailed = ns["StepFailed"]
+
+    def steps() -> dict:
+        return {p.stem: json.loads(p.read_text(encoding="utf-8")) for p in Path(ns["STEP_DIR"]).glob("*.json")}
+
+    # 1. the serialisation fails (no cached chunk): the cell raises, the next cells refuse to run
+    ns["CACHE_DIR"] = str(tmp_path / "empty_cache")
+    (tmp_path / "empty_cache").mkdir()
+    _exec_cell(nb, "# --- 1. Download", ns)
+    with pytest.raises(StepFailed, match=r"\[serialize\] exit 1, 0 Shards"):
+        _exec_cell(nb, "# --- 2. Serialisierung", ns)
+    assert steps()["serialize"]["status"] == "error" and steps()["serialize"]["n_shards"] == 0
+    assert steps()["serialize"]["params"] is True                    # serialize_params.json is written first
+    with pytest.raises(StepFailed, match="Voraussetzung fehlt: serialize: error"):
+        _exec_cell(nb, "# --- 3a. Hash-Split", ns)
+    with pytest.raises(StepFailed, match="Voraussetzung fehlt: split: error"):
+        _exec_cell(nb, "# --- 3b. Vokabular", ns)
+    assert steps()["split"]["status"] == steps()["vocab"]["status"] == "error"
+    assert not Path(ns["VOCAB_DIR"]).exists() and not Path(ns["ITR_TRAIN"]).exists()
+    # the summary of the stopped run: nothing counts
+    _exec_cell(nb, "# --- Zusammenfassung: Ist gegen Plan", ns)
+    s = json.loads(next(out.glob("summary_12_trace_source_*.json")).read_text(encoding="utf-8"))
+    assert s["stage_L"]["counts_for_prereg"] is False and s["stage_L"]["steps_ok"] is False
+    assert s["stage_L"]["steps_not_ok"]["serialize"] == "error" and s["stage_L"]["steps_not_ok"]["train"] == "nicht gelaufen"
+    assert "download" not in s["stage_L"]["steps_not_ok"]                       # skipped_smoke is fine in a smoke run
+    assert s["frozen_amendments"]["beats_surface"].startswith("AUC_trained at the frozen snapshot")
+    frozen = json.loads((Path(ns["TRACE_ROOT"]) / "frozen_feature.json").read_text(encoding="utf-8"))
+    assert set(frozen["amendments"]) == {"beats_surface"}
+
+    # 2. fixed (the fixture cache): the same cells recover from the error markers
+    ns["CACHE_DIR"] = str(REPO / "tests" / "fixtures" / "xatu")
+    for marker in ("# --- 2. Serialisierung", "# --- 3a. Hash-Split", "# --- 3b. Vokabular", "# --- 3c. Hold-out-OOV"):
+        _exec_cell(nb, marker, ns)
+    st = steps()
+    assert [st[k]["status"] for k in ("serialize", "split", "vocab", "oov_heldout")] == ["ok"] * 4
+    assert st["serialize"]["n_shards"] == 2 and st["serialize"]["n_missing"] == 0 and st["vocab"]["train_tx"] > 0
+    assert st["split"]["train_tx"] == st["vocab"]["train_tx"] and st["oov_heldout"]["n_val_tx"] > 0
+
+    # 3. a recomputed prerequisite makes the later marker stale
+    import time
+    time.sleep(1.1)
+    ns["FORCE_STEPS"] = {"serialize"}
+    _exec_cell(nb, "# --- 2. Serialisierung", ns)
+    ns["FORCE_STEPS"] = set()
+    capsys.readouterr()
+    _exec_cell(nb, "# --- 3a. Hash-Split", ns)
+    assert "[split] Marker vom" in capsys.readouterr().out and steps()["split"]["finished"] >= steps()["serialize"]["finished"]
+    _exec_cell(nb, "# --- 3a. Hash-Split", ns)                                  # now up to date: reused
+    assert "[split] bereits erledigt" in capsys.readouterr().out
+
+    # 4. a model of another vocabulary is moved aside, never resumed; the trainer checks the OOV rate
+    model_dir = Path(ns["MODEL_DIR"])
+    model_dir.mkdir(parents=True)
+    voc = json.loads((Path(ns["VOCAB_DIR"]) / "vocab.json").read_text(encoding="utf-8"))
+    voc["tokens"] = voc["tokens"][:-1]
+    (model_dir / "vocab.json").write_text(json.dumps(voc), encoding="utf-8")
+    _exec_cell(nb, "# --- 4a. Planung", ns)
+    _exec_cell(nb, "# --- 4b. Training", ns)
+    aside = list(model_dir.parent.glob(model_dir.name + ".stale-*"))
+    assert len(aside) == 1 and (aside[0] / "vocab.json").exists()
+    tr = steps()["train"]
+    assert tr["status"] == "ok" and tr["n_train_tx"] > 0 and tr["oov_address_train"] == 0.0
+    assert (model_dir / "manifest.json").exists() and len(list_shards(ns["ITR"])) == 2
+    _exec_cell(nb, "# --- Zusammenfassung: Ist gegen Plan", ns)
+    s = json.loads(next(out.glob("summary_12_trace_source_*.json")).read_text(encoding="utf-8"))
+    nok = s["stage_L"]["steps_not_ok"]
+    assert not {"serialize", "split", "vocab", "oov_heldout", "train"} & set(nok)
+    assert {"evaluate", "probes", "pair", "align", "stage_L"} <= set(nok) and s["stage_L"]["counts_for_prereg"] is False
 
 
 def test_trace_source_notebook_cli_options_exist(regenerated):
@@ -373,6 +524,103 @@ def test_trace_source_notebook_stage_l_cli_equivalent(regenerated):
     model_dir, opts = SL.parse_trace_spec("trace:/x/lm,shards=/x/itr,k=5,n_probe=500,length_ratio=1.25,standin=/r/L/m@s")
     assert model_dir == "/x/lm" and opts == dict(shards="/x/itr", k="5", n_probe="500", length_ratio="1.25",
                                                  standin="/r/L/m@s")
+
+
+# --------------------------------------------------------------------------------------
+# notebook 13: pre-registered evaluation of the finished runs (CPU, no model)
+# --------------------------------------------------------------------------------------
+def _prereg_nb(regenerated) -> nbformat.NotebookNode:
+    return nbformat.read(regenerated / f"{PREREG_NB}.ipynb", as_version=4)
+
+
+def test_prereg_notebook_skeleton(regenerated):
+    """Header (German prose, CPU runtime, the pre-registered rules), the LSNE_B shortcut
+    note, setup / Drive / run roots (asked for, defaults MyDrive/LSNE/runs + LSNE_B/runs) /
+    evaluation / tables / figure / summary; no model and no stage run."""
+    nb = _prereg_nb(regenerated)
+    head = nb.cells[0].source
+    assert head.startswith("# LS-NEQ 13_prereg_evaluation")
+    for s in ("**Zweck.**", "**Laufzeit.**", "**Eingaben.**", "**Ausgaben.**", "**Ablauf.**", "**Präregistrierung.**",
+              "CPU-Laufzeit genügt", "F01–F12", "10 000", "Benjamini-Hochberg", "prereg_results.csv", "prereg_results.md",
+              "not_tested", "Notebook 05", "docs/STAGES.md"):
+        assert s in head, s
+    md_all = "\n".join(c.source for c in nb.cells if c.cell_type == "markdown")
+    for s in ("## Zweites Konto einbinden (`LSNE_B`)", "Verknüpfung", "Für mich freigegeben", "/content/drive/MyDrive/LSNE_B",
+              "RUN_ROOTS_TEXT"):
+        assert s in md_all, s
+    src = _code(nb)
+    for s in ("https://github.com/Erikiss/Language-Switching-.git", "claude/language-switching-non-equilibrium-ejpz0q",
+              "/content/lsne-repo", "google.colab", "drive_root", "OUT_ROOT", '("LSNE", "LSNE_B")', '("runs", "runs_trace")',
+              'RUN_ROOTS_TEXT = ""  # @param {type:"string"}', "input(", "from lsne import prereg_eval as PE",
+              "PE.evaluate(RUN_ROOTS", "PE.write_outputs(res, EVAL_OUT)", "N_BOOT = 10000", 'REVISION = "step98000"',
+              "FROZEN_DOSE = None", "PE.EVAL_KEYS", "summary_", "json.dump", "def guarded(", "traceback", "plt.show()",
+              "fig.savefig("):
+        assert s in src, s
+    assert "load_model" not in src and "run_stage(" not in src
+
+
+def test_prereg_notebook_cli_equivalent_uses_existing_options(regenerated):
+    """The printed CLI equivalent uses only options of ``python -m lsne.prereg_eval``."""
+    import re
+
+    from lsne import prereg_eval as PE
+
+    cfg = next(c.source for c in _prereg_nb(regenerated).cells if c.cell_type == "code" and "CLI_COMMAND = (" in c.source)
+    seg = cfg[cfg.index("CLI_COMMAND = ("):cfg.index('print("Laufwurzeln:")')]
+    used = set(re.findall(r"(?<![\w-])--[a-z][a-z0-9-]*", seg))
+    assert {"--runs", "--out", "--model", "--revision", "--n-boot", "--seed", "--frozen-dose"} <= used
+    assert used <= set(PE.build_parser()._option_string_actions)
+
+
+def test_prereg_notebook_runs_headless(regenerated, tmp_path, monkeypatch):
+    """Execute notebook 13 through nbclient on a tiny synthetic run root (no model): every
+    cell runs (the root prompt falls back to the default without stdin), the evaluation
+    writes its tables, the overview figure and the summary json below ``$LSNE_RUNS``."""
+    nbclient = pytest.importorskip("nbclient")
+    pytest.importorskip("ipykernel")
+    import numpy as np
+    import pandas as pd
+    from nbclient.exceptions import CellExecutionError, CellTimeoutError
+
+    out_root = tmp_path / "lsne_out"
+    run = out_root / "runs" / "C" / "pythia-160m@step98000"
+    run.mkdir(parents=True)
+    t = {f"F{i:02d}": -0.3 + 0.01 * i for i in range(1, 13)}
+    rows = [dict(family=f, formulation=form, tag=f"{f}{form}:K8:C1", K=8, C="C1", kind="standard", dir_family="ent", sign=1,
+                 eps=0.0, T=v, B_mixed=0.0, B_mono=0.0, I=0.0) for f, v in t.items() for form in "AB"]
+    pd.DataFrame(rows).to_csv(run / "contrasts.csv", index=False)
+    (run / "manifest.json").write_text(json.dumps(dict(stage="C", status="ok", timestamp="2026-10-27T00:00:00+00:00")),
+                                       encoding="utf-8")
+    monkeypatch.setenv("LSNE_RUNS", str(out_root))                 # drive_root() outside Colab
+    monkeypatch.delenv("LSNE_REPO_DIR", raising=False)
+    nb = _prereg_nb(regenerated)
+    client = nbclient.NotebookClient(nb, timeout=600, kernel_name="python3", allow_errors=False,
+                                     resources={"metadata": {"path": str(REPO)}})
+    started = False
+    try:
+        with client.setup_kernel():
+            started = True
+            client.reset_execution_trackers()
+            for i, cell in enumerate(nb.cells):
+                client.execute_cell(cell, i)
+    except (CellExecutionError, CellTimeoutError) as e:
+        pytest.fail(f"{PREREG_NB}: {e}")
+    except Exception as e:  # noqa: BLE001 - no kernel on this machine
+        if not started:
+            pytest.skip(f"no Jupyter kernel could be started: {e!r}")
+        raise
+    text = "\n".join(_cell_text(c) for c in nb.cells if c.cell_type == "code")
+    assert "übersprungen" not in text, text[-3000:]
+    assert "Vorhandener Checkout" in text and "Keine verwendbaren Läufe für: D" in text
+    res_dir = out_root / "prereg_eval" / "pythia-160m@step98000"
+    df = pd.read_csv(res_dir / "prereg_results.csv").set_index("id")
+    assert df.loc["S1", "n_families"] == 12 and np.isclose(df.loc["S1", "estimate"], np.mean(list(t.values())))
+    assert df.loc["P", "verdict"] == "not_tested"
+    assert (res_dir / "prereg_results.md").read_text(encoding="utf-8").startswith("# Präregistrierte Auswertung")
+    summaries = list(out_root.glob(f"summary_{PREREG_NB}_*.json"))
+    assert len(summaries) == 1
+    s = json.loads(summaries[0].read_text(encoding="utf-8"))
+    assert s["runs_used"] == {"C": str(run)} and s["figures"] and s["n_boot"] == 10000
 
 
 # --------------------------------------------------------------------------------------
@@ -488,8 +736,9 @@ def test_trace_notebook_runs_headless_in_smoke_mode(regenerated, tmp_path, monke
     assert (root / "frozen_feature.json").exists() and (root / "trace_lm_tiny" / "manifest.json").exists()
     steps = {p.stem: json.loads(p.read_text(encoding="utf-8")) for p in (root / "steps").glob("*.json")}
     for name in ("serialize", "split", "vocab", "oov_heldout", "train", "evaluate", "pair", "align",
-                 "probe_fanout_len_k5", "probe_dao_len_mask_all"):
+                 "probe_fanout_len_k5", "probe_dao_len_mask_all", "stage_L"):
         assert steps[name]["status"] == "ok", (name, steps.get(name))
+    assert steps["serialize"]["n_missing"] == 0 and steps["vocab"]["train_tx"] > 0 and steps["train"]["n_train_tx"] > 0
     ev = json.loads((root / "eval.json").read_text(encoding="utf-8"))
     assert ev["model_val"] < ev["untrained_val"] and ev["bigram_val"] < ev["unigram_val"] < ev["uniform"]
     m = json.loads((out_root / "runs_trace" / "L" / "pythia-14m@step98000" / "manifest.json").read_text(encoding="utf-8"))
@@ -500,6 +749,8 @@ def test_trace_notebook_runs_headless_in_smoke_mode(regenerated, tmp_path, monke
     s = json.loads(summaries[0].read_text(encoding="utf-8"))
     assert s["smoke"] is True and s["stage"] == "L" and s["report"]["L"]["status"] == "ok"
     assert s["stage_L"]["sharing_effect_claimed"] is False and s["standin_validated"] is None
+    assert s["stage_L"]["steps_ok"] is True and s["stage_L"]["steps_not_ok"] == {}      # every step ended ok ...
+    assert s["stage_L"]["counts_for_prereg"] is False                                  # ... but a smoke run never counts
     assert s["tables"]["L"]["trace_verdict"] == 3 and set(s["tables"]["L"]) == set(m["tables"])
     assert {r["step"] for r in s["plan_vs_actual"]} >= {"download", "train", "probes", "stage_L"}
     assert any(c.startswith("python -m lsne.chain.cli train ") for c in s["cli_commands"])

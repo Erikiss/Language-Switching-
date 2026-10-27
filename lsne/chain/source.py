@@ -515,7 +515,10 @@ def criterion_table(S: dict, S0: dict, n_pos: int, layers: Optional[Sequence[int
     negatives in the same order) of the trained model and the untrained twin.  ``n_tests``
     defaults to the number of layers (Bonferroni columns).  ``surface`` (the result of
     :func:`lsne.chain.labels.surface_baseline_auc` with the same seed) adds
-    ``surface_auc`` (combined) and ``beats_surface`` (``auc_trained`` > it)."""
+    ``surface_auc`` (combined), ``beats_surface`` (``auc_trained`` > it) and
+    ``counts_beyond_surface`` (``counts`` AND ``beats_surface``: the criterion of the frozen
+    feature since 27.10.2026 -- a direction the surface counts already separate better than
+    the trained LM is not evidence of a learned feature)."""
     layers = sorted(S) if layers is None else [int(l) for l in layers]
     kw.setdefault("n_tests", len(layers))
     n = int(n_pos)
@@ -525,7 +528,9 @@ def criterion_table(S: dict, S0: dict, n_pos: int, layers: Optional[Sequence[int
         r = dict(layer=int(l), **r)
         if surface is not None:
             r["surface_auc"] = float(surface.get("combined", float("nan")))
-            r["beats_surface"] = bool(np.isfinite(r["surface_auc"]) and r["auc_trained"] > r["surface_auc"])
+            r["beats_surface"] = bool(np.isfinite(r["surface_auc"]) and np.isfinite(r["auc_trained"])
+                                      and r["auc_trained"] > r["surface_auc"])
+            r["counts_beyond_surface"] = bool(r["counts"] and r["beats_surface"])
         rows.append(r)
     return pd.DataFrame(rows)
 

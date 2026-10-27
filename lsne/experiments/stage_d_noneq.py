@@ -11,6 +11,20 @@ D1 damage          ``damage``          per (variant, injection, direction, eps):
                                        token, fronts at thresholds 0.01 and 0.1
                    ``damage_phase``    phase-diagram table: means over variants per
                                        (K, C, injection, dir_family, eps)
+                   ``damage_contrasts`` primary endpoint per formulation (PREREGISTRATION
+                                       section 2, depth injection): Delta-lambda of
+                                       ``lang_dom`` and of ``rand`` (mean over the random
+                                       directions) at K vs the K=0 variant of the same
+                                       formulation, and the difference in differences
+                   ``damage_boot``     family-mean cluster bootstrap of those contrasts per
+                                       (K, C, eps) and split (``all`` / ``test`` = F01-F12 x
+                                       {A, B} / ``dev``); ``preregistered`` = C1 (the cell
+                                       whose injection site is the pre-registered last
+                                       token of unit 9), ``confirmatory`` = C1 on the test
+                                       split; the other C levels carry
+                                       ``position_deviation`` (their site is the last German
+                                       token); ``min_effect_met`` / ``verdict`` by the CI rule
+                                       (minimum effect 0.05 per layer), ``monotone_in_K``
    Injections: (a) ``dossier`` = block input of the last block at the last token (the
    State-2143 site; position front), (b) ``depth`` = block input of block ``n_layers//3``
    at the language-defined site :func:`lsne.stimuli.last_switched_position` (the last
@@ -81,6 +95,17 @@ HYST_N_NULL = 4
 CA_MASS_FLOOR = "auto"
 #: Bump when the meaning of a checkpointed stage-D result changes (invalidates ``_resume``).
 RESUME_VERSION = 1
+#: Limits fields that no checkpointed stage-D result depends on and whose defaults changed after
+#: RESUME_VERSION 1 (the bootstrap draws - ``damage_boot`` is recomputed from the damage table on
+#: every run - and stage-L knobs).  They enter the resume signature with their version-1 values,
+#: so a run started before the change (e.g. a stage-F sub-run of a running checkpoint sweep)
+#: resumes its checkpoints instead of recomputing them.
+RESUME_PINNED_LIMITS = dict(n_boot=2000, l_n_prompts=3, l_eps=1.0)
+#: Minimum effect of the primary endpoint (PREREGISTRATION section 2: Delta-lambda >= 0.05 per layer).
+PREREG_MIN_DLAM = 0.05
+#: The C level whose depth-injection site is the pre-registered one (last token of unit 9, the
+#: K=0 site); C2 / C3 / seg inject at the last German token instead (``position_deviation``).
+PREREG_C = "C1"
 
 
 # --------------------------------------------------------------------------------------
@@ -239,6 +264,90 @@ def phase_table(damage: pd.DataFrame) -> pd.DataFrame:
                          n_spread01_final_mean=float(g["n_spread01_final"].mean()),
                          B_mean=float(g["B"].mean()), B_sd=float(g["B"].std(ddof=0))))
     return pd.DataFrame(rows, columns=cols)
+
+
+DAMAGE_CONTRAST_COLS = ["family", "formulation", "tag", "K", "C", "kind", "inject", "eps", "lam_lang_dom",
+                        "lam_lang_dom_K0", "dlam_lang_dom", "lam_rand", "lam_rand_K0", "dlam_rand",
+                        "did_lang_dom_minus_rand", "n_rand", "split", "position_deviation"]
+DAMAGE_BOOT_COLS = ["quantity", "inject", "K", "C", "eps", "split", "stat_level", "preregistered", "confirmatory",
+                    "position_deviation",
+                    "mean", "ci_low", "ci_high", "se", "n_clusters", "n_rows", "p_boot", "min_effect", "min_effect_met",
+                    "verdict", "monotone_in_K"]
+#: Quantities of ``damage_boot`` (columns of ``damage_contrasts``).
+DAMAGE_BOOT_QUANTITIES = ("dlam_lang_dom", "dlam_rand", "did_lang_dom_minus_rand")
+
+
+def damage_contrasts(damage: pd.DataFrame, inject: str = "depth") -> pd.DataFrame:
+    """Primary endpoint per formulation (PREREGISTRATION section 2): for every standard mixed
+    variant (K > 0) and dose of the ``inject`` injection, ``dlam_lang_dom`` = lambda(K, lang_dom)
+    - lambda(K=0, lang_dom) against the K=0 variant of the same formulation, ``dlam_rand`` the same
+    for the mean lambda over the random directions (only directions present at both K), and
+    ``did_lang_dom_minus_rand`` = their difference.  ``split`` is the pre-registered split of the
+    formulation, ``position_deviation`` marks the C levels whose injection site is not the
+    pre-registered one (:data:`PREREG_C`)."""
+    if damage.empty:
+        return pd.DataFrame(columns=DAMAGE_CONTRAST_COLS)
+    d = damage[(damage["inject"] == inject) & (damage["kind"] == "standard")
+               & damage["dir_family"].isin(["lang_dom", "rand"])]
+    if d.empty:
+        return pd.DataFrame(columns=DAMAGE_CONTRAST_COLS)
+    rows = []
+    for (fam, form), g in d.groupby(["family", "formulation"], sort=True):
+        ref = g[g["K"] == 0]
+        if ref.empty:
+            continue
+        for (tag, eps), gv in g[g["K"] != 0].groupby(["tag", "eps"], sort=False):
+            r0 = ref[ref["eps"] == eps]
+            ld, ld0 = gv[gv["dir_family"] == "lang_dom"]["lam"], r0[r0["dir_family"] == "lang_dom"]["lam"]
+            rk = gv[gv["dir_family"] == "rand"].set_index("direction")["lam"]
+            r0r = r0[r0["dir_family"] == "rand"].set_index("direction")["lam"]
+            common = sorted(set(rk.index) & set(r0r.index))
+            lam_ld = float(ld.iloc[0]) if len(ld) else float("nan")
+            lam_ld0 = float(ld0.iloc[0]) if len(ld0) else float("nan")
+            lam_r = float(rk.loc[common].mean()) if common else float("nan")
+            lam_r0 = float(r0r.loc[common].mean()) if common else float("nan")
+            K, Cc = int(gv["K"].iloc[0]), str(gv["C"].iloc[0])
+            rows.append(dict(family=fam, formulation=form, tag=tag, K=K, C=Cc, kind="standard", inject=inject,
+                             eps=float(eps), lam_lang_dom=lam_ld, lam_lang_dom_K0=lam_ld0, dlam_lang_dom=lam_ld - lam_ld0,
+                             lam_rand=lam_r, lam_rand_K0=lam_r0, dlam_rand=lam_r - lam_r0,
+                             did_lang_dom_minus_rand=(lam_ld - lam_ld0) - (lam_r - lam_r0), n_rand=len(common),
+                             split=C.prereg_split(fam, form), position_deviation=Cc != PREREG_C))
+    return pd.DataFrame(rows, columns=DAMAGE_CONTRAST_COLS)
+
+
+def damage_boot(contrasts: pd.DataFrame, n_boot: int, seed: int, splits=C.SPLITS) -> pd.DataFrame:
+    """Family cluster bootstrap (family means, PREREGISTRATION section 2: both formulations and
+    every mask of a family drawn together) of :data:`DAMAGE_BOOT_QUANTITIES` per (inject, K, C,
+    eps) and split.  ``preregistered`` = the C1 rows of ``dlam_lang_dom`` and
+    ``did_lang_dom_minus_rand`` (H1: > 0 and > rand), ``confirmatory`` = those rows on the test
+    split; ``min_effect_met`` / ``verdict`` follow the CI
+    rule (:func:`~lsne.experiments.common.min_effect_verdict`, minimum 0.05 per layer; not for
+    ``dlam_rand``); ``monotone_in_K`` = the means of the K levels of the same (quantity, inject, C,
+    eps, split) do not decrease with K (None with a single K)."""
+    if contrasts.empty:
+        return pd.DataFrame(columns=DAMAGE_BOOT_COLS)
+    rows = []
+    for (inj, K, Cc, eps), g in contrasts.groupby(["inject", "K", "C", "eps"], sort=True):
+        for q in DAMAGE_BOOT_QUANTITIES:
+            for r in C.split_boot_rows(g, q, n_boot, seed, splits=splits, with_p=True, quantity=q, inject=inj,
+                                       K=int(K), C=str(Cc), eps=float(eps)):
+                met, verdict = (C.min_effect_verdict(r["ci_low"], r["ci_high"], PREREG_MIN_DLAM)
+                                if q != "dlam_rand" else (None, ""))
+                pre = str(Cc) == PREREG_C and q != "dlam_rand"
+                rows.append(dict(r, stat_level="cluster", position_deviation=str(Cc) != PREREG_C, preregistered=pre,
+                                 confirmatory=bool(pre and r["split"] == "test"),
+                                 min_effect=PREREG_MIN_DLAM if q != "dlam_rand" else float("nan"),
+                                 min_effect_met=met, verdict=verdict))
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(columns=DAMAGE_BOOT_COLS)
+    out["monotone_in_K"] = None
+    for _, g in out.groupby(["quantity", "inject", "C", "eps", "split"], sort=False):
+        if g["K"].nunique() < 2:
+            continue
+        m = g.sort_values("K")["mean"].to_numpy(dtype=float)
+        out.loc[g.index, "monotone_in_K"] = bool(np.all(np.isfinite(m)) and np.all(np.diff(m) >= 0))
+    return out[DAMAGE_BOOT_COLS].reset_index(drop=True)
 
 
 # --------------------------------------------------------------------------------------
@@ -459,7 +568,8 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
                              bank=C.bank_signature(variants, site, cfg, limits, original),
                              depth_bank=C.bank_signature(variants, dsite, cfg, limits, original),
                              lattice_dirs=lattice_dirs, doses=list(doses), gen_dirs=gen_dirs,
-                             core=[v.tag for v in core], limits={k: v for k, v in asdict(limits).items()
+                             core=[v.tag for v in core], limits={k: RESUME_PINNED_LIMITS.get(k, v)
+                                                                 for k, v in asdict(limits).items()
                                                                  if k not in ("progress", "damage_batch_size")},
                              cfg=dict(seed=cfg.seed, gen_n_new=cfg.gen_n_new, gen_n_samples=cfg.gen_n_samples,
                                       gen_temperature=cfg.gen_temperature, doses_steer=list(cfg.doses_steer)),
@@ -474,7 +584,9 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     gen = res.chunked("generation", core, lambda vs: generation_tables(
         mb, vs, bank, gen_dirs, cfg, limits, site, enabled=limits.progress))
 
+    dcon = damage_contrasts(damage, inject="depth")
     tables = {"damage": damage, "damage_profile": profile, "damage_phase": phase_table(damage),
+              "damage_contrasts": dcon, "damage_boot": damage_boot(dcon, n_boot=limits.n_boot, seed=cfg.seed),
               "lens": lens, "lens_summary": lens_summary, "update_norms": upd, "ca": ca, "ca_layers": ca_layers}
     tables.update(gen)
     markers = resolve_markers(mb, lexicon, bank.get("lang_dom"))
@@ -495,6 +607,15 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
                                    tokens_per_step=limits.gen_tokens_per_step, t_on=limits.gen_t_on,
                                    n_null=int(getattr(limits, "gen_n_null", HYST_N_NULL)),
                                    doses_steer=list(cfg.doses_steer)),
-                          resumed_checkpoints=len(res.loaded))
+                          resumed_checkpoints=len(res.loaded),
+                          audit=dict(C.audit_summary(damage),
+                                     by_inject={str(k): C.audit_summary(g) for k, g in damage.groupby("inject", sort=True)}
+                                     if len(damage) else {}),
+                          primary=dict(table="damage_boot", inject="depth", n_boot=int(limits.n_boot),
+                                       quantities=list(DAMAGE_BOOT_QUANTITIES), min_effect=PREREG_MIN_DLAM,
+                                       preregistered_C=PREREG_C, splits=list(C.SPLITS),
+                                       position_deviation=("C levels other than C1 inject at the last German token "
+                                                           "(lsne.stimuli.last_switched_position), not at the last "
+                                                           "token of unit 9 of PREREGISTRATION section 2")))
     res.clear()
     return out

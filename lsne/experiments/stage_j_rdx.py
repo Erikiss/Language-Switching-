@@ -29,7 +29,13 @@ rdx               contrast 15: :func:`lsne.rdx.rdx_table` of the difference vect
                   z against ``Limits.j_n_random_bases`` random bases of the same size.
                   ``preregistered`` = culture_politics_vs_misfolding x domain_axes x last
 rdx_summary       per (contrast, basis, readout): sites, share of sites with z >= 2,
-                  ``min_effect_met`` (>= half of the sites; contrast 15)
+                  ``min_effect_met`` (>= half of the sites; contrast 15).  The cross-domain
+                  contrast is evaluated against the misfolding pole (``evaluated_pole``); rule
+                  16 (``pile_rank_check``) may replace the counterpole by the hardest Pile
+                  subfield (``counterpole_rule16``).  ``preregistered_form`` is True only when
+                  both agree, False when rule 16 fired (contrast 15 then is NOT in its
+                  pre-registered form: the misfolding result is exploratory), empty when the
+                  ranking did not run; the manifest repeats this under ``rule16``
 rdx_stability     :func:`lsne.rdx.stability` across families (E_vs_D, K0_vs_K8) and across
                   family pairs (cross-domain contrasts)
 sharing           :func:`lsne.sharing.sharing_table` at the dossier site: Jaccard sharing
@@ -61,6 +67,9 @@ from .stage_g_geometry import realization_clouds
 from .stage_i_compass import DOMAIN_AXES
 
 PREREG_CONTRAST, PREREG_BASIS, PREREG_READOUT = "culture_politics_vs_misfolding", "domain_axes", "last"
+#: The pole each cross-domain contrast is evaluated against (contrast 15: the misfolding families
+#: F19-F20); rule 16 may name another counterpole (``pile_rank_check.counterpole``).
+EVALUATED_POLES = {"culture_politics_vs_misfolding": "protein_misfolding"}
 PREREG_Z = 2.0
 RDX_COLS = ["contrast", "unit", "basis", "site", "layer", "readout", "k", "explained", "random_mean", "random_sd", "z", "p_random",
             "delta_norm", "n_a", "n_b", "top_component", "top_share", "sae_source", "preregistered", "z_ge_2"]
@@ -222,9 +231,27 @@ def rdx_rows(mb: ModelBundle, contrasts: dict, bases: dict, sites: Sequence[Hook
     return out[RDX_COLS]
 
 
-def rdx_summary(rdx: pd.DataFrame) -> pd.DataFrame:
+def rule16_status(counterpole: Optional[str], evaluated_pole: str = "protein_misfolding") -> dict:
+    """Contrast 15 against rule 16: ``counterpole_rule16`` (the counterpole of
+    ``pile_rank_check``, None when the ranking did not run), ``evaluated_pole`` (the pole the RDX
+    contrast was computed with) and ``preregistered_form`` (True when they agree, False when rule
+    16 replaced the counterpole, None when unknown)."""
+    cp = None if counterpole is None or (isinstance(counterpole, float) and not np.isfinite(counterpole)) or str(counterpole) in ("", "None", "nan") \
+        else str(counterpole)
+    form = None if cp is None else bool(cp == evaluated_pole)
+    note = ("rule 16 did not run (no Pile ranking): the form of contrast 15 is unknown" if cp is None else
+            "contrast 15 evaluated in its pre-registered form" if form else
+            f"rule 16 replaced the counterpole by {cp!r}, but contrast 15 was evaluated against {evaluated_pole!r}: "
+            "NOT the pre-registered form (exploratory)")
+    return dict(counterpole_rule16=cp, evaluated_pole=evaluated_pole, preregistered_form=form, note=note)
+
+
+def rdx_summary(rdx: pd.DataFrame, counterpole: Optional[str] = None) -> pd.DataFrame:
+    """Per (contrast, basis, readout) of the pooled rows: share of sites with z >= 2 and
+    ``min_effect_met``; the cross-domain contrasts carry ``evaluated_pole``,
+    ``counterpole_rule16`` and ``preregistered_form`` (:func:`rule16_status`)."""
     cols = ["contrast", "basis", "readout", "n_sites", "n_z_ge_2", "frac_z_ge_2", "z_mean", "z_min", "explained_mean", "preregistered",
-            "min_effect_met"]
+            "min_effect_met", "evaluated_pole", "counterpole_rule16", "preregistered_form"]
     if rdx.empty:
         return pd.DataFrame(columns=cols)
     rows = []
@@ -233,10 +260,13 @@ def rdx_summary(rdx: pd.DataFrame) -> pd.DataFrame:
         ok = np.isfinite(z)
         n = int(ok.sum())
         n2 = int((z[ok] >= PREREG_Z).sum())
+        pole = EVALUATED_POLES.get(str(c))
+        st = rule16_status(counterpole, pole) if pole else dict(evaluated_pole="", counterpole_rule16=None, preregistered_form=None)
         rows.append(dict(contrast=c, basis=b, readout=ro, n_sites=n, n_z_ge_2=n2, frac_z_ge_2=(n2 / n) if n else np.nan,
                          z_mean=float(np.nanmean(z)) if ok.any() else np.nan, z_min=float(np.nanmin(z)) if ok.any() else np.nan,
                          explained_mean=float(np.nanmean(g["explained"])), preregistered=bool(g["preregistered"].any()),
-                         min_effect_met=bool(n and n2 >= np.ceil(n / 2))))
+                         min_effect_met=bool(n and n2 >= np.ceil(n / 2)), evaluated_pole=st["evaluated_pole"],
+                         counterpole_rule16=st["counterpole_rule16"], preregistered_form=st["preregistered_form"]))
     return pd.DataFrame(rows, columns=cols)
 
 
@@ -285,7 +315,11 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=RDX_COLS), st
     rdx_units, stab = sub.run("stability", _stab, (pd.DataFrame(columns=RDX_COLS), empty))
     rdx_all = pd.concat([rdx, rdx_units], ignore_index=True) if len(rdx_units) else rdx
-    summary = sub.run("rdx_summary", lambda: rdx_summary(rdx_all), empty)
+    counterpole = check["counterpole"].iloc[0] if len(check) and "counterpole" in check.columns else None
+    rule16 = dict(rule16_status(counterpole, EVALUATED_POLES[PREREG_CONTRAST]), contrast_15_evaluated=PREREG_CONTRAST in pooled)
+    if rule16["preregistered_form"] is False and rule16["contrast_15_evaluated"]:
+        warnings.warn(f"stage J: {rule16['note']}")
+    summary = sub.run("rdx_summary", lambda: rdx_summary(rdx_all, counterpole), empty)
 
     def _sharing():
         if sae is None:
@@ -310,6 +344,8 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
                           bases=list(bases), readouts=list(readouts), n_random_bases=limits.j_n_random_bases,
                           pile=dict(n=limits.j_n_pile, max_len=limits.j_pile_max_len, offline=C.offline(),
                                     check=(check.iloc[0].to_dict() if len(check) else None)),
-                          substages=sub.report(),
-                          prereg=dict(contrast_15="rdx_summary row contrast=culture_politics_vs_misfolding, basis=domain_axes, readout=last",
+                          substages=sub.report(), rule16=rule16,
+                          prereg=dict(contrast_15="rdx_summary row contrast=culture_politics_vs_misfolding, basis=domain_axes, readout=last "
+                                                  "(pre-registered form only when rdx_summary.preregistered_form is True: the rule-16 "
+                                                  "counterpole equals the evaluated pole; see rule16)",
                                       contrast_16="pile_rank_check: rank / in_hardest_third / counterpole"))

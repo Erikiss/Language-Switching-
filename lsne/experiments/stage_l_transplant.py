@@ -25,10 +25,14 @@ transfer_summary  one row: the best layer (max cosine), its flags, ``validated``
 layer_matching    :func:`layer_matching` R^2 table over source x target grid layers
 alignments        one row per target layer of :func:`layer_alignments` (the maps that
                   plant the KV prefix at every layer): layer_src, r2_train/holdout/permuted
-transplant        :func:`transplant_experiment` per prompt (K=0 contexts with their
-                  targets) x mode (residual / kv / both) x control (none / random /
-                  identity / permuted_alignment): entropy, logp_target, fD of a short
-                  continuation, written_norm, kv_layers
+transplant        :func:`transplant_experiment` per prompt (``Limits.l_n_prompts`` K=0
+                  contexts with their targets, spread round robin over the families,
+                  :func:`round_robin_families`) x mode (residual / kv / both) x control (none /
+                  random / identity / permuted_alignment): entropy, logp_target, fD of a short
+                  continuation, written_norm, kv_layers.  Every alignment map (target layer <-
+                  its source layer) is dosed with the language direction measured at its own
+                  source layer (:func:`layer_consistent_directions`; ``v_src_per_layer``,
+                  ``v_src_layer``), dose ``Limits.l_eps`` (0.3: eps = 1 saturates the readout)
 transplant_summary per mode: fD and logp_target of the transplant arm minus each control
                   (mean over prompts), the sign of the fD shift vs the identity control and
                   whether it agrees with the native axis's shift (contrast 18, last clause)
@@ -52,7 +56,9 @@ of every alignment, default the last, ``n_layers``), ``k`` (fan-out threshold, 5
 :func:`trace_prompt_variants`), ``split`` (``all`` / ``heldout`` / ``train``: transactions of
 the LM's hash split only, default ``all``; the LM-split membership of the probe and
 alignment items is recorded in the manifest), ``standin`` (the stage-L run directory of the
-stand-in validation, PREREGISTRATION 18).  Helpers: :mod:`lsne.chain.pairs`.
+stand-in validation, PREREGISTRATION 18), ``eps`` (dose of the transplanted direction,
+default :data:`TRACE_EPS` = 1.0, the dose the path was built with; independent of the
+stand-in's ``Limits.l_eps``).  Helpers: :mod:`lsne.chain.pairs`.
 
 1. *Probe* (``trace_probe``, ``trace_probe_match``): the length-matched fan-out probe
    (``fan_out_eth >= k`` vs ``== 1`` on net flows, required on the visible window too, 1:1
@@ -76,7 +82,8 @@ stand-in validation, PREREGISTRATION 18).  Helpers: :mod:`lsne.chain.pairs`.
 3. *Transplant* (``transplant``, ``transplant_summary``): prompt pairs (carrier transaction,
    stimulus variant) for the K=0 variants (one per family, :func:`trace_prompt_variants`) and
    their K=8/C1 partners; the carrier is a matched probe negative (fan-out 1), the same for
-   both variants of a formulation; residual substitution (last ``trace_n_substitute``
+   both variants of a formulation; dose :data:`TRACE_EPS` (1.0, option ``trace_eps``; not the
+   stand-in's ``Limits.l_eps``); residual substitution (last ``trace_n_substitute``
    positions), KV planting at every layer, both; controls random (one random direction per
    carrier, shared by the K=0 and K=8/C1 partner) / identity / permuted_alignment; site =
    the grid layer nearest the middle; ``cos_native`` against Pythia's own
@@ -88,16 +95,23 @@ stand-in validation, PREREGISTRATION 18).  Helpers: :mod:`lsne.chain.pairs`.
    pooled), T, fD and entropy with family cluster-bootstrap CIs (``trace_effects``); the
    sharing index (Jaccard of active SAE latents K0 vs K8C1) and network activity
    (:mod:`lsne.sharing`) at the dossier site per arm and for the plain model
-   (``trace_sharing``; ``sae_source`` marks a synthetic SAE in smoke runs).
+   (``trace_sharing``; ``sae_source`` marks a synthetic SAE in smoke runs); every arm (the
+   transplant and each control) minus the plain model (``trace_damage``,
+   :func:`trace_damage`: how much a control damages log p(target) by itself).
 5. ``trace_verdict`` (:func:`trace_verdict`): one row per mode.  ``sharing_effect_claimed`` =
    ``probe_ok`` (``feature_frozen`` AND the probe criterion ``counts`` at the frozen layer AND
-   ``direction_spec_ok``) AND ``align_ok`` (residualised hold-out R² > 0 and gap >= 0.2 on
-   every map the mode uses: the site layer for residual, every planted layer for kv, both
-   for both) AND ``transplant_effect`` (B or T differs from both the random and the
-   permuted-alignment control with CIs excluding 0 in the same direction, >= 3 families); it
-   is **never** True without the probe criterion.  ``counts_for_prereg`` additionally needs
-   a passed stand-in validation (``standin``: ``verdict.validated`` True for a language
-   source).  ``claim`` states the reasons.
+   ``beats_surface`` there AND ``direction_spec_ok``) AND ``align_ok`` (residualised hold-out
+   R² > 0 and gap >= 0.2 on every map the mode uses: the site layer for residual, every
+   planted layer for kv, both for both) AND ``align_beats_untrained`` (CI of the residualised
+   gain over the untrained twin above 0) AND ``transplant_effect`` (B or T differs from the
+   plain model, the random and the permuted-alignment control, all CIs excluding 0 in the
+   pre-specified direction :data:`TRACE_EXPECTED_SIGN` -- B and T up --, >= 3 families: a
+   transplant that is merely less harmful than a destructive control is no effect); it is
+   **never** True without the probe criterion.  ``counts_for_prereg`` additionally needs a
+   passed stand-in validation (``standin``: ``verdict.validated`` True for a language source)
+   and a healthy trace-LM corpus (:func:`read_lm_corpus`: address OOV of the training
+   transactions <= 0.5).  ``claim`` states the reasons.  :func:`rejudge_trace` recomputes the
+   verdict of a finished run from its tables.
 
 The functional transfer test (contrast 18, ``transfer_test`` / ``transfer_summary``) needs
 paired language texts in both models and is skipped for a trace source (empty tables,
@@ -105,6 +119,7 @@ manifest ``functional_transfer.skipped``); ``verdict`` then holds one explanator
 """
 from __future__ import annotations
 
+import json
 import time
 import warnings
 from typing import Optional, Sequence
@@ -134,7 +149,7 @@ PREREG_R2_GAP, PREREG_MIN_COS = 0.2, 0.3
 # --------------------------------------------------------------------------------------
 #: options of the trace source that can ride on ``--transplant-source trace:<dir>,<key>=<value>,...``
 TRACE_SPEC_KEYS = ("shards", "direction", "layer", "k", "n_probe", "n_pairs", "site_layer", "length_ratio", "limit",
-                   "n_substitute", "n_prompts", "standin", "split")
+                   "n_substitute", "n_prompts", "standin", "split", "eps")
 
 
 def parse_trace_spec(spec: str) -> tuple[str, dict]:
@@ -309,7 +324,8 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
                 kw[f"trace_{key}"] = val
         return run_trace(cfg, mb, run_dir, src, limits, kw, t0, sub, variants)
     texts_E, texts_D, texts_N = C.family_text_pairs(fams, limits.l_n_texts)
-    k0 = C.k_subset(variants, 0)[: int(limits.l_n_prompts)]
+    # prompts: K=0 variants spread over the families (round robin), not the first formulations of one family
+    k0 = round_robin_families(C.k_subset(variants, 0), int(limits.l_n_prompts))
     prompts = [v.text for v in k0] or ["Yesterday we went to the market and"]
     grid = list(C.prereg_layer_grid(mb.n_layers))
 
@@ -327,17 +343,21 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     pairs = [(t, t) for t in texts_E + texts_D + texts_N]
     lm, al = sub.run("alignments", lambda: alignment_tables(src, mb, pairs, list(range(mb.n_layers + 1))), (empty, dict(aligns={}, table=empty)))
 
+    v_src_layers: dict = {}
+
     def _transplant():
         if not al["aligns"]:
             raise RuntimeError("no alignments")
         key = site.layer if site.layer in results else None
         if key is not None:
-            v_src, native, d_nat = results[key]["v_src"], results[key]["v_native"], float(results[key]["delta_fD_native"])
+            native, d_nat = results[key]["v_native"], float(results[key]["delta_fD_native"])
         else:
-            S = torch.stack([TP._pool_rows(src.residuals(src.encode(t), [site.layer])[site.layer], "mean") for t in texts_E + texts_D])
-            v_src = diff_of_means(S[len(texts_E):], S[: len(texts_E)])
             Tt = torch.stack([TP.target_residuals(mb, mb.encode(t), [site.layer])[site.layer].mean(0) for t in texts_E + texts_D])
             native, d_nat = diff_of_means(Tt[len(texts_E):], Tt[: len(texts_E)]), float("nan")
+        # layer-consistent transplant direction: every map (target layer <- its own source layer) is dosed with
+        # the source direction measured at that source layer, not with the one of the transfer test's layer
+        v_src = layer_consistent_directions(src, texts_E, texts_D, [a.layer_src for a in al["aligns"].values()])
+        v_src_layers.update({int(l): int(a.layer_src) for l, a in al["aligns"].items()})
         return transplant_tables(mb, src, al["aligns"], v_src, native, [(v.text, int(v.target_id)) for v in k0] or prompts, site, cfg, limits, d_nat)
     tp, tp_summary = sub.run("transplant", _transplant, (empty, empty))
 
@@ -348,9 +368,13 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     return C.finish_stage(run_dir, "L", cfg, mb, tables, limits=limits, t0=t0, site=site, source=dict(kind=source_kind, name=getattr(src, "name", ""),
                                                                                                      d_model=int(src.d_model), n_layers=int(src.n_layers)),
                           n_texts=dict(E=len(texts_E), D=len(texts_D), neutral=len(texts_N)), prompts=prompts, layer_grid=grid,
+                          prompt_selection=dict(rule="round_robin_families", n_prompts=int(limits.l_n_prompts), n_used=len(prompts),
+                                                tags=[v.tag for v in k0], families=sorted({str(v.family_id) for v in k0})),
                           validated=(None if verdict.empty or self_consistency else bool(verdict["validated"].iloc[0])),
                           self_consistency=self_consistency,
-                          transplant=dict(eps=limits.l_eps, n_prefix=limits.l_n_prefix, n_gen=cfg.gen_n_new, n_samples=cfg.gen_n_samples),
+                          transplant=dict(eps=limits.l_eps, n_prefix=limits.l_n_prefix, n_gen=cfg.gen_n_new, n_samples=cfg.gen_n_samples,
+                                          v_src="layer_consistent: per alignment map the source direction at its own source layer",
+                                          v_src_layer_by_target_layer=v_src_layers),
                           substages=sub.report(),
                           prereg=dict(contrast_18="verdict.validated = transfer_summary (r2_gap_ok, cos_ok, sign_agreement at the best layer) "
                                                   "AND transplant_summary.sign_agrees_with_native for modes residual and kv; "
@@ -361,9 +385,22 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
 # trace source (DESIGN 4.9 with lsne.chain): probe -> residualised alignments -> transplant
 # ======================================================================================
 TRACE_MIN_CLUSTERS = 3                 # families needed before a transplant effect can count
+TRACE_MIN_PROMPTS = 3                  # least default number of trace prompts (the l_n_prompts default the path was built with)
+#: dose of the trace transplant (option ``trace_eps`` / ``eps=``): the ``l_eps`` default the path was
+#: built with and the first A100 trace run used.  The stand-in's ``Limits.l_eps`` (0.3 since
+#: 27.10.2026, a stand-in finding about the f_D readout) does not move the trace protocol.
+TRACE_EPS = 1.0
 TRACE_MIN_PROBE_PAIRS = 4              # matched pairs needed by the probe criterion
 TRACE_MODES = ("residual", "kv", "both")
 TRACE_CONTROLS = ("random", "identity", "permuted_alignment")
+#: pre-specified direction of a trace transplant effect (fixed 27.10.2026, before any confirmatory
+#: trace run): the transplanted sharing direction is to *help* the language-switching task --
+#: log p(target) above the unmodified model (B = ln p_delta - ln p_0 > 0, DESIGN's intervention
+#: benefit) and a smaller switching cost (T - T_plain > 0).  Every contrast of a claim (transplant
+#: minus plain, minus random, minus permuted_alignment) must have this sign; a transplant that only
+#: does less damage than a destructive control is no effect.
+TRACE_EXPECTED_SIGN = {"B_all": +1, "T": +1}
+TRACE_DAMAGE_QUANTITIES = ("B_all", "B_K0", "B_K8C1", "T")
 FT_SKIP_REASON = ("trace source: the functional transfer test (contrast 18) needs paired language texts (E/D) in "
                   "both models; it validates the machinery with a language source and is skipped here")
 LM_TRACE_COLS = ["layer_src", "layer_tgt", "r2_train", "r2_holdout", "r2_permuted", "gap", "r2_holdout_raw",
@@ -384,6 +421,12 @@ def _trace_opt(kw: dict, limits, name: str, default=None):
     if v is None:
         v = getattr(limits, f"l_trace_{name}", None)
     return default if v is None else v
+
+
+def trace_eps(kw: dict, limits) -> float:
+    """Dose of the trace transplant: option ``trace_eps`` (``eps=`` on the spec string), else
+    :data:`TRACE_EPS` -- never the stand-in's ``Limits.l_eps``."""
+    return float(_trace_opt(kw, limits, "eps", TRACE_EPS))
 
 
 def _nearest_middle(grid: Sequence[int], n_layers: int) -> int:
@@ -510,14 +553,51 @@ def trace_alignment(src, twin, mb: ModelBundle, index: pd.DataFrame, shards: str
                 controls=controls, items=items, covariates=names, native=native, n_pairs=len(items), lm_split=lm_split)
 
 
+def round_robin_families(variants: Sequence, n: int) -> list:
+    """At most ``n`` of ``variants`` spread over the families: the first variant of every family
+    (families in order of first appearance), then the second, ... (stand-in and trace transplant
+    prompts: the family cluster bootstrap needs families, not formulations of one family)."""
+    fams: dict = {}
+    for v in variants:
+        fams.setdefault(v.family_id, []).append(v)
+    out, depth = [], 0
+    while len(out) < int(n) and any(depth < len(vs) for vs in fams.values()):
+        for vs in fams.values():
+            if depth < len(vs) and len(out) < int(n):
+                out.append(vs[depth])
+        depth += 1
+    return out
+
+
+def layer_consistent_directions(src, texts_E: Sequence[str], texts_D: Sequence[str], layers_src: Sequence[int],
+                                denoise_pcs: int = 1) -> dict[int, torch.Tensor]:
+    """``{layer_src: v_src}``: the language direction (difference of means German - English of
+    the mean-pooled source states, as in :func:`lsne.transplant.functional_transfer_test`) at every
+    source layer an alignment map reads from, so that each map is dosed with the direction of its
+    own source layer (a map fitted L3 -> L5 must not carry the source-L5 axis)."""
+    layers = sorted({int(l) for l in layers_src})
+    S = {l: [] for l in layers}
+    for t in list(texts_E) + list(texts_D):
+        H = src.residuals(src.encode(t), layers)
+        for l in layers:
+            S[l].append(TP._pool_rows(H[l], "mean"))
+    nE = len(texts_E)
+    out = {}
+    for l in layers:
+        X = torch.stack(S[l])
+        out[l] = diff_of_means(X[nE:], X[:nE], denoise_pcs=denoise_pcs)
+    return out
+
+
 def trace_prompt_variants(k0: Sequence, k8: Sequence, n_prompts=None, limits: Optional[C.Limits] = None) -> list:
     """The K=0 variants of the trace transplant, spread over the families: round-robin over
     the families in order (first formulation of every family, then the second, ...),
     formulations with a K=8/C1 partner first.  ``n_prompts`` (option ``trace_n_prompts``)
     sets the number; the default covers every selected family once and is at least
-    ``Limits.l_n_prompts`` (a smoke run keeps ``l_n_prompts``).  The family cluster bootstrap
-    of ``trace_effects`` needs >= ``TRACE_MIN_CLUSTERS`` families, so the first
-    ``l_n_prompts`` variants of one family can never support an effect."""
+    :data:`TRACE_MIN_PROMPTS` (a smoke run keeps ``Limits.l_n_prompts``; outside smoke runs
+    ``l_n_prompts`` is the stand-in's prompt count and does not change the trace default).  The
+    family cluster bootstrap of ``trace_effects`` needs >= ``TRACE_MIN_CLUSTERS`` families, so
+    the first variants of one family can never support an effect."""
     partners = {(v.family_id, v.formulation) for v in k8}
     fams: dict = {}
     for v in k0:
@@ -525,17 +605,13 @@ def trace_prompt_variants(k0: Sequence, k8: Sequence, n_prompts=None, limits: Op
     for f, vs in fams.items():
         vs.sort(key=lambda v: (v.family_id, v.formulation) not in partners)      # stable: partnered first
     if n_prompts is None:
-        base = int(limits.l_n_prompts) if limits is not None else 1
-        n = base if (limits is not None and limits.is_smoke) else max(base, len(fams))
+        if limits is not None and limits.is_smoke:
+            n = int(limits.l_n_prompts)
+        else:
+            n = max(TRACE_MIN_PROMPTS if limits is not None else 1, len(fams))
     else:
         n = int(n_prompts)
-    out, depth = [], 0
-    while len(out) < n and any(depth < len(vs) for vs in fams.values()):
-        for vs in fams.values():
-            if depth < len(vs) and len(out) < n:
-                out.append(vs[depth])
-        depth += 1
-    return out
+    return round_robin_families([v for vs in fams.values() for v in vs], n)
 
 
 def trace_transplant(mb: ModelBundle, src, aligns: dict, v_src, native, variants, probe: dict, align: dict, site: HookSite,
@@ -563,7 +639,8 @@ def trace_transplant(mb: ModelBundle, src, aligns: dict, v_src, native, variants
                              K=int(v.K), C=str(v.C), carrier=str(car.get("tx_hash")), carrier_label=car.get("label"),
                              carrier_fan_out=feat.get("fan_out_eth"), carrier_n_tokens=car.get("n_tokens")))
     n_sub = int(_trace_opt(kw, limits, "n_substitute", int(limits.l_n_prefix)))
-    df, states = TP.transplant_experiment(mb, src, aligns, v_src, prompts, site, eps=limits.l_eps, n_prefix=int(limits.l_n_prefix),
+    eps = trace_eps(kw, limits)
+    df, states = TP.transplant_experiment(mb, src, aligns, v_src, prompts, site, eps=eps, n_prefix=int(limits.l_n_prefix),
                                           n_substitute=n_sub, native_axis=native, seed=cfg.seed, state_sites=[meas_site],
                                           gen_kw=dict(n_new=cfg.gen_n_new, n_samples=cfg.gen_n_samples,
                                                       temperature=cfg.gen_temperature))
@@ -577,7 +654,7 @@ def trace_transplant(mb: ModelBundle, src, aligns: dict, v_src, native, variants
         plain_rows.append(dict(meta[i], logp_plain=lp))
         plain_states.append(co.resid[meas_site.key][0, -1].detach().float().cpu().numpy())
     return dict(df=df, states=states, plain=pd.DataFrame(plain_rows), plain_states=plain_states, meta=mdf,
-                n_substitute=n_sub, n_prompts=len(prompts), n_families=int(mdf["family"].nunique()) if len(mdf) else 0)
+                n_substitute=n_sub, n_prompts=len(prompts), n_families=int(mdf["family"].nunique()) if len(mdf) else 0, eps=eps)
 
 
 def _diff_rows(a: pd.DataFrame, b: pd.DataFrame, col: str, keys: Sequence[str]) -> pd.DataFrame:
@@ -669,6 +746,63 @@ def trace_readouts(tp: dict, sae, sae_source: str, meas_site: HookSite, n_boot: 
     return bt, tt, effects, sharing
 
 
+def trace_damage(bt: pd.DataFrame, tt: pd.DataFrame, n_boot: int, seed: int) -> pd.DataFrame:
+    """``trace_damage``: every arm -- the transplant (``control = "none"``) and each control --
+    minus the unmodified ("plain") model, per mode x quantity (``B_all`` / ``B_K0`` /
+    ``B_K8C1``: ``B = logp_target - logp_plain``; ``T``: ``dT = T - T_plain``), family cluster
+    bootstrap, the columns of ``trace_effects``.  Negative = the arm lowers log p(target) (or the
+    K=8/C1 advantage) below the plain model's: the damage against which a transplant-minus-control
+    difference has to be read (``trace_effects`` row = damage of the transplant minus damage of
+    the control)."""
+    rows = []
+    if bt is None or bt.empty:
+        return pd.DataFrame(columns=EFFECT_COLS)
+    tt = tt if tt is not None and len(tt) else pd.DataFrame(columns=T_COLS)
+    for mode in [m for m in TRACE_MODES if m in set(bt["mode"])]:
+        for arm in ("none",) + TRACE_CONTROLS:
+            b = bt[(bt["mode"] == mode) & (bt["control"] == arm)]
+            if b.empty:
+                continue
+            t = tt[(tt["mode"] == mode) & (tt["control"] == arm)]
+            dv = b.assign(diff=b["B"])
+            per_q = dict(B_all=dv, B_K0=dv[dv["K"] == 0], B_K8C1=dv[dv["K"] == 8], T=t.assign(diff=t["dT"]))
+            for q in TRACE_DAMAGE_QUANTITIES:
+                rows.append(_effect_row(per_q[q], n_boot, seed, mode=mode, control=arm, quantity=q))
+    return pd.DataFrame(rows, columns=EFFECT_COLS)
+
+
+def read_lm_corpus(model_dir) -> dict:
+    """Health of the trace LM's training corpus from its ``manifest.json`` (``corpus``, written
+    by ``python -m lsne.chain.cli train``): ``ok`` when the model saw training transactions and
+    the address OOV rate of those transactions under its vocabulary is at most
+    :data:`lsne.chain.cli.MAX_OOV_ADDRESS` (the first A100 run trained at 0.967 on a vocabulary
+    built from 0 transactions).  A manifest without corpus statistics is not ok."""
+    import os
+
+    from ..chain.cli import MAX_OOV_ADDRESS, oov_guard
+    out = dict(ok=False, reason=None, oov_address_rate=float("nan"), n_tx_train=None)
+    try:
+        with open(os.path.join(str(model_dir), "manifest.json"), encoding="utf-8") as fh:
+            corpus = (json.load(fh) or {}).get("corpus") or {}
+    except (OSError, ValueError) as e:
+        out["reason"] = f"trace LM manifest unreadable ({type(e).__name__})"
+        return out
+    if not corpus:
+        out["reason"] = "no corpus statistics in the trace LM manifest (not trained by `lsne.chain.cli train`)"
+        return out
+    oov = corpus.get("oov_train") or corpus.get("oov") or {}
+    rate = oov.get("rate_A")
+    out.update(oov_address_rate=float("nan") if rate is None else float(rate), n_tx_train=corpus.get("n_tx_train"))
+    why = oov_guard(corpus, MAX_OOV_ADDRESS)
+    if not corpus.get("n_tx_train"):
+        out["reason"] = "the trace LM was trained on 0 transactions"
+    elif why:
+        out["reason"] = f"trace LM corpus: {why}"
+    else:
+        out["ok"] = True
+    return out
+
+
 def _sharing_delta(sharing: pd.DataFrame, mode: str, control: str, measure: str, condition: str) -> float:
     if sharing is None or sharing.empty:
         return float("nan")
@@ -683,11 +817,30 @@ def _align_layer_ok(row: dict) -> bool:
     return bool(np.isfinite(gap) and gap >= PREREG_R2_GAP and np.isfinite(r2) and r2 > 0)
 
 
+#: Reason of :func:`read_standin` for a stand-in run written before the fix of 27.10.2026.
+STANDIN_PREDATES_FIX = ("stand-in run predates the 27.10.2026 fix (eps 1.0, first-family prompts, layer-inconsistent "
+                        "v_src): rerun notebook 11")
+
+
+def standin_manifest_ok(man: dict) -> bool:
+    """True when a stand-in run's ``manifest.json`` carries the markers only the stand-in code of
+    27.10.2026 writes: ``prompt_selection.rule == "round_robin_families"`` (prompts spread over
+    the families) and ``transplant.v_src`` starting with ``"layer_consistent"`` (one source
+    direction per alignment map).  Runs written before (eps 1.0, three prompts of the first
+    family, one v_src for every map) lack them."""
+    ps = man.get("prompt_selection") if isinstance(man.get("prompt_selection"), dict) else {}
+    tp = man.get("transplant") if isinstance(man.get("transplant"), dict) else {}
+    return bool(ps.get("rule") == "round_robin_families" and str(tp.get("v_src", "")).startswith("layer_consistent"))
+
+
 def read_standin(path) -> dict:
     """The stand-in validation of PREREGISTRATION 18 from a stage-L run with a language source
     (``path``: its run directory or ``verdict.csv``).  ``ok`` only when ``verdict.validated`` is
-    True, ``counts_for_prereg`` is True and the source is not the target itself or an isometry
-    of it (``self`` / ``rotated_self``: plumbing checks without a verdict)."""
+    True, ``counts_for_prereg`` is True, the source is not the target itself or an isometry
+    of it (``self`` / ``rotated_self``: plumbing checks without a verdict) and the run's
+    ``manifest.json`` (next to ``verdict.csv``) was written by the fixed stand-in code
+    (:func:`standin_manifest_ok`; a run that predates it -- the saturated, single-family
+    notebook-11 run -- must be rerun)."""
     import os
     out = dict(path=None if path is None else str(path), ok=False, reason=None)
     if not path:
@@ -715,33 +868,54 @@ def read_standin(path) -> dict:
     elif not _true(r.get("counts_for_prereg")):
         out["reason"] = "stand-in verdict does not count for the pre-registration"
     else:
-        out["ok"] = True
+        try:
+            with open(os.path.join(os.path.dirname(p), "manifest.json"), encoding="utf-8") as fh:
+                man = json.load(fh) or {}
+        except (OSError, ValueError):
+            man = {}
+        tp = man.get("transplant") if isinstance(man.get("transplant"), dict) else {}
+        out.update(standin_eps=tp.get("eps"), prompt_rule=(man.get("prompt_selection") or {}).get("rule")
+                   if isinstance(man.get("prompt_selection"), dict) else None)
+        if not standin_manifest_ok(man):
+            out["reason"] = STANDIN_PREDATES_FIX
+        else:
+            out["ok"] = True
     return out
 
 
 def trace_verdict(probe: dict, align: dict, effects: pd.DataFrame, sharing: pd.DataFrame, frozen: int, site_layer: int,
                   sae_source: str, is_smoke: bool, modes: Sequence[str] = TRACE_MODES,
-                  standin: Optional[dict] = None) -> pd.DataFrame:
+                  standin: Optional[dict] = None, damage: Optional[pd.DataFrame] = None,
+                  expected_sign: Optional[dict] = None, lm_corpus: Optional[dict] = None) -> pd.DataFrame:
     """One row per mode.  ``sharing_effect_claimed`` = ``probe_ok`` AND ``align_ok`` AND
-    ``transplant_effect`` -- never True unless the probe criterion holds (``probe_ok``:
-    the pre-specified length-matched probe (``feature_frozen``) with at least
-    ``TRACE_MIN_PROBE_PAIRS`` pairs and ``counts`` at the frozen layer, i.e. the bootstrap CI
-    of trained minus untrained split-half AUC above 0, and ``v_src`` from that probe -- a
-    direction file counts only when it was written by the same probe specification,
-    ``direction_spec_ok``).  ``align_ok``: residualised hold-out R² > 0 and gap to the
-    permuted-pairs null >= 0.2 on every map the mode uses -- the site's target layer for
-    ``residual``, every planted layer of the KV prefix for ``kv`` (all target layers), both
-    for ``both`` (``align_ok_site``, ``n_planted_layers`` / ``n_planted_layers_ok``,
-    ``planted_layers_failing``).  ``transplant_effect``: B (pooled over K=0 and K=8/C1) or T
-    of the transplant arm differs from both the random-direction and the permuted-alignment
-    control, both family-bootstrap CIs excluding 0 in the same direction with >=
-    ``TRACE_MIN_CLUSTERS`` families.  ``counts_for_prereg`` additionally needs a passed
-    stand-in validation (PREREGISTRATION 18: ``standin`` from :func:`read_standin`), a frozen
-    feature and no smoke run.  Sharing index / network activity deltas are reported
-    (descriptive, ``sae_source``)."""
+    ``align_beats_untrained`` AND ``transplant_effect`` -- never True unless the probe criterion
+    holds (``probe_ok``: the pre-specified length-matched probe (``feature_frozen``) with at
+    least ``TRACE_MIN_PROBE_PAIRS`` pairs, ``counts`` at the frozen layer, i.e. the bootstrap CI
+    of trained minus untrained split-half AUC above 0, ``beats_surface`` there, i.e. the trained
+    AUC above the surface-baseline AUC of the same pairs (``probe_surface_auc``), and ``v_src``
+    from that probe -- a direction file counts only when it was written by the same probe
+    specification, ``direction_spec_ok``).  ``align_ok``: residualised hold-out R² > 0 and gap
+    to the permuted-pairs null >= 0.2 on every map the mode uses -- the site's target layer for
+    ``residual``, every planted layer of the KV prefix for ``kv`` (all target layers), both for
+    ``both`` (``align_ok_site``, ``n_planted_layers`` / ``n_planted_layers_ok``,
+    ``planted_layers_failing``).  ``align_beats_untrained``: the bootstrap CI of the residualised
+    alignment gain of the trained source over its untrained twin (frozen layer -> site layer)
+    above 0.  ``transplant_effect``: B (pooled over K=0 and K=8/C1) or T of the transplant arm
+    differs from the plain (unmodified) model, from the random-direction and from the
+    permuted-alignment control, all three family-bootstrap CIs excluding 0 **in the
+    pre-specified direction** (``expected_sign``, default :data:`TRACE_EXPECTED_SIGN`: B and T
+    up) with >= ``TRACE_MIN_CLUSTERS`` families (``effect_B`` / ``effect_T``; the former rule,
+    random and permuted only and any common sign, is kept as ``effect_B_vs_controls`` /
+    ``effect_T_vs_controls``).  ``B_damage_<control>`` / ``T_damage_<control>``: each control
+    arm minus the plain model (``damage``, :func:`trace_damage`; else derived from ``effects``).
+    ``counts_for_prereg`` additionally needs a passed stand-in validation (PREREGISTRATION 18:
+    ``standin`` from :func:`read_standin`), a frozen feature, a healthy trace-LM corpus
+    (``lm_corpus`` from :func:`read_lm_corpus`, when given) and no smoke run.  Sharing index /
+    network activity deltas are reported (descriptive, ``sae_source``)."""
     probe = probe or {}
     align = align or {}
     standin = standin if standin is not None else read_standin(None)
+    sign_of = dict(TRACE_EXPECTED_SIGN if expected_sign is None else expected_sign)
     info = probe.get("info", {}) or {}
     tab = probe.get("table")
     prow = {}
@@ -753,10 +927,13 @@ def trace_verdict(probe: dict, align: dict, effects: pd.DataFrame, sharing: pd.D
     delta_hi = float(prow.get("delta_ci_hi", np.nan))
     ci_excludes_0 = bool(np.isfinite(delta_lo) and delta_lo > 0)
     counts = bool(prow.get("counts", False))
+    surface_auc = float(prow.get("surface_auc", np.nan))
+    beats_surface = bool(prow.get("beats_surface", False)) and np.isfinite(surface_auc)
     feature_frozen = bool(info.get("feature_frozen", False))
     dsrc = str(probe.get("direction_source") or "")
     spec_ok = bool(probe.get("direction_spec_ok", True)) and dsrc.startswith(("probe:", "file:"))
-    probe_ok = bool(feature_frozen and n_probe >= TRACE_MIN_PROBE_PAIRS and counts and ci_excludes_0 and spec_ok)
+    probe_ok = bool(feature_frozen and n_probe >= TRACE_MIN_PROBE_PAIRS and counts and ci_excludes_0 and beats_surface
+                    and spec_ok)
     al = align.get("alignments")
     rows_by_layer = {}
     if al is not None and len(al):
@@ -776,27 +953,48 @@ def trace_verdict(probe: dict, align: dict, effects: pd.DataFrame, sharing: pd.D
     if ctr is not None and len(ctr):
         sel = ctr[(ctr["layer_src"] == int(frozen)) & (ctr["layer_tgt"] == int(site_layer))]
         crow = sel.iloc[0].to_dict() if len(sel) else {}
+    gain = float(crow.get("gain_resid", np.nan))
     gain_lo = float(crow.get("gain_resid_ci_lo", np.nan))
+    beats_untrained = bool(np.isfinite(gain_lo) and gain_lo > 0)
+    corpus_ok = True if lm_corpus is None else bool(lm_corpus.get("ok"))
     rows = []
     for mode in modes:
         e = effects[effects["mode"] == mode] if effects is not None and len(effects) else pd.DataFrame(columns=EFFECT_COLS)
+        dmg = damage[damage["mode"] == mode] if damage is not None and len(damage) else pd.DataFrame(columns=EFFECT_COLS)
 
-        def _get(control, q):
-            s = e[(e["control"] == control) & (e["quantity"] == q)]
+        def _get(control, q, frame=e):
+            s = frame[(frame["control"] == control) & (frame["quantity"] == q)]
             return s.iloc[0].to_dict() if len(s) else {}
 
-        q_ok = {}
+        def _directed(r: dict, q: str) -> bool:
+            # CI excludes 0 and the estimate has the pre-specified sign
+            m = float(r.get("mean", np.nan)) if r else np.nan
+            return bool(r and r.get("ci_excludes_0", False) and np.isfinite(m) and sign_of.get(q, 0) != 0
+                        and np.sign(m) == np.sign(sign_of[q]))
+
+        def _damage(control: str, q: str) -> float:
+            # control arm minus plain: from trace_damage, else (transplant - plain) - (transplant - control)
+            r = _get(control, q, dmg)
+            if r:
+                return float(r.get("mean", np.nan))
+            a, b = _get("plain", q), _get(control, q)
+            return float(a.get("mean", np.nan)) - float(b.get("mean", np.nan)) if a and b else float("nan")
+
+        q_ok, q_ctrl, q_plain = {}, {}, {}
         for q in ("B_all", "T"):
-            r1, r2 = _get("random", q), _get("permuted_alignment", q)
+            r1, r2, rp = _get("random", q), _get("permuted_alignment", q), _get("plain", q)
             same = bool(r1 and r2 and np.sign(r1.get("mean", 0.0)) == np.sign(r2.get("mean", 0.0)))
-            q_ok[q] = bool(r1.get("ci_excludes_0", False) and r2.get("ci_excludes_0", False) and same)
+            q_ctrl[q] = bool(r1.get("ci_excludes_0", False) and r2.get("ci_excludes_0", False) and same)
+            q_plain[q] = _directed(rp, q)
+            q_ok[q] = bool(q_plain[q] and _directed(r1, q) and _directed(r2, q))
         transplant_effect = bool(any(q_ok.values()))
         uses_site = mode in ("residual", "both")
         uses_kv = mode in ("kv", "both")
         align_ok = bool((align_ok_site or not uses_site) and (align_ok_planted or not uses_kv))
-        claimed = bool(probe_ok and align_ok and transplant_effect)
+        claimed = bool(probe_ok and align_ok and beats_untrained and transplant_effect)
         r_rand, r_perm = _get("random", "B_all"), _get("permuted_alignment", "B_all")
         t_rand, t_perm = _get("random", "T"), _get("permuted_alignment", "T")
+        b_plain, t_plain = _get("plain", "B_all"), _get("plain", "T")
         n_clusters = int(max([int(x.get("n_clusters", 0) or 0) for x in (r_rand, r_perm, t_rand, t_perm)] or [0]))
         reasons = []
         if not feature_frozen:
@@ -807,26 +1005,47 @@ def trace_verdict(probe: dict, align: dict, effects: pd.DataFrame, sharing: pd.D
                            f"({'; '.join((probe.get('file_info') or {}).get('spec_mismatch') or []) or 'unknown spec'})")
         if n_probe < TRACE_MIN_PROBE_PAIRS:
             reasons.append(f"probe has {n_probe} matched pairs (< {TRACE_MIN_PROBE_PAIRS})")
-        elif not (counts and ci_excludes_0):
-            reasons.append(f"probe criterion not met (trained - untrained CI [{delta_lo:.3f}, {delta_hi:.3f}])")
+        else:
+            if not (counts and ci_excludes_0):
+                reasons.append(f"probe criterion not met (trained - untrained CI [{delta_lo:.3f}, {delta_hi:.3f}])")
+            if not beats_surface:
+                reasons.append(f"probe does not beat the surface baseline at layer {frozen} (AUC trained "
+                               f"{float(prow.get('auc_trained', np.nan)):.3f} vs surface {surface_auc:.3f})")
         if uses_site and not align_ok_site:
             reasons.append(f"residualised alignment at target layer {site_layer}: r2_holdout {r2_hold:.3f} (needs > 0), "
                            f"gap {gap:.3f} (needs >= {PREREG_R2_GAP})")
         if uses_kv and not align_ok_planted:
             reasons.append(f"KV prefix planted through {len(planted)} maps, {len(failing)} fail r2_holdout > 0 / gap >= "
                            f"{PREREG_R2_GAP} (target layers {failing})")
+        if not beats_untrained:
+            reasons.append(f"alignment does not beat the untrained twin (residualised gain {gain:+.3f}, CI lower bound "
+                           f"{gain_lo:+.3f}; needs > 0)" if np.isfinite(gain_lo) else
+                           f"alignment gain over the untrained twin {gain:+.3f} has no CI (too few hold-out pairs)"
+                           if crow else "no alignment gain over the untrained twin (control missing)")
         if e.empty:
             reasons.append("no transplant readouts (substage failed or skipped)")
         elif n_clusters < TRACE_MIN_CLUSTERS:
             reasons.append(f"only {n_clusters} families (< {TRACE_MIN_CLUSTERS}): no transplant effect can be shown")
         elif not transplant_effect:
-            reasons.append("no transplant effect beyond the random and permuted-alignment controls")
-        counts_prereg = bool(feature_frozen and spec_ok and not is_smoke and standin.get("ok"))
+            def _fmt(r):
+                return (f"{float(r.get('mean', np.nan)):+.3f} [{float(r.get('ci_low', np.nan)):+.3f}, "
+                        f"{float(r.get('ci_high', np.nan)):+.3f}]") if r else "n/a"
+            want = ", ".join(f"{q} {'up' if sign_of.get(q, 0) > 0 else 'down' if sign_of.get(q, 0) < 0 else 'unspecified'}"
+                             for q in ("B_all", "T"))
+            why = ("differs from the controls only, not from the plain model in the pre-specified direction"
+                   if any(q_ctrl.values()) else "no effect")
+            reasons.append(f"no transplant effect in the pre-specified direction ({want}) against the plain model and "
+                           f"the random and permuted-alignment controls ({why}): B vs plain {_fmt(b_plain)}, vs random "
+                           f"{_fmt(r_rand)}, vs permuted {_fmt(r_perm)}; T vs plain {_fmt(t_plain)}; damage of the "
+                           f"controls vs plain (B): random {_damage('random', 'B_all'):+.3f}, permuted "
+                           f"{_damage('permuted_alignment', 'B_all'):+.3f}, identity {_damage('identity', 'B_all'):+.3f}")
+        counts_prereg = bool(feature_frozen and spec_ok and not is_smoke and standin.get("ok") and corpus_ok)
         prereg_note = ("" if counts_prereg else
                        "; does not count for PREREGISTRATION 18: " + "; ".join(
                            x for x in [None if standin.get("ok") else str(standin.get("reason")),
                                        None if feature_frozen else "feature not frozen",
                                        None if spec_ok else "direction not the frozen probe's",
+                                       None if corpus_ok else str((lm_corpus or {}).get("reason")),
                                        "smoke run" if is_smoke else None] if x))
         rows.append(dict(
             mode=mode, source_kind="trace", frozen_layer=int(frozen), site_layer=int(site_layer),
@@ -839,8 +1058,8 @@ def trace_verdict(probe: dict, align: dict, effects: pd.DataFrame, sharing: pd.D
             align_gap=gap, align_ok_site=align_ok_site, n_planted_layers=len(planted) if uses_kv else 0,
             n_planted_layers_ok=(len(planted) - len(failing)) if uses_kv else 0,
             planted_layers_failing=",".join(str(l) for l in failing) if uses_kv else "",
-            align_ok=align_ok, align_gain_resid=float(crow.get("gain_resid", np.nan)),
-            align_gain_resid_ci_lo=gain_lo, align_beats_untrained=bool(np.isfinite(gain_lo) and gain_lo > 0),
+            align_ok=align_ok, align_gain_resid=gain,
+            align_gain_resid_ci_lo=gain_lo, align_beats_untrained=beats_untrained,
             align_r2_length_only=float(crow.get("r2_length_only", np.nan)),
             B_vs_random=float(r_rand.get("mean", np.nan)), B_vs_permuted=float(r_perm.get("mean", np.nan)),
             T_vs_random=float(t_rand.get("mean", np.nan)), T_vs_permuted=float(t_perm.get("mean", np.nan)),
@@ -854,9 +1073,68 @@ def trace_verdict(probe: dict, align: dict, effects: pd.DataFrame, sharing: pd.D
             sharing_effect_claimed=claimed,
             standin_validated=bool(standin.get("ok")), standin_path=standin.get("path"),
             counts_for_prereg=counts_prereg,
-            claim=(("sharing effect: probe criterion, residualised alignment and transplant effect beyond both controls"
-                    if claimed else "no claim: " + "; ".join(reasons)) + prereg_note)))
+            claim=(("sharing effect: probe criterion beyond the surface baseline, residualised alignment beyond the "
+                    "untrained twin and a transplant effect in the pre-specified direction beyond the plain model and "
+                    "both controls" if claimed else "no claim: " + "; ".join(reasons)) + prereg_note),
+            # added 27.10.2026 (columns appended, the ones above keep their names)
+            probe_surface_auc=surface_auc, probe_beats_surface=beats_surface,
+            expected_sign_B=int(sign_of.get("B_all", 0)), expected_sign_T=int(sign_of.get("T", 0)),
+            B_vs_plain=float(b_plain.get("mean", np.nan)), B_vs_plain_ci_lo=float(b_plain.get("ci_low", np.nan)),
+            B_vs_plain_ci_hi=float(b_plain.get("ci_high", np.nan)),
+            T_vs_plain=float(t_plain.get("mean", np.nan)), T_vs_plain_ci_lo=float(t_plain.get("ci_low", np.nan)),
+            T_vs_plain_ci_hi=float(t_plain.get("ci_high", np.nan)),
+            effect_B_vs_plain=q_plain["B_all"], effect_T_vs_plain=q_plain["T"],
+            effect_B_vs_controls=q_ctrl["B_all"], effect_T_vs_controls=q_ctrl["T"],
+            B_damage_random=_damage("random", "B_all"), B_damage_permuted=_damage("permuted_alignment", "B_all"),
+            B_damage_identity=_damage("identity", "B_all"),
+            T_damage_random=_damage("random", "T"), T_damage_permuted=_damage("permuted_alignment", "T"),
+            T_damage_identity=_damage("identity", "T"),
+            lm_corpus_ok=corpus_ok,
+            lm_oov_address_rate=float((lm_corpus or {}).get("oov_address_rate", np.nan))))
     return pd.DataFrame(rows)
+
+
+def rejudge_trace(run_dir, n_boot: Optional[int] = None, seed: Optional[int] = None,
+                  model_dir: Optional[str] = None, standin: Optional[str] = None) -> dict:
+    """:func:`trace_verdict` of a finished trace-source run, recomputed from its tables and
+    manifest alone (no model, no GPU; nothing is written): ``trace_probe`` (frozen layer with
+    ``beats_surface``), ``alignments``, ``trace_alignment_controls``, ``trace_effects``,
+    ``trace_sharing``, ``trace_damage`` (rebuilt from ``trace_bt`` / ``trace_T`` with
+    :func:`trace_damage` when the run predates it; ``n_boot`` / ``seed`` default to the run's),
+    the manifest's frozen / site layer and smoke flag, the stand-in re-read with
+    :func:`read_standin` from the recorded path (``standin`` overrides it; the recorded result
+    is not reused, so a stand-in run that predates the fix of 27.10.2026 no longer counts) and
+    :func:`read_lm_corpus` of the run's trace LM (``model_dir`` overrides the recorded
+    directory, e.g. a Drive mount).  Returns ``dict(trace_verdict=..., trace_damage=...)``."""
+    from ..io import load_df, read_manifest
+
+    m = read_manifest(run_dir)
+    tr = m.get("trace") or {}
+    lim = m.get("limits") or {}
+
+    def _t(name: str) -> pd.DataFrame:
+        try:
+            return load_df(run_dir, name)
+        except (FileNotFoundError, pd.errors.EmptyDataError):
+            return pd.DataFrame()
+    pt = _t("trace_probe")
+    probe = dict(info=dict(tr.get("probe") or {}), table=pt, direction_source=tr.get("direction_source"),
+                 direction_spec_ok=bool(pt["direction_spec_ok"].astype(str).str.lower().eq("true").all())
+                 if "direction_spec_ok" in pt and len(pt) else True,
+                 file_info=tr.get("direction_file") or {})
+    align = dict(alignments=_t("alignments"), controls=_t("trace_alignment_controls"))
+    damage = _t("trace_damage")
+    if damage.empty:
+        n_boot = int(n_boot if n_boot is not None else lim.get("n_boot") or 10000)
+        seed = int(seed if seed is not None else (m.get("cfg") or {}).get("seed", 0))
+        damage = trace_damage(_t("trace_bt"), _t("trace_T"), n_boot, seed)
+    mdir = model_dir or (m.get("source") or {}).get("model_dir")
+    rec = tr.get("standin") if isinstance(tr.get("standin"), dict) else {}
+    verdict = trace_verdict(probe, align, _t("trace_effects"), _t("trace_sharing"), int(tr.get("frozen_layer")),
+                            int(tr.get("site_layer")), str(tr.get("sae_source")), bool(lim.get("is_smoke", False)),
+                            standin=read_standin(standin or rec.get("path")), damage=damage,
+                            lm_corpus=read_lm_corpus(mdir) if mdir else None)
+    return dict(trace_verdict=verdict, trace_damage=damage)
 
 
 def _trace_sae(mb: ModelBundle, site: HookSite, limits: C.Limits, kw: dict) -> tuple:
@@ -926,8 +1204,11 @@ def run_trace(cfg: RunConfig, mb: ModelBundle, run_dir, src, limits: C.Limits, k
     sae, sae_source = _trace_sae(mb, meas_site, limits, kw)
     bt, tt, effects, sharing = (sub.run("trace_readouts", lambda: trace_readouts(tp, sae, sae_source, meas_site, int(limits.n_boot), seed),
                                         (empty, empty, empty, empty)) if tp else (empty, empty, empty, empty))
+    damage = (sub.run("trace_damage", lambda: trace_damage(bt, tt, int(limits.n_boot), seed), empty)
+              if len(bt) else pd.DataFrame(columns=EFFECT_COLS))
+    lm_corpus = read_lm_corpus(model_dir)
     verdict_t = trace_verdict(probe, align, effects, sharing, frozen, site_layer, sae_source, bool(limits.is_smoke),
-                              standin=standin)
+                              standin=standin, damage=damage, lm_corpus=lm_corpus)
     tp_df = tp.get("df", empty) if tp else empty
     tables = {
         "transfer_test": pd.DataFrame(columns=TT_COLS),
@@ -944,6 +1225,7 @@ def run_trace(cfg: RunConfig, mb: ModelBundle, run_dir, src, limits: C.Limits, k
         "trace_probe_match": probe.get("match", empty) if probe else empty,
         "trace_alignment_controls": align.get("controls", empty) if align else empty,
         "trace_bt": bt, "trace_T": tt, "trace_effects": effects, "trace_sharing": sharing, "trace_verdict": verdict_t,
+        "trace_damage": damage,
     }
     tables = {k: (v if isinstance(v, pd.DataFrame) else empty) for k, v in tables.items()}
     sub.write_tracebacks(run_dir)
@@ -960,7 +1242,8 @@ def run_trace(cfg: RunConfig, mb: ModelBundle, run_dir, src, limits: C.Limits, k
                    direction_file=(probe or {}).get("file_info"), direction_meta=(probe or {}).get("direction_meta"),
                    n_alignment_pairs=int((align or {}).get("n_pairs", 0)), covariates=(align or {}).get("covariates"),
                    split=split, lm_split=dict(probe=(info or {}).get("lm_split"), alignment=(align or {}).get("lm_split")),
-                   standin=standin, n_families=int((tp or {}).get("n_families", 0)),
+                   standin=standin, lm_corpus=lm_corpus, expected_sign=dict(TRACE_EXPECTED_SIGN),
+                   n_families=int((tp or {}).get("n_families", 0)),
                    alignment_method="procrustes on length-residualised pooled states (intercept from raw means)",
                    native_axis=bool((align or {}).get("native") is not None),
                    carrier="matched probe negatives (fan-out 1); one carrier per formulation (K=0 and K=8/C1)",
@@ -968,14 +1251,19 @@ def run_trace(cfg: RunConfig, mb: ModelBundle, run_dir, src, limits: C.Limits, k
                    sae_source=sae_source, have_chain_controls=bool(TPP.HAVE_CHAIN_CONTROLS),
                    sharing_effect_claimed=claimed),
         validated=None, self_consistency=False,
-        transplant=dict(eps=limits.l_eps, n_prefix=limits.l_n_prefix, n_gen=cfg.gen_n_new, n_samples=cfg.gen_n_samples),
+        transplant=dict(eps=trace_eps(kw, limits), eps_source=("option trace_eps" if _trace_opt(kw, limits, "eps") is not None
+                                                               else "TRACE_EPS"),
+                        n_prefix=limits.l_n_prefix, n_gen=cfg.gen_n_new, n_samples=cfg.gen_n_samples),
         substages=sub.report(),
         prereg=dict(contrast_18="not applicable to a trace source (the stand-in validation needs a language source; "
                                 "PREREGISTRATION 18: a trace source counts only after a passed stand-in validation, "
                                 "trace_verdict.counts_for_prereg requires it via the standin option)",
                     trace="trace_verdict.sharing_effect_claimed = probe_ok (feature_frozen AND probe criterion: CI of "
-                          "trained - untrained split-half AUC above 0 at the frozen layer AND v_src from that probe "
-                          "specification) AND align_ok (residualised R2 > 0 and gap >= 0.2 at the site for residual, "
-                          "on every planted layer for kv, both for both) AND transplant_effect (B or T vs random and "
-                          f"permuted_alignment, CIs exclude 0, >= {TRACE_MIN_CLUSTERS} families); sharing / activity "
-                          "deltas are descriptive"))
+                          "trained - untrained split-half AUC above 0 at the frozen layer AND trained AUC above the "
+                          "surface baseline there AND v_src from that probe specification) AND align_ok (residualised "
+                          "R2 > 0 and gap >= 0.2 at the site for residual, on every planted layer for kv, both for "
+                          "both) AND align_beats_untrained (CI of the residualised gain over the untrained twin above "
+                          "0) AND transplant_effect (B or T vs plain, random and permuted_alignment, CIs exclude 0 in "
+                          f"the pre-specified direction {TRACE_EXPECTED_SIGN}, >= {TRACE_MIN_CLUSTERS} families); "
+                          "trace_damage: every arm minus the plain model; sharing / activity deltas are descriptive; "
+                          "counts_for_prereg also needs a healthy trace-LM corpus (address OOV <= 0.5)"))

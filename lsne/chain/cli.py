@@ -37,6 +37,18 @@ ITR tokens, no vocabulary applied), ``features`` (:func:`lsne.chain.labels.shari
 ``text`` (:func:`lsne.chain.text.render_text`) and, with ``--records``, the full ``record``
 (``TxRecord.to_dict``).  Every step is resumable: existing shards / chunks are skipped and
 ``train`` continues from the newest checkpoint.  Data: ethPandaOps Xatu, CC BY 4.0.
+
+Failing loudly (the first A100 run lost 558 of 2 135 chunks to one dead worker and then built
+a vocabulary from 0 transactions): ``serialize`` writes ``serialize_params.json`` before the
+first chunk, runs one future per chunk and logs every chunk as it completes; a failed chunk or
+a broken worker pool (``BrokenProcessPool``) is retried with fewer workers (halved down to 1,
+:func:`retry_schedule`), chunks already written are skipped, and the command exits with 2 and
+lists the chunks still missing; ``--overwrite`` removes the old shards of its chunks before it
+writes the new options (:func:`drop_shards`), so a chunk it fails to rewrite is missing --
+filled by the retries or the next resume -- and never left with the old options.  ``vocab``
+exits with 1 when its input holds no transaction;
+``train`` exits with 1 when the address OOV rate of its training transactions under the
+vocabulary exceeds ``--max-oov-address`` (0.5: the vocabulary does not belong to the corpus).
 """
 from __future__ import annotations
 
@@ -47,7 +59,8 @@ import os
 import re
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from types import SimpleNamespace
 from typing import Iterator, Optional, Sequence
 
@@ -152,36 +165,171 @@ def _serialize_chunk(job: tuple) -> dict:
         return dict(start=start, path=path, n_tx=0, n_tokens=0, skipped=False, error=f"{type(exc).__name__}: {exc}")
 
 
-def serialize_chunks(cache: str, block_from: int, block_to: int, out_dir: str, overwrite: bool = False,
-                     with_records: bool = False, serialize_kw: Optional[dict] = None,
-                     text_kw: Optional[dict] = None, label_k: int = 5, workers: int = 1, gz: bool = True,
-                     log_fn=_say, visible_len: Optional[int] = 512) -> pd.DataFrame:
-    """Write one ITR shard per cached traces chunk covering ``[block_from, block_to)``
-    (gzipped JSON lines unless ``gz=False``; existing shards of either format are skipped).
-    ``visible_len``: the features also hold the fan-out of the first ``visible_len`` tokens
-    (the trace LM's window; :func:`lsne.chain.labels.sharing_features`)."""
+def retry_schedule(workers: int) -> list:
+    """Worker counts of the serialisation rounds: ``workers``, then halved down to one worker
+    (12 -> ``[12, 6, 3, 1]``); a single worker gets one retry (``[1, 1]``).  Round ``i + 1``
+    only sees the chunks round ``i`` left unwritten."""
+    w = max(1, int(workers))
+    out = [w]
+    while w > 1:
+        w = max(1, w // 2)
+        out.append(w)
+    return out if len(out) > 1 else out + [1]
+
+
+def _clean_partial(out_dir: str, starts: Sequence[int]) -> None:
+    """Remove the temporary files killed workers left for the chunks ``starts`` (never a finished
+    shard; one directory listing, the shard directory may be a slow Drive mount)."""
+    prefixes = tuple(os.path.basename(shard_path(out_dir, s, gz)) + ".tmp." for s in starts for gz in (True, False))
+    if not prefixes:
+        return
+    for f in os.listdir(out_dir):
+        if f.startswith(prefixes):
+            try:
+                os.remove(os.path.join(out_dir, f))
+            except OSError:
+                pass
+
+
+def drop_shards(out_dir: str, starts: Sequence[int]) -> int:
+    """Remove the shards (both formats) of the chunks ``starts`` from ``out_dir`` (one directory
+    listing; the shard directory may be a slow Drive mount); returns how many were removed.
+    An ``--overwrite`` serialisation calls this before its first chunk: a chunk it then fails to
+    rewrite is *missing* -- retried in the later rounds and by the next resume -- instead of
+    keeping a shard of the old options that every later round and resume would skip as
+    existing (two serialisations mixed under the new ``serialize_params.json``)."""
+    if not os.path.isdir(out_dir):
+        return 0
+    names = {os.path.basename(shard_path(out_dir, s, gz)) for s in starts for gz in (True, False)}
+    n = 0
+    for f in os.listdir(out_dir):
+        if f in names:
+            os.remove(os.path.join(out_dir, f))
+            n += 1
+    return n
+
+
+def cached_chunk_starts(cache: str, block_from: int, block_to: int) -> list:
+    """Starts of the cached traces chunks covering ``[block_from, block_to)`` (the chunks
+    :func:`serialize_chunks` writes)."""
     from .xatu import cached_starts, chunk_starts
 
     wanted = set(chunk_starts(block_from, block_to))
-    starts = [s for s in cached_starts(cache, "traces") if s in wanted]
+    return [s for s in cached_starts(cache, "traces") if s in wanted]
+
+
+def _chunk_line(res: dict, k: int, n: int) -> str:
+    what = ("skipped (exists)" if res["skipped"] else f"FAILED {res['error']}" if res["error"]
+            else f"{res['n_tx']} tx, {res['n_tokens']} tokens")
+    return f"serialize {res['start']}: {what} [{k}/{n}]"
+
+
+def serialize_chunks(cache: str, block_from: int, block_to: int, out_dir: str, overwrite: bool = False,
+                     with_records: bool = False, serialize_kw: Optional[dict] = None,
+                     text_kw: Optional[dict] = None, label_k: int = 5, workers: int = 1, gz: bool = True,
+                     log_fn=_say, visible_len: Optional[int] = 512,
+                     schedule: Optional[Sequence[int]] = None) -> pd.DataFrame:
+    """Write one ITR shard per cached traces chunk covering ``[block_from, block_to)``
+    (gzipped JSON lines unless ``gz=False``; existing shards of either format are skipped;
+    ``overwrite`` first removes the existing shards of these chunks, :func:`drop_shards`, so a
+    chunk this call fails to rewrite is reported missing, never kept with the old options).
+    ``visible_len``: the features also hold the fan-out of the first ``visible_len`` tokens
+    (the trace LM's window; :func:`lsne.chain.labels.sharing_features`).
+
+    One future per chunk; every chunk is logged when it completes (``[k/n]``).  A chunk whose
+    worker raised, or that was still pending when a worker died (``BrokenProcessPool``), is
+    retried in the next round of ``schedule`` (default :func:`retry_schedule` of ``workers``:
+    fewer workers each round, the last with one worker that serialises one chunk at a time and
+    is replaced after a crash, so a chunk that kills its worker costs only itself); a round never
+    rewrites a chunk an earlier round finished, and a shard a dead worker managed to write before
+    the pool broke counts as written.  ``workers == 1`` serialises in this process.  Rows: ``start, path, n_tx,
+    n_tokens, skipped, error`` (the final state: ``error`` is set only for chunks still missing
+    after the last round), ``attempts`` and ``errors`` (the failures of earlier attempts)."""
+    starts = cached_chunk_starts(cache, block_from, block_to)
     os.makedirs(out_dir, exist_ok=True)
-    jobs = [(s, cache, out_dir, int(block_from), int(block_to), bool(overwrite), bool(with_records),
-             dict(serialize_kw or {}), dict(text_kw or {}), int(label_k), bool(gz),
-             None if visible_len is None else int(visible_len)) for s in starts]
+    if overwrite:
+        n_old = drop_shards(out_dir, starts)
+        if n_old:
+            log_fn(f"serialize: --overwrite removed {n_old} existing shard(s) of these chunks before rewriting them")
+
+    def job(s: int, ow: bool) -> tuple:
+        return (s, cache, out_dir, int(block_from), int(block_to), bool(ow), bool(with_records),
+                dict(serialize_kw or {}), dict(text_kw or {}), int(label_k), bool(gz),
+                None if visible_len is None else int(visible_len))
+
+    rounds = [max(1, int(w)) for w in schedule] if schedule else retry_schedule(workers)
+    in_process = int(workers) <= 1
+    final: dict = {}
+    history: dict = {s: [] for s in starts}
+    pending = list(starts)
+    n = len(starts)
+
+    def record(res: dict) -> None:
+        # only failed chunks are attempted again, so the newest result of a chunk is its state
+        final[int(res["start"])] = res
+        history[int(res["start"])].append(res.get("error"))
+        log_fn(_chunk_line(res, sum(1 for v in final.values() if v.get("error") is None), n))
+
+    for i, w in enumerate(rounds):
+        if not pending:
+            break
+        if i:
+            log_fn(f"serialize: retry round {i} with {w} worker(s) for {len(pending)} chunk(s): "
+                   f"{', '.join(str(s) for s in pending[:20])}{' ...' if len(pending) > 20 else ''}")
+        _clean_partial(out_dir, pending)          # partial files of workers killed in this or an earlier call
+        # a retry never rewrites a shard (it can only have been written by this call, completely: atomic rename;
+        # with overwrite the old shards were removed above)
+        jobs = [job(s, overwrite and i == 0) for s in pending]
+        if in_process:
+            for j in jobs:
+                try:
+                    res = _serialize_chunk(j)
+                except Exception as exc:  # noqa: BLE001 - reported per chunk like a worker's failure
+                    res = dict(start=j[0], path=shard_path(out_dir, j[0], gz), n_tx=0, n_tokens=0, skipped=False,
+                               error=f"{type(exc).__name__}: {exc}")
+                record(res)
+        elif w <= 1:
+            # one chunk at a time and a fresh worker after a crash: a chunk that kills its worker
+            # costs only itself, not the chunks queued behind it
+            ex = None
+            try:
+                for j in jobs:
+                    ex = ex or ProcessPoolExecutor(max_workers=1)
+                    try:
+                        res = ex.submit(_serialize_chunk, j).result()
+                    except Exception as exc:  # noqa: BLE001 - BrokenProcessPool, pickling, ...
+                        res = dict(start=j[0], path=shard_path(out_dir, j[0], gz), n_tx=0, n_tokens=0, skipped=False,
+                                   error=f"{type(exc).__name__}: {exc}")
+                        if isinstance(exc, BrokenProcessPool):
+                            ex.shutdown(wait=True)
+                            ex = None
+                    record(res)
+            finally:
+                if ex is not None:
+                    ex.shutdown(wait=True)
+        else:
+            ex = ProcessPoolExecutor(max_workers=min(int(w), len(jobs)))
+            try:
+                futs = {ex.submit(_serialize_chunk, j): j[0] for j in jobs}
+                for f in as_completed(futs):
+                    s = futs[f]
+                    try:
+                        res = f.result()
+                    except Exception as exc:  # noqa: BLE001 - BrokenProcessPool (a worker died), pickling, ...
+                        res = dict(start=s, path=shard_path(out_dir, s, gz), n_tx=0, n_tokens=0, skipped=False,
+                                   error=f"{type(exc).__name__}: {exc}")
+                    record(res)
+            finally:
+                ex.shutdown(wait=True, cancel_futures=True)
+        pending = [s for s in starts if final.get(s, {}).get("error", "missing") is not None]
     rows = []
-    if int(workers) > 1 and len(jobs) > 1:
-        with ProcessPoolExecutor(max_workers=int(workers)) as ex:
-            for res in ex.map(_serialize_chunk, jobs):
-                rows.append(res)
-                log_fn(f"serialize {res['start']}: " + ("skipped (exists)" if res["skipped"] else
-                                                        res["error"] or f"{res['n_tx']} tx, {res['n_tokens']} tokens"))
-    else:
-        for j in jobs:
-            res = _serialize_chunk(j)
-            rows.append(res)
-            log_fn(f"serialize {res['start']}: " + ("skipped (exists)" if res["skipped"] else
-                                                    res["error"] or f"{res['n_tx']} tx, {res['n_tokens']} tokens"))
-    return pd.DataFrame(rows, columns=["start", "path", "n_tx", "n_tokens", "skipped", "error"])
+    for s in starts:
+        r = dict(final.get(s) or dict(start=s, path=shard_path(out_dir, s, gz), n_tx=0, n_tokens=0, skipped=False,
+                                      error="not attempted"))
+        errs = [e for e in history[s] if e]
+        r.update(attempts=len(history[s]), errors="; ".join(errs[:-1] if r.get("error") else errs) or None)
+        rows.append(r)
+    return pd.DataFrame(rows, columns=["start", "path", "n_tx", "n_tokens", "skipped", "error", "attempts", "errors"])
 
 
 # ======================================================================================
@@ -224,6 +372,10 @@ def code_fingerprint() -> str:
     return h.hexdigest()[:24]
 
 
+#: serialize_params.json keys that define the shard content: shards written with other values must not be mixed
+SERIALIZE_PARAM_KEYS = ("serialize_kw", "text_kw", "label_k", "visible_len", "fan_definition")
+
+
 def cmd_serialize(a) -> int:
     from .labels import FAN_DEFINITION
 
@@ -231,28 +383,67 @@ def cmd_serialize(a) -> int:
                   include_logs=not a.no_logs, max_depth_token=a.max_depth_token)
     text_kw = dict(max_nodes=a.text_max_nodes, address_style=a.address_style)
     vis = a.visible_len if a.visible_len and a.visible_len > 0 else None
+    params = dict(serialize_kw=ser_kw, text_kw=text_kw, label_k=a.k, cache=a.cache, visible_len=vis,
+                  fan_definition=FAN_DEFINITION, block_from=a.block_from, block_to=a.block_to,
+                  code_sha256=code_fingerprint(), data_source="ethPandaOps Xatu (CC BY 4.0)")
+    # the options travel with the shards from the first chunk on (a crash must not leave shards without them);
+    # resuming into shards of other options would mix two serialisations
+    os.makedirs(a.out, exist_ok=True)
+    pfile = os.path.join(a.out, "serialize_params.json")
+    if os.path.exists(pfile) and not a.overwrite:
+        try:
+            with open(pfile, encoding="utf-8") as fh:
+                old = json.load(fh)
+        except (OSError, ValueError):
+            old = {}
+        diff = {k: (old.get(k), params[k]) for k in SERIALIZE_PARAM_KEYS
+                if k in old and json.dumps(old.get(k), sort_keys=True) != json.dumps(params[k], sort_keys=True)}
+        if diff and list_shards(a.out):
+            _say(f"serialize: the shards in {a.out} were written with other options {diff}; "
+                 "use --overwrite or another --out")
+            return 2
+    if a.overwrite:
+        # the old shards go before the new options are written: a chunk this call does not rewrite is then
+        # missing (filled by the retries or the next resume), never an old-option shard under the new params
+        n_old = drop_shards(a.out, cached_chunk_starts(a.cache, a.block_from, a.block_to))
+        if n_old:
+            _say(f"serialize: --overwrite removed {n_old} existing shard(s) in {a.out}")
+    tmp = pfile + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(params, fh, indent=1)
+    os.replace(tmp, pfile)
+    sched = retry_schedule(a.workers)
     df = serialize_chunks(a.cache, a.block_from, a.block_to, a.out, overwrite=a.overwrite, with_records=a.records,
                           serialize_kw=ser_kw, text_kw=text_kw, label_k=a.k, workers=a.workers, gz=not a.plain,
-                          visible_len=vis)
+                          visible_len=vis, schedule=sched)
     if not len(df):
         _say(f"serialize: no cached traces chunks in [{a.block_from}, {a.block_to}) under {a.cache}")
         return 1
-    with open(os.path.join(a.out, "serialize_params.json"), "w", encoding="utf-8") as fh:
-        json.dump(dict(serialize_kw=ser_kw, text_kw=text_kw, label_k=a.k, cache=a.cache, visible_len=vis,
-                       fan_definition=FAN_DEFINITION, block_from=a.block_from, block_to=a.block_to,
-                       code_sha256=code_fingerprint(), data_source="ethPandaOps Xatu (CC BY 4.0)"),
-                  fh, indent=1)
     new = df[~df["skipped"]]
     bad = df[df["error"].notna()]
+    n_retried = int((df["attempts"] > 1).sum())
     _say(f"serialize: {len(df)} chunks ({int(df['skipped'].sum())} skipped), {int(new['n_tx'].sum())} tx, "
-         f"{int(new['n_tokens'].sum())} tokens written, {len(bad)} errors")
-    return 0 if bad.empty else 2
+         f"{int(new['n_tokens'].sum())} tokens written, {n_retried} retried, {len(bad)} missing")
+    if len(bad):
+        _say(f"serialize: ERROR {len(bad)} of {len(df)} chunks missing after {len(sched)} rounds "
+             f"(workers {sched}): {', '.join(str(int(s)) for s in bad['start'])}")
+        for _, r in bad.iterrows():
+            _say(f"  MISSING {int(r['start'])}: {r['error']}")
+        return 2
+    return 0
 
 
 def cmd_vocab(a) -> int:
     from .vocab import build_vocab, make_tokenizer, oov_rates
 
     t0 = time.time()
+    try:
+        n_shards = len(list_shards(a.inp))
+    except FileNotFoundError:
+        n_shards = 0
+    if not n_shards:
+        _say(f"vocab: ERROR no ITR shards at {a.inp}; no vocabulary written")
+        return 1
     # the shards' serialisation options travel with the vocabulary, so that TraceLMSource
     # serialises records exactly like the training corpus
     ser_kw = {}
@@ -263,6 +454,10 @@ def cmd_vocab(a) -> int:
     vocab = build_vocab((r["tokens"] for r in iter_rows(a.inp, limit=a.limit)), n_addresses=a.n_addresses,
                         n_selectors=a.n_selectors, n_topics=a.n_topics, min_count=a.min_count,
                         serialize_kw=ser_kw)
+    if int(vocab.meta.get("n_items", 0)) == 0:
+        # a vocabulary of the closed tokens alone maps every address / selector / topic to OOV
+        _say(f"vocab: ERROR {n_shards} shard(s) at {a.inp} hold 0 transactions; no vocabulary written")
+        return 1
     make_tokenizer(vocab, a.out, model_max_length=a.max_len)
     oov = oov_rates(vocab.map_tokens(r["tokens"]) for r in iter_rows(a.inp, limit=a.limit))
     with open(os.path.join(a.out, "oov.json"), "w", encoding="utf-8") as fh:
@@ -292,26 +487,29 @@ def _merge_oov(parts: list) -> dict:
 def corpus_blocks(in_path: str, vocab, block_size: int = 512, max_tx_len: Optional[int] = 512,
                   val_frac: float = 0.01, limit: Optional[int] = None, log_fn=_say) -> tuple:
     """Encode the shards with ``vocab``, split by transaction hash (``val_frac``), pack each
-    split (``[EOS]`` separators) -> ``(train_blocks int32 [N, T], val_blocks, stats)``."""
+    split (``[EOS]`` separators) -> ``(train_blocks int32 [N, T], val_blocks, stats)``.
+    ``stats["oov"]``: OOV rates over every transaction, ``oov_train`` / ``oov_val`` per split
+    (untruncated token lists)."""
     from .train import blocks_from_stream, concat_with_eos
     from .vocab import oov_rates
 
     import torch
 
-    tr_parts, va_parts, oov_parts = [], [], []
+    tr_parts, va_parts, oov_parts, oov_tr, oov_va = [], [], [], [], []
     n_tx = [0, 0]
     n_trunc = 0
     seen = 0
     for fn in list_shards(in_path):
-        tr, va, mapped = [], [], []
+        tr, va, mapped_tr, mapped_va = [], [], [], []
         for r in iter_rows(fn):
             toks = vocab.map_tokens(r["tokens"])
-            mapped.append(toks)
+            is_val = _is_val(r["tx_hash"], val_frac)
+            (mapped_va if is_val else mapped_tr).append(toks)
             if max_tx_len is not None and len(toks) > int(max_tx_len):
                 toks = toks[: int(max_tx_len)]
                 n_trunc += 1
             ids = vocab.ids(toks)
-            if _is_val(r["tx_hash"], val_frac):
+            if is_val:
                 va.append(ids)
                 n_tx[1] += 1
             else:
@@ -320,7 +518,9 @@ def corpus_blocks(in_path: str, vocab, block_size: int = 512, max_tx_len: Option
             seen += 1
             if limit is not None and seen >= int(limit):
                 break
-        oov_parts.append(oov_rates(mapped))
+        oov_tr.append(oov_rates(mapped_tr))
+        oov_va.append(oov_rates(mapped_va))
+        oov_parts.append(oov_rates(mapped_tr + mapped_va))
         tr_parts.append(concat_with_eos(tr, vocab.eos_id))
         va_parts.append(concat_with_eos(va, vocab.eos_id))
         if limit is not None and seen >= int(limit):
@@ -332,11 +532,34 @@ def corpus_blocks(in_path: str, vocab, block_size: int = 512, max_tx_len: Option
     stats = dict(n_tx_train=n_tx[0], n_tx_val=n_tx[1], n_tx_truncated=n_trunc, max_tx_len=max_tx_len,
                  tokens_train=int(tr_stream.size), tokens_val=int(va_stream.size),
                  n_train_blocks=int(len(train_blocks)), n_val_blocks=int(len(val_blocks)),
-                 block_size=int(block_size), val_frac=float(val_frac), oov=_merge_oov(oov_parts))
+                 block_size=int(block_size), val_frac=float(val_frac), oov=_merge_oov(oov_parts),
+                 oov_train=_merge_oov(oov_tr), oov_val=_merge_oov(oov_va))
     log_fn(f"corpus: {n_tx[0]} train / {n_tx[1]} val tx ({n_trunc} truncated to {max_tx_len}), "
            f"{tr_stream.size:,} / {va_stream.size:,} tokens -> {len(train_blocks)} / {len(val_blocks)} blocks of "
-           f"{block_size}; OOV address rate {stats['oov']['rate_A']:.3f}")
+           f"{block_size}; OOV address rate {stats['oov']['rate_A']:.3f} (training transactions "
+           f"{stats['oov_train']['rate_A']:.3f})")
     return train_blocks, val_blocks, stats
+
+
+#: default of ``train --max-oov-address``: above this address OOV rate of the training
+#: transactions the vocabulary does not belong to the corpus (the first A100 run trained at 0.967)
+MAX_OOV_ADDRESS = 0.5
+
+
+def oov_guard(stats: dict, max_rate: Optional[float] = MAX_OOV_ADDRESS) -> Optional[str]:
+    """The reason not to train on a corpus (``stats`` of :func:`corpus_blocks`) or ``None``:
+    the address OOV rate of the training transactions above ``max_rate`` (``None`` or a value
+    outside ``[0, 1)`` disables the check; a corpus without address tokens passes)."""
+    if max_rate is None or not 0 <= float(max_rate) < 1:
+        return None
+    oov = stats.get("oov_train") or stats.get("oov") or {}
+    rate = oov.get("rate_A")                    # None in a JSON manifest = NaN (no address tokens)
+    rate = float("nan") if rate is None else float(rate)
+    if np.isfinite(rate) and rate > float(max_rate):
+        return (f"address OOV rate {rate:.3f} of the {stats.get('n_tx_train')} training transactions exceeds "
+                f"{float(max_rate):g} ({oov.get('n_A_oov')} of {oov.get('n_A')} address tokens map to [A_OOV]): "
+                "the vocabulary was not built from this corpus (or from an empty one)")
+    return None
 
 
 def cmd_train(a) -> int:
@@ -347,6 +570,10 @@ def cmd_train(a) -> int:
     tok = load_tokenizer(a.vocab)
     tr, va, stats = corpus_blocks(a.inp, vocab, a.block_size, None if a.max_tx_len <= 0 else a.max_tx_len,
                                   a.val_frac, a.limit)
+    why = oov_guard(stats, a.max_oov_address)
+    if why:
+        _say(f"train: ERROR {why}; not training (vocabulary {a.vocab}, corpus {a.inp}; --max-oov-address 1 disables)")
+        return 1
     if len(tr) == 0:
         _say("train: corpus shorter than one block")
         return 1
@@ -533,7 +760,12 @@ def cmd_probe(a) -> int:
                       verdict=dict(n_pairs=n, layers_counting=[int(l) for l in crit.loc[crit["counts"], "layer"]],
                                    layers_counting_bonferroni=[int(l) for l in crit.loc[crit.get("counts_adj", crit["counts"]).astype(bool), "layer"]],
                                    any_counts=bool(crit["counts"].any()),
-                                   rule="delta CI lower bound > 0 and trained AUC > permutation p95"),
+                                   rule="delta CI lower bound > 0 and trained AUC > permutation p95",
+                                   layers_beating_surface=[int(l) for l in crit.loc[crit["beats_surface"], "layer"]],
+                                   layers_counting_beyond_surface=[
+                                       int(l) for l in crit.loc[crit["counts_beyond_surface"], "layer"]],
+                                   rule_beyond_surface="counts and trained AUC > surface-baseline AUC "
+                                                       "(the frozen feature's criterion)"),
                       seconds=dict(encode_trained=round(t_enc, 1), encode_untrained=round(t_enc0, 1),
                                    controls=round(time.time() - t1 - t_enc0, 1)))
     with open(os.path.join(a.out, "probe_report.json"), "w", encoding="utf-8") as fh:
@@ -550,7 +782,7 @@ def cmd_probe(a) -> int:
          f"(best single {surf['best_single']})")
     if crit is not None:
         cols = ["layer", "auc_trained", "auc_untrained", "delta", "delta_ci_lo", "delta_ci_hi", "perm_auc_p95",
-                "random_dir_auc_p95", "counts"]
+                "random_dir_auc_p95", "surface_auc", "beats_surface", "counts", "counts_beyond_surface"]
         _say(crit[cols].round(3).to_string(index=False))
     else:
         best = sm.sort_values("auc_holdout", ascending=False, na_position="last").iloc[0]
@@ -794,6 +1026,8 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--keep-checkpoints", type=int, default=2)
     t.add_argument("--val-frac", type=float, default=0.01)
     t.add_argument("--max-tx-len", type=int, default=512, help="truncate each transaction (<= 0: no truncation)")
+    t.add_argument("--max-oov-address", type=float, default=MAX_OOV_ADDRESS,
+                   help="abort when the address OOV rate of the training transactions exceeds this (1: no check)")
     t.add_argument("--limit", type=int, default=None)
     t.add_argument("--seed", type=int, default=0)
     t.add_argument("--device", default="auto")

@@ -40,12 +40,26 @@ lambda_steps     per-step curves g, density, F, dist_from_start of every path
 lambda_corr      Spearman rho of every numeric path quantity with ``lam`` per start x
                  discriminant (:func:`geometry_lambda_correlation`); ``preregistered``
                  marks discriminant ``target_logit`` x {sae_fvu, steps_to_cross,
-                 mahal_to_ref_mean} (contrast 10 i-iii; expected rho < 0 for i and iii)
-lambda_boot      family cluster bootstrap of rho per (discriminant, quantity)
+                 mahal_to_ref_mean} (contrast 10 i-iii; expected rho < 0 for i and iii);
+                 ``split`` = pre-registered split of the start (dev / test / other).
+                 Contrast 10(ii) counts a constant censored step series (no path crosses
+                 at any lambda, or all cross at the same step) as rho = 0
+                 (``constant_series``; Spearman is undefined there and the start would
+                 drop out, against "censored, not discarded"); the as-run rows (rho NaN
+                 for such starts) are kept as ``quantity =
+                 "steps_to_cross_censored_as_run"`` with ``as_run = True``
+lambda_boot      family cluster bootstrap of rho per (discriminant, quantity) and ``split``
+                 (``all`` = every start, ``dev`` = DEV01-DEV04, ``test`` = F01-F12 x
+                 {A, B}); ``confirmatory`` = the pre-registered rows on ``test``;
+                 ``sign_as_expected`` is empty when the mean is undefined
 lambda_features  :func:`feature_lambda_correlation` per start (SAE latents vs lam);
-                 ``candidate`` = |rho| >= 0.7 (contrast 10: frozen candidates)
+                 ``candidate`` = |rho| >= 0.7 (contrast 10: frozen candidates); ``split``
 lambda_features_summary  per (discriminant, feature): mean rho, n_starts, frac_candidate,
-                 n_active_only_lambda0 / _pos
+                 n_active_only_lambda0 / _pos (every start)
+lambda_features_frozen  contrast 10, last sentence: candidates frozen on the development
+                 starts (|mean rho over DEV01-DEV04| >= 0.7) and evaluated on the test
+                 starts F01-F12 x {A, B}: family-bootstrap mean rho and CI on test,
+                 ``confirmed`` = the test CI excludes 0 on the side of the DEV sign
 lambda_original  contrast 11: the same sweep from the State-2143 context (h_207 at the
                  dossier site, target 22905, discriminant target_logit); target cloud =
                  the original's K>0 variants plus the standard K=8/C1 cloud (flagged in
@@ -79,6 +93,11 @@ PREREG_DISCRIMINANT = "target_logit"
 # are set to n_steps+1 rather than dropped (the raw column 'steps_to_cross' is kept as secondary).
 PREREG_QUANTITIES = {"sae_fvu": -1, "steps_to_cross_censored": 0, "mahal_to_ref_mean": -1}
 PREREG_CANDIDATE_RHO = 0.7
+#: Contrast 10(ii): a start whose censored step series is constant counts as rho = 0.
+CENSORED_STEPS = "steps_to_cross_censored"
+CENSORED_STEPS_AS_RUN = "steps_to_cross_censored_as_run"
+#: Splits of the bootstrap rows (``all`` = the rows written before the split existed).
+BOOT_SPLITS = C.SPLITS
 PREREG_LAMBDA_REL_B = 3.0
 N_RANGE_POINTS = 16
 
@@ -262,38 +281,119 @@ CORR_QUANTITIES = ["path_length", "net_displacement", "tortuosity", "mean_turnin
                    "local_log_volume", "sae_fvu", "n_shared_features_with_ref", "n_active_features"]
 
 
-def correlation_tables(paths: pd.DataFrame, n_boot: int, seed: int) -> tuple[pd.DataFrame, pd.DataFrame]:
-    ccols = ["tag", "family", "formulation", "discriminant", "quantity", "rho", "pvalue", "n", "preregistered", "expected_sign"]
+def constant_series(values) -> bool:
+    """True when the finite values (at least two) are all equal: Spearman's rho is undefined."""
+    v = np.asarray(values, dtype=np.float64)
+    v = v[np.isfinite(v)]
+    return bool(v.size >= 2 and np.all(v == v[0]))
+
+
+def sign_as_expected(mean: float, expected: int) -> Optional[bool]:
+    """Sign check of a bootstrap mean: None without an expected sign or with an undefined mean
+    (an untested row must not read False)."""
+    if not expected or not np.isfinite(mean):
+        return None
+    return bool(np.sign(mean) == expected)
+
+
+CORR_COLS = ["tag", "family", "formulation", "discriminant", "quantity", "rho", "pvalue", "n", "preregistered", "expected_sign",
+             "split", "constant_series", "as_run"]
+CORR_BOOT_COLS = ["discriminant", "quantity", "preregistered", "expected_sign", "sign_as_expected", "mean", "ci_low", "ci_high",
+                  "se", "n_clusters", "n_rows", "split", "confirmatory", "as_run", "n_constant_as_zero", "p_boot"]
+
+
+def correlation_tables(paths: pd.DataFrame, n_boot: int, seed: int,
+                       splits: Sequence[str] = BOOT_SPLITS) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """``(lambda_corr, lambda_boot)``: Spearman rho per start x discriminant x quantity and
+    its family bootstrap per (discriminant, quantity, split); see the module notes for the
+    constant censored step series (rho = 0, as-run rows kept under
+    :data:`CENSORED_STEPS_AS_RUN`)."""
     if paths.empty:
-        return pd.DataFrame(columns=ccols), pd.DataFrame(columns=["discriminant", "quantity", "preregistered", "expected_sign",
-                                                                  "sign_as_expected", "mean", "ci_low", "ci_high", "se",
-                                                                  "n_clusters", "n_rows"])
+        return pd.DataFrame(columns=CORR_COLS), pd.DataFrame(columns=CORR_BOOT_COLS)
     rows = []
     for (tag, fid, form, kind), g in paths.groupby(["tag", "family", "formulation", "discriminant"], sort=True):
         sub = g[["lam"] + [c for c in CORR_QUANTITIES if c in g.columns]].copy()
         sub["crossed"] = sub["crossed"].astype(float)
         cr = geometry_lambda_correlation(sub)
+        split = C.prereg_split(fid, form)
         for _, r in cr.iterrows():
-            pre = bool(kind == PREREG_DISCRIMINANT and r["quantity"] in PREREG_QUANTITIES)
-            rows.append(dict(tag=tag, family=fid, formulation=form, discriminant=kind, quantity=r["quantity"], rho=float(r["rho"]),
-                             pvalue=float(r["pvalue"]), n=int(r["n"]), preregistered=pre,
-                             expected_sign=(PREREG_QUANTITIES.get(r["quantity"], 0) if pre else 0)))
-    corr = pd.DataFrame(rows, columns=ccols)
+            q = str(r["quantity"])
+            pre = bool(kind == PREREG_DISCRIMINANT and q in PREREG_QUANTITIES)
+            base = dict(tag=tag, family=fid, formulation=form, discriminant=kind, quantity=q, rho=float(r["rho"]),
+                        pvalue=float(r["pvalue"]), n=int(r["n"]), preregistered=pre,
+                        expected_sign=(PREREG_QUANTITIES.get(q, 0) if pre else 0), split=split, constant_series=False,
+                        as_run=False)
+            if q == CENSORED_STEPS and q in sub.columns:
+                const = constant_series(sub[q])
+                rows.append(dict(base, quantity=CENSORED_STEPS_AS_RUN, preregistered=False, expected_sign=0,
+                                 constant_series=const, as_run=True))
+                if const and not np.isfinite(base["rho"]):
+                    base.update(rho=0.0, pvalue=1.0, constant_series=True)
+            rows.append(base)
+    corr = pd.DataFrame(rows, columns=CORR_COLS)
     brows = []
     for (kind, q), g in corr.groupby(["discriminant", "quantity"], sort=True):
         pre = bool(kind == PREREG_DISCRIMINANT and q in PREREG_QUANTITIES)
         exp = PREREG_QUANTITIES.get(q, 0) if pre else 0
-        r = C.boot_row(g, "rho", n_boot, seed, discriminant=kind, quantity=q, preregistered=pre, expected_sign=exp)
-        r["sign_as_expected"] = (bool(np.isfinite(r["mean"]) and np.sign(r["mean"]) == exp) if exp else None)
-        brows.append(r)
-    boot = pd.DataFrame(brows, columns=["discriminant", "quantity", "preregistered", "expected_sign", "sign_as_expected",
-                                        "mean", "ci_low", "ci_high", "se", "n_clusters", "n_rows"])
+        as_run = bool(g["as_run"].any())
+        for r in C.split_boot_rows(g, "rho", n_boot, seed, splits=splits, with_p=True, discriminant=kind, quantity=q,
+                                   preregistered=pre, expected_sign=exp):
+            part = g[C.split_mask(g, r["split"])]
+            r.update(sign_as_expected=sign_as_expected(r["mean"], exp), confirmatory=bool(pre and r["split"] == "test"),
+                     as_run=as_run, n_constant_as_zero=int((part["constant_series"] & ~part["as_run"]).sum()))
+            brows.append(r)
+    boot = pd.DataFrame(brows, columns=CORR_BOOT_COLS)
     return corr, boot
+
+
+FROZEN_COLS = ["discriminant", "feature", "n_starts_dev", "n_families_dev", "rho_mean_dev", "sign_dev", "candidate_dev",
+               "n_starts_test", "n_clusters_test", "rho_mean_test", "ci_low_test", "ci_high_test", "p_boot_test",
+               "frac_candidate_test", "confirmed"]
+
+
+def frozen_feature_table(feats: pd.DataFrame, n_boot: int, seed: int) -> pd.DataFrame:
+    """Contrast 10, last sentence: SAE features with ``|mean rho| >= 0.7`` over the starts of the
+    development families DEV01-DEV04 are frozen as candidates (``candidate_dev``) and evaluated on
+    the test starts F01-F12 x {A, B}: family-mean rho with a family cluster bootstrap
+    (``rho_mean_test``, ``ci_low_test`` / ``ci_high_test``), the fraction of test starts with
+    ``|rho| >= 0.7`` and the DEV sign, and ``confirmed`` = the test interval excludes 0 on the
+    side of the DEV sign (False without a test start).  One row per frozen candidate."""
+    if feats.empty or "split" not in feats.columns:
+        return pd.DataFrame(columns=FROZEN_COLS)
+    dev = feats[feats["split"] == "dev"]
+    if dev.empty:
+        return pd.DataFrame(columns=FROZEN_COLS)
+    test = feats[feats["split"] == "test"]
+    test_by = {k: g for k, g in test.groupby(["discriminant", "feature"], sort=False)} if len(test) else {}
+    rows = []
+    for (kind, f), g in dev.groupby(["discriminant", "feature"], sort=True):
+        rho = g["rho"].to_numpy(dtype=float)
+        if not np.isfinite(rho).any():
+            continue
+        m = float(np.nanmean(rho))
+        if abs(m) < PREREG_CANDIDATE_RHO:
+            continue
+        sgn = int(np.sign(m))
+        row = dict(discriminant=kind, feature=int(f), n_starts_dev=int(len(g)), n_families_dev=int(g["family"].nunique()),
+                   rho_mean_dev=m, sign_dev=sgn, candidate_dev=True, n_starts_test=0, n_clusters_test=0,
+                   rho_mean_test=np.nan, ci_low_test=np.nan, ci_high_test=np.nan, p_boot_test=np.nan,
+                   frac_candidate_test=np.nan, confirmed=False)
+        t = test_by.get((kind, f))
+        if t is not None and np.isfinite(t["rho"].to_numpy(dtype=float)).any():
+            r = C.boot_row(t, "rho", n_boot, seed, with_p=True)
+            tr = t["rho"].to_numpy(dtype=float)
+            ok = np.isfinite(tr)
+            row.update(n_starts_test=int(ok.sum()), n_clusters_test=r["n_clusters"], rho_mean_test=r["mean"],
+                       ci_low_test=r["ci_low"], ci_high_test=r["ci_high"], p_boot_test=r["p_boot"],
+                       frac_candidate_test=float(np.mean((np.abs(tr[ok]) >= PREREG_CANDIDATE_RHO) & (np.sign(tr[ok]) == sgn))),
+                       confirmed=bool(r["ci_low"] > 0 if sgn > 0 else r["ci_high"] < 0))
+        rows.append(row)
+    return pd.DataFrame(rows, columns=FROZEN_COLS)
 
 
 def feature_tables(ends_by_start: list[tuple[dict, dict]], sae) -> tuple[pd.DataFrame, pd.DataFrame]:
     fcols = ["tag", "family", "formulation", "discriminant", "feature", "rho", "pvalue", "act_at_min_lambda", "act_at_max_lambda",
-             "active_only_lambda0", "active_only_lambda_pos", "n_active", "max_act", "candidate"]
+             "active_only_lambda0", "active_only_lambda_pos", "n_active", "max_act", "candidate", "split"]
     scols = ["discriminant", "feature", "n_starts", "rho_mean", "rho_min", "rho_max", "frac_candidate", "n_active_only_lambda0",
              "n_active_only_lambda_pos", "candidate_all"]
     if sae is None or not ends_by_start:
@@ -309,6 +409,7 @@ def feature_tables(ends_by_start: list[tuple[dict, dict]], sae) -> tuple[pd.Data
             df.insert(0, "family", idc["family"])
             df.insert(0, "tag", idc["tag"])
             df["candidate"] = df["rho"].abs() >= PREREG_CANDIDATE_RHO
+            df["split"] = C.prereg_split(idc["family"], idc["formulation"])
             frames.append(df)
     if not frames:
         return pd.DataFrame(columns=fcols), pd.DataFrame(columns=scols)
@@ -405,11 +506,14 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     steps_df = pd.DataFrame(step_rows, columns=STEP_COLS)
     corr, boot = sub.run("correlations", lambda: correlation_tables(paths, limits.n_boot, cfg.seed), (empty, empty))
     feats, feats_summary = sub.run("features", lambda: feature_tables(ends_by_start, sae), (empty, empty))
+    feats_frozen = sub.run("features_frozen", lambda: frozen_feature_table(feats, limits.n_boot, cfg.seed),
+                           lambda: pd.DataFrame(columns=FROZEN_COLS))
     orig_df = sub.run("original", lambda: original_table(mb, original, site, kde, H_target, limits, cfg.seed, freq_ids, sae,
                                                          sae_source, limits.h_cov_rank), empty)
 
     tables = {"lambda_paths": paths, "lambda_steps": steps_df, "lambda_corr": corr, "lambda_boot": boot,
-              "lambda_features": feats, "lambda_features_summary": feats_summary, "lambda_original": orig_df}
+              "lambda_features": feats, "lambda_features_summary": feats_summary, "lambda_features_frozen": feats_frozen,
+              "lambda_original": orig_df}
     sub.write_tracebacks(run_dir)
     return C.finish_stage(run_dir, "H", cfg, mb, tables, limits=limits, t0=t0, site=site, sae_source=sae_source,
                           sae_feature=feature, n_starts=len(starts), n_target=int(H_target.shape[0]), n_k0_cloud=int(H_k0.shape[0]),
@@ -419,7 +523,15 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
                           path=dict(n_steps=limits.h_n_steps, step_rel=limits.h_step_rel, dmax_rel=limits.h_dmax_rel,
                                     cross_nats=limits.h_cross_nats, ball_metric="l2"),
                           original=(original.info() if original is not None else None), substages=sub.report(),
+                          splits=dict(boot=list(BOOT_SPLITS), dev_families=list(C.DEV_FAMILIES),
+                                      test_families=list(C.TEST_FAMILIES), test_formulations=list(C.TEST_FORMULATIONS),
+                                      starts_by_split={k: int(v) for k, v in pd.Series(
+                                          [C.prereg_split(v.family_id, v.formulation) for v in starts]).value_counts().items()}),
+                          constant_censored_series="rho = 0 (as-run rows: quantity steps_to_cross_censored_as_run)",
                           prereg=dict(contrast_10="lambda_boot rows with preregistered=True (discriminant target_logit; "
-                                                  "sae_fvu, steps_to_cross_censored (uncrossed paths at n_steps+1; raw steps_to_cross secondary), mahal_to_ref_mean); "
-                                                  "lambda_features candidate=|rho|>=0.7",
+                                                  "sae_fvu, steps_to_cross_censored (uncrossed paths at n_steps+1, a constant "
+                                                  "censored series counts as rho = 0; raw steps_to_cross secondary), "
+                                                  "mahal_to_ref_mean), confirmatory on split=test; "
+                                                  "lambda_features candidate=|rho|>=0.7; lambda_features_frozen: frozen on "
+                                                  "DEV01-DEV04, evaluated on F01-F12 x {A, B}",
                                       contrast_11="lambda_original: B_lambda0 vs B_lambda3, same_sign"))

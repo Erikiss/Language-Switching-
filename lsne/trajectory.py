@@ -103,8 +103,9 @@ def depth_trajectory(geom_table: pd.DataFrame) -> pd.DataFrame:
     ``delta_participation_ratio``, ``delta_disp_mahal`` and the per-condition summaries
     repeated on every row: ``breathing_index`` (sign changes of ``delta_log_volume``,
     zeros ignored), ``breathing_amplitude`` (mean ``|delta_log_volume|``),
-    ``layer_of_max_contraction`` (layer at which ``delta_log_volume`` is most negative),
-    ``layer_of_max_expansion``, ``net_change`` (last minus first log-volume),
+    ``layer_of_max_contraction`` (layer at which ``delta_log_volume`` is most negative; NaN
+    when no increment is negative: nothing contracts), ``layer_of_max_expansion`` (most
+    positive increment; NaN when none is positive), ``net_change`` (last minus first log-volume),
     ``total_variation`` and ``n_layers``.
     """
     df = geom_table.copy()
@@ -138,8 +139,10 @@ def depth_trajectory(geom_table: pd.DataFrame) -> pd.DataFrame:
         layers = out["layer"].to_numpy()
         out["breathing_index"] = breathing_index(delta)
         out["breathing_amplitude"] = float(np.mean(np.abs(delta[finite]))) if finite.any() else np.nan
-        out["layer_of_max_contraction"] = (layers[np.nanargmin(delta)] if finite.any() else np.nan)
-        out["layer_of_max_expansion"] = (layers[np.nanargmax(delta)] if finite.any() else np.nan)
+        out["layer_of_max_contraction"] = (layers[np.nanargmin(delta)] if finite.any() and np.nanmin(delta) < 0
+                                           else np.nan)
+        out["layer_of_max_expansion"] = (layers[np.nanargmax(delta)] if finite.any() and np.nanmax(delta) > 0
+                                         else np.nan)
         lv_f = lv[np.isfinite(lv)]
         out["net_change"] = float(lv_f[-1] - lv_f[0]) if lv_f.size > 1 else np.nan
         out["total_variation"] = float(np.sum(np.abs(delta[finite]))) if finite.any() else np.nan

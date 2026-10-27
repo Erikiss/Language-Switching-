@@ -841,6 +841,27 @@ def _generate_fraction(mb: ModelBundle, ids: torch.Tensor, specs, n_new: int, n_
 # ======================================================================================
 # the transplant experiment (A / B / C against controls)
 # ======================================================================================
+def source_directions(v_src) -> Union[torch.Tensor, dict]:
+    """``v_src`` as a float CPU vector, or - for layer-consistent directions - a
+    ``{layer_src: vector}`` dict (:func:`direction_at`)."""
+    if isinstance(v_src, dict):
+        if not v_src:
+            raise ValueError("v_src dict is empty")
+        return {int(l): torch.as_tensor(v).detach().float().cpu().reshape(-1) for l, v in v_src.items()}
+    return torch.as_tensor(v_src).detach().float().cpu().reshape(-1)
+
+
+def direction_at(v_src, layer_src: int) -> torch.Tensor:
+    """The source direction dosed into the states of source layer ``layer_src``: ``v_src`` itself
+    (one vector for every layer) or ``v_src[layer_src]`` of a ``{layer_src: vector}`` dict, so that
+    every alignment map is dosed with the direction measured at its own source layer."""
+    if isinstance(v_src, dict):
+        if int(layer_src) not in v_src:
+            raise KeyError(f"no source direction for source layer {layer_src}; have {sorted(v_src)}")
+        return v_src[int(layer_src)]
+    return v_src
+
+
 def _dose_rows(H: torch.Tensor, v: torch.Tensor, eps: float) -> torch.Tensor:
     """Per-row State-2143 dose in the *source* space: ``h + eps RMS(h) v / RMS(v)``."""
     if eps == 0.0:
@@ -869,20 +890,22 @@ def transplanted_states(src: SourceModel, align: Union[Alignment, dict], prompt,
     """Transferred states ``{layer_tgt: [T_S, d_T]}`` of the source side of ``prompt``: the
     source residuals at each alignment's source layer, dosed along ``v_src`` (``eps``
     relative RMS per position, :func:`transplant_experiment` convention; no dose when
-    ``v_src`` is None or ``eps == 0``) and mapped with ``H_S W + b``.  ``align``: one
-    :class:`Alignment` (keyed by its ``layer_tgt``) or a ``{layer_tgt: Alignment}`` dict."""
+    ``v_src`` is None or ``eps == 0``; a ``{layer_src: vector}`` dict doses each map's source
+    layer with its own direction, :func:`direction_at`) and mapped with ``H_S W + b``.
+    ``align``: one :class:`Alignment` (keyed by its ``layer_tgt``) or a ``{layer_tgt: Alignment}``
+    dict."""
     aligns = {int(align.layer_tgt): align} if isinstance(align, Alignment) else {int(k): a for k, a in align.items()}
     if layers_tgt is not None:
         aligns = {int(l): aligns[int(l)] for l in layers_tgt}
     if not aligns:
         raise ValueError("no alignment")
     H_S = source_states(src, prompt, sorted({int(a.layer_src) for a in aligns.values()}))
-    v = None if v_src is None else torch.as_tensor(v_src).detach().float().cpu().reshape(-1)
+    v = None if v_src is None else source_directions(v_src)
     out = {}
     for l, a in aligns.items():
         H = torch.as_tensor(H_S[int(a.layer_src)]).detach().float().cpu()
         if v is not None and float(eps) != 0.0:
-            H = _dose_rows(H, v, float(eps))
+            H = _dose_rows(H, direction_at(v, int(a.layer_src)), float(eps))
         out[l] = transfer_states(a, H)
     return out
 
@@ -942,6 +965,10 @@ def transplant_experiment(mb: ModelBundle, src: SourceModel, align: Union[Alignm
                           gen_kw: Optional[dict] = None, native_axis=None, targets=None, seed: int = 0,
                           n_substitute: Optional[int] = None, state_sites: Optional[Sequence[HookSite]] = None):
     """Transplant the source feature ``v_src`` into the target per prompt x mode x control.
+
+    ``v_src``: one source vector, or a ``{layer_src: vector}`` dict of layer-consistent
+    directions (every alignment map is dosed with the direction measured at its own source
+    layer, :func:`direction_at`; rows record ``v_src_per_layer`` and ``v_src_layer``).
 
     ``prompts``: plain strings (the same text in both models, the old behaviour),
     ``(text, target)`` tuples, or prompt *pairs* whose source side differs from the target
@@ -1003,8 +1030,12 @@ def transplant_experiment(mb: ModelBundle, src: SourceModel, align: Union[Alignm
     align_res = aligns.get(site_layer, next(iter(aligns.values())))
     kv_layers = sorted(aligns)
     kv_layers_str = ",".join(str(l) for l in kv_layers)
-    v_src = torch.as_tensor(v_src).detach().float().cpu().reshape(-1)
-    v_T = transfer_direction(align_res, v_src)
+    v_src = source_directions(v_src)
+    per_layer = isinstance(v_src, dict)
+    for a in aligns.values():
+        direction_at(v_src, int(a.layer_src))               # every map needs its source layer's direction
+    d_src = int(next(iter(v_src.values())).numel()) if per_layer else int(v_src.numel())
+    v_T = transfer_direction(align_res, direction_at(v_src, int(align_res.layer_src)))
     cos_native = cosine(v_T, native_axis) if native_axis is not None else float("nan")
     arms = ["none"] + [c for c in controls if c != "none"]
     layers_src = sorted({a.layer_src for a in aligns.values()})
@@ -1024,7 +1055,7 @@ def transplant_experiment(mb: ModelBundle, src: SourceModel, align: Union[Alignm
             v_dose = v_src
             use = aligns
             if control == "random":
-                v_dose = random_directions(v_src.numel(), 1, seed + 1000 * _random_key(pp, i) + ci)[0]
+                v_dose = random_directions(d_src, 1, seed + 1000 * _random_key(pp, i) + ci)[0]
             elif control == "permuted_alignment":
                 use = {l: permute_alignment(a, seed + l) for l, a in aligns.items()}
             elif control not in ("none", "identity"):
@@ -1036,9 +1067,10 @@ def transplant_experiment(mb: ModelBundle, src: SourceModel, align: Union[Alignm
                     H_T[l] = own[l]
             else:
                 for l, a in use.items():
-                    H_T[l] = transfer_states(a, _dose_rows(H_S[a.layer_src], v_dose, eps))
+                    H_T[l] = transfer_states(a, _dose_rows(H_S[a.layer_src], direction_at(v_dose, int(a.layer_src)), eps))
                 if site_layer not in H_T:
-                    H_T[site_layer] = transfer_states(use[next(iter(use))], _dose_rows(H_S[align_res.layer_src], v_dose, eps))
+                    H_T[site_layer] = transfer_states(use[next(iter(use))], _dose_rows(H_S[align_res.layer_src],
+                                                                                       direction_at(v_dose, int(align_res.layer_src)), eps))
             for mode in modes:
                 if mode not in ("residual", "kv", "both"):
                     raise ValueError(f"unknown mode {mode!r}")
@@ -1075,7 +1107,8 @@ def transplant_experiment(mb: ModelBundle, src: SourceModel, align: Union[Alignm
                                  n_switches=gen["n_switches"], entropy_gen=gen["entropy_gen"],
                                  written_norm=written, cos_native=cos_native,
                                  r2_holdout=align_res.r2_holdout, r2_permuted=align_res.r2_permuted,
-                                 layer_src=align_res.layer_src, method=align_res.method))
+                                 layer_src=align_res.layer_src, method=align_res.method,
+                                 v_src_per_layer=per_layer, v_src_layer=(int(align_res.layer_src) if per_layer else -1)))
     df = pd.DataFrame(rows)
     return (df, states) if rec_sites else df
 

@@ -30,8 +30,12 @@ direction_domain   contrast 13 per variant (K=0 and K=8/C1) x direction x eps: B
 direction_domain_T T(K=8, C1) = logp_0(K=8) - logp_0(K=0) per formulation with its family group
 direction_domain_boot  family bootstrap of B per (family_domain, direction, eps) and of the
                    pre-registered contrast ``B(dom_culture_politics_cs) - B(lang_dom)``
-                   (``quantity = "B_cs_minus_lang_dom"``; ``min_effect_met`` = mean >= 0.05
-                   nats on the culture/politics families)
+                   (``quantity = "B_cs_minus_lang_dom"``); ``preregistered`` on ONE dose of the
+                   culture/politics K=8/C1 rows: the dose frozen on a development run
+                   (``kw['direction_domain_eps']``), else 0.05 (PREREGISTRATION fixes none;
+                   manifest ``contrast_13_eps``); ``min_effect_met`` / ``verdict`` by the CI
+                   rule (:func:`~lsne.experiments.common.min_effect_verdict`, 0.05 nats: met only
+                   when the whole interval is >= 0.05), never by the point estimate
 head_effects       mean-ablation effect of every head of the pre-registered layer grid on
                    log p(target) per variant (:func:`lsne.heads.head_ablation_effects`)
 head_direct        direct logit effect of every head on the target at the last position
@@ -42,8 +46,17 @@ worst_head         :func:`lsne.heads.worst_head` ranking (weak = culture/politic
 head_steering      contrast 14 per variant x direction x eps: B when the direction is
                    applied through the worst head (:func:`lsne.heads.steer_at_head`, dose
                    relative to the head's own RMS) vs added to the residual at the block
-                   output of the same layer with the same relative dose (``arm``)
-head_steering_boot family bootstrap of ``B_head - B_residual`` per (direction, eps)
+                   output of the same layer with the same relative dose (``arm="residual"``,
+                   ``dose_match="relative"``, the pre-registered wording) and with the same
+                   *absolute* norm as the head arm's realised residual delta
+                   (``arm="residual_abs"``, ``dose_match="absolute"``: the relative residual
+                   arm writes ~30x the head arm's norm, so B_head - B_residual measures the
+                   residual arm's damage); ``delta_norm`` = ||delta|| written into the residual
+                   stream, ``audit_rel_err`` = Soll/Ist of the write (Injector / HeadInjector)
+head_steering_boot family bootstrap of ``B_head - B_residual`` (relative dose) and of
+                   ``B_head - B_residual_abs`` (``quantity="B_head_minus_residual_abs"``) per
+                   (direction, eps); ``delta_norm_ratio`` = mean ||delta_residual|| /
+                   ||delta_head||
 """
 from __future__ import annotations
 
@@ -66,6 +79,8 @@ from . import common as C
 
 COMPASS_EPS = 0.05
 PREREG_MIN_B = 0.05
+#: Dose of the pre-registered contrast-13 row when no dose was frozen on a development run.
+PREREG_EPS_13 = 0.05
 DOMAIN_AXES = {"dom_law": ("law", "everyday"), "dom_culture_politics": (["culture_values", "politics"], "everyday"),
                "dom_protein_misfolding": ("protein_misfolding", "everyday")}
 DD_DIRECTIONS = ("dom_culture_politics_cs", "dom_culture_politics", "dom_law", "lang_dom", "rand")
@@ -224,25 +239,40 @@ def direction_domain_tables(mb: ModelBundle, variants, bank, axes: dict[str, Dir
     return dd, pd.DataFrame(trows, columns=["family", "formulation", "family_domain", "logp_0_K0", "logp_0_K8", "T"])
 
 
-def direction_domain_boot(dd: pd.DataFrame, n_boot: int, seed: int) -> pd.DataFrame:
+def contrast13_eps(frozen, doses: Sequence[float]) -> tuple[Optional[float], str]:
+    """``(eps, source)`` of the one pre-registered contrast-13 row: the dose frozen on a
+    development run (``source="frozen_input"``), else :data:`PREREG_EPS_13` (``"default_0.05"``);
+    ``(None, "... not in doses")`` when that dose is not swept."""
+    eps, source = ((float(frozen), "frozen_input") if frozen is not None and frozen != ""
+                   else (PREREG_EPS_13, f"default_{PREREG_EPS_13:g}"))
+    if not any(np.isclose(eps, float(d)) for d in doses):
+        return None, f"{source}: eps {eps:g} not in doses {list(doses)}"
+    return eps, source
+
+
+def direction_domain_boot(dd: pd.DataFrame, n_boot: int, seed: int, prereg_eps: Optional[float] = PREREG_EPS_13) -> pd.DataFrame:
+    """Family bootstrap of B per (family_domain, direction, K, C, eps) and of the contrast-13
+    difference ``B_cs_minus_lang_dom``; ``preregistered`` only on the culture/politics K=8/C1 row
+    at ``prereg_eps`` (one dose); ``min_effect_met`` / ``verdict`` follow the CI rule."""
     cols = ["quantity", "family_domain", "direction", "K", "C", "eps", "preregistered", "min_effect_met", "mean", "ci_low", "ci_high",
-            "se", "n_clusters", "n_rows"]
+            "se", "n_clusters", "n_rows", "verdict", "p_boot"]
     if dd.empty:
         return pd.DataFrame(columns=cols)
     std = dd[dd["kind"] == "standard"]
     rows = []
     for (grp, name, K, Cc, eps), g in std.groupby(["family_domain", "direction", "K", "C", "eps"], sort=True):
-        rows.append(C.boot_row(g, "B", n_boot, seed, quantity="B", family_domain=grp, direction=name, K=int(K), C=str(Cc), eps=float(eps),
-                               preregistered=False, min_effect_met=None))
+        rows.append(C.boot_row(g, "B", n_boot, seed, with_p=True, quantity="B", family_domain=grp, direction=name, K=int(K), C=str(Cc),
+                               eps=float(eps), preregistered=False, min_effect_met=None, verdict=""))
     piv = std.pivot_table(index=["family", "formulation", "tag", "family_domain", "K", "C", "eps"], columns="direction", values="B")
     if "dom_culture_politics_cs" in piv.columns and "lang_dom" in piv.columns:
         piv = piv.reset_index()
         piv["diff"] = piv["dom_culture_politics_cs"] - piv["lang_dom"]
         for (grp, K, Cc, eps), g in piv.groupby(["family_domain", "K", "C", "eps"], sort=True):
-            pre = bool(grp == "culture_politics" and int(K) == 8 and str(Cc) == "C1")
-            r = C.boot_row(g, "diff", n_boot, seed, quantity="B_cs_minus_lang_dom", family_domain=grp, direction="dom_culture_politics_cs-lang_dom",
-                           K=int(K), C=str(Cc), eps=float(eps), preregistered=pre)
-            r["min_effect_met"] = bool(np.isfinite(r["mean"]) and r["mean"] >= PREREG_MIN_B)
+            pre = bool(grp == "culture_politics" and int(K) == 8 and str(Cc) == "C1" and prereg_eps is not None
+                       and np.isclose(float(eps), float(prereg_eps)))
+            r = C.boot_row(g, "diff", n_boot, seed, with_p=True, quantity="B_cs_minus_lang_dom", family_domain=grp,
+                           direction="dom_culture_politics_cs-lang_dom", K=int(K), C=str(Cc), eps=float(eps), preregistered=pre)
+            r["min_effect_met"], r["verdict"] = C.min_effect_verdict(r["ci_low"], r["ci_high"], PREREG_MIN_B)
             rows.append(r)
     return pd.DataFrame(rows, columns=cols)
 
@@ -316,8 +346,9 @@ def select_worst_head(eff: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 def head_steering_tables(mb: ModelBundle, variants, head_info: dict, directions: dict[str, object], doses: Sequence[float],
                          n_boot: int, seed: int, enabled: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
     cols = list(C.ID_COLS) + ["family_domain", "layer", "head", "direction", "eps", "arm", "logp_0", "logp_delta", "B", "rms_delta",
-                              "cos_realised_direction", "preimage_rel_err"]
-    bcols = ["quantity", "direction", "eps", "mean", "ci_low", "ci_high", "se", "n_clusters", "n_rows"]
+                              "cos_realised_direction", "preimage_rel_err", "delta_norm", "dose_match", "audit_rel_err"]
+    bcols = ["quantity", "direction", "eps", "mean", "ci_low", "ci_high", "se", "n_clusters", "n_rows", "dose_match",
+             "delta_norm_ratio", "p_boot"]
     if head_info.get("layer") is None or not directions:
         return pd.DataFrame(columns=cols), pd.DataFrame(columns=bcols)
     layer, head = int(head_info["layer"]), int(head_info["head"])
@@ -331,32 +362,58 @@ def head_steering_tables(mb: ModelBundle, variants, head_info: dict, directions:
         logp0 = float(torch.log_softmax(cache.logits[0, -1], -1)[int(v.target_id)])
         h_out = cache.resid[out_site.key][0, T - 1].detach().float().cpu()
         idc = dict(C.variant_row(v), family_domain=C.family_domain(v.family_id), layer=layer, head=head)
+        def _residual(delta: torch.Tensor) -> tuple[float, float]:
+            inj = Injector(mb, out_site, delta.to(mb.dtype), positions=[T - 1], mode="add")
+            with torch.no_grad(), inj:
+                logits = forward_logits(mb, ids)
+            return float(torch.log_softmax(logits[0, -1], -1)[int(v.target_id)]), float(inj.audit.get("rel_err", np.nan))
+
         for name, d in directions.items():
             vec = getattr(d, "vec", d)
             for eps in doses:
                 eps = float(eps)
+                head_norm = None
                 try:
                     last, info = steer_at_head(mb, ids, layer, head, vec, eps, position=T - 1, return_info=True)
                     lp = float(torch.log_softmax(last, -1)[int(v.target_id)])
+                    head_norm = float(info["realised"].float().norm())
                     rows.append(dict(idc, direction=name, eps=eps, arm="head", logp_0=logp0, logp_delta=lp, B=lp - logp0,
                                      rms_delta=float(info["rms_delta"]), cos_realised_direction=float(info["cos_realised_direction"]),
-                                     preimage_rel_err=float(info["preimage_rel_err"])))
+                                     preimage_rel_err=float(info["preimage_rel_err"]), delta_norm=head_norm, dose_match="relative",
+                                     audit_rel_err=float(info.get("audit", {}).get("written_rel_err", np.nan))))
                 except ValueError as e:
                     warnings.warn(f"head steering skipped for {v.tag}/{name}: {e}")
                 delta = make_dose_delta(h_out, vec, eps)
-                with torch.no_grad(), Injector(mb, out_site, delta.to(mb.dtype), positions=[T - 1], mode="add"):
-                    logits = forward_logits(mb, ids)
-                lp = float(torch.log_softmax(logits[0, -1], -1)[int(v.target_id)])
+                lp, err = _residual(delta)
                 rows.append(dict(idc, direction=name, eps=eps, arm="residual", logp_0=logp0, logp_delta=lp, B=lp - logp0,
-                                 rms_delta=float(delta.float().pow(2).mean().sqrt()), cos_realised_direction=1.0, preimage_rel_err=0.0))
+                                 rms_delta=float(delta.float().pow(2).mean().sqrt()), cos_realised_direction=1.0, preimage_rel_err=0.0,
+                                 delta_norm=float(delta.float().norm()), dose_match="relative", audit_rel_err=err))
+                if head_norm is not None:
+                    # the same absolute ||delta|| as the head arm's realised residual delta, along the direction
+                    u = torch.as_tensor(vec).detach().float().cpu().reshape(-1)
+                    delta_abs = u / u.norm().clamp_min(1e-30) * head_norm
+                    lp, err = _residual(delta_abs)
+                    rows.append(dict(idc, direction=name, eps=eps, arm="residual_abs", logp_0=logp0, logp_delta=lp, B=lp - logp0,
+                                     rms_delta=float(delta_abs.pow(2).mean().sqrt()), cos_realised_direction=1.0, preimage_rel_err=0.0,
+                                     delta_norm=float(delta_abs.norm()), dose_match="absolute", audit_rel_err=err))
     hs = pd.DataFrame(rows, columns=cols)
     brows = []
     if len(hs):
-        piv = hs[hs["kind"] == "standard"].pivot_table(index=["family", "tag", "direction", "eps"], columns="arm", values="B").reset_index()
-        if "head" in piv.columns and "residual" in piv.columns:
-            piv["diff"] = piv["head"] - piv["residual"]
+        keys = ["family", "tag", "direction", "eps"]
+        std = hs[hs["kind"] == "standard"]
+        piv = std.pivot_table(index=keys, columns="arm", values="B").reset_index()
+        nrm = std.pivot_table(index=keys, columns="arm", values="delta_norm").reset_index()
+        for arm, q, match in (("residual", "B_head_minus_residual", "relative"), ("residual_abs", "B_head_minus_residual_abs", "absolute")):
+            if "head" not in piv.columns or arm not in piv.columns:
+                continue
+            piv["diff"] = piv["head"] - piv[arm]
+            ratio = nrm.set_index(keys)[arm] / nrm.set_index(keys)["head"] if {"head", arm} <= set(nrm.columns) else None
+            piv["ratio"] = ratio.reindex(pd.MultiIndex.from_frame(piv[keys])).to_numpy() if ratio is not None else np.nan
             for (name, eps), g in piv.groupby(["direction", "eps"], sort=True):
-                brows.append(C.boot_row(g, "diff", n_boot, seed, quantity="B_head_minus_residual", direction=name, eps=float(eps)))
+                ratio = g["ratio"].to_numpy(dtype=float)
+                brows.append(C.boot_row(g, "diff", n_boot, seed, with_p=True, quantity=q, direction=name, eps=float(eps),
+                                        dose_match=match,
+                                        delta_norm_ratio=float(np.nanmean(ratio)) if np.isfinite(ratio).any() else np.nan))
     return hs, pd.DataFrame(brows, columns=bcols)
 
 
@@ -397,7 +454,8 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     std = C.k_subset(variants, 0) + C.k_subset(variants, 8, "C1")
     dd, dd_T = sub.run("direction_domain", lambda: direction_domain_tables(mb, std, bank, axes, site, limits.i_doses, enabled=limits.progress),
                        (empty, empty))
-    dd_boot = sub.run("direction_domain_boot", lambda: direction_domain_boot(dd, limits.n_boot, cfg.seed), empty)
+    eps13, eps13_source = contrast13_eps(kw.get("direction_domain_eps"), limits.i_doses)
+    dd_boot = sub.run("direction_domain_boot", lambda: direction_domain_boot(dd, limits.n_boot, cfg.seed, prereg_eps=eps13), empty)
 
     grid = C.prereg_layer_grid(mb.n_layers)
     eff, direct = sub.run("heads", lambda: head_tables(mb, std, grid, enabled=limits.progress), (empty, empty))
@@ -433,7 +491,13 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
                           atlas=dict(dir=str(atlas_dir), n_clusters=len(clusters)), layer_grid=[int(l) for l in grid],
                           worst_head=C.to_jsonable(wh), doses=list(limits.i_doses), head_eps=list(limits.i_head_eps),
                           n_variants=len(std), substages=sub.report(),
+                          contrast_13_eps=dict(eps=eps13, source=eps13_source, min_effect=PREREG_MIN_B,
+                                               rule="min_effect_met = ci_low >= 0.05 (CI rule, common.min_effect_verdict)"),
+                          head_arm_dose=dict(relative="arm residual: eps x RMS of the residual (pre-registered wording)",
+                                             absolute="arm residual_abs: ||delta|| = the head arm's realised ||W_O u||"),
                           prereg=dict(contrast_12="compass_summary: direction=ent, lang=E -> law_is_top / law_rank",
-                                      contrast_13="direction_domain_boot quantity=B_cs_minus_lang_dom, family_domain=culture_politics, K=8/C1",
-                                      contrast_14="head_steering_boot quantity=B_head_minus_residual (evaluation families only; "
+                                      contrast_13="direction_domain_boot quantity=B_cs_minus_lang_dom, family_domain=culture_politics, K=8/C1, "
+                                                  "preregistered=True (one eps: contrast_13_eps)",
+                                      contrast_14="head_steering_boot quantity=B_head_minus_residual (relative dose) and "
+                                                  "B_head_minus_residual_abs (equal absolute ||delta||) (evaluation families only; "
                                                   "worst_head.selection_families disjoint unless selection_evaluation_overlap)"))

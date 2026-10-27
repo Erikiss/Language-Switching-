@@ -33,7 +33,7 @@ from lsne.transplant import SourceModel
 FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "xatu")
 TRACE_TABLES = {"transfer_test", "transfer_summary", "layer_matching", "alignments", "transplant", "transplant_summary",
                 "verdict", "trace_probe", "trace_probe_match", "trace_alignment_controls", "trace_bt", "trace_T",
-                "trace_effects", "trace_sharing", "trace_verdict"}
+                "trace_effects", "trace_sharing", "trace_verdict", "trace_damage"}
 
 
 @pytest.fixture(scope="module")
@@ -58,11 +58,25 @@ def tsrc(trace_lm):
 
 @pytest.fixture(scope="module")
 def stage_run(trace_lm, tmp_path_factory):
+    """The smoke trace run.  The stand-in dose ``Limits.l_eps`` is set to 0.3 (the full-run
+    default) and ``transplant_experiment`` is spied on, so the trace dose is checked against a
+    stand-in dose that differs from it."""
+    import lsne.transplant as TPM
+
     out = tmp_path_factory.mktemp("stage_l_trace")
-    rc = main(["run", "--stage", "L", "--model", "EleutherAI/pythia-14m", "--revision", "step98000", "--dtype", "float32",
-               "--device", "cpu", "--families", "DEV01", "--out", str(out), "--smoke", "--no-progress",
-               "--transplant-source", f"trace:{trace_lm['lm']},k=5,n_probe=50"])      # options on the spec string
-    return dict(rc=rc, dir=Path(out) / "L" / "pythia-14m@step98000")
+    calls = []
+    real, smoke = TPM.transplant_experiment, C.Limits.smoke
+
+    def spy(*a, **k):
+        calls.append(dict(eps=k.get("eps")))
+        return real(*a, **k)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(TPM, "transplant_experiment", spy)
+        mp.setattr(C.Limits, "smoke", classmethod(lambda cls, **kw: smoke(**dict(dict(l_eps=0.3), **kw))))
+        rc = main(["run", "--stage", "L", "--model", "EleutherAI/pythia-14m", "--revision", "step98000", "--dtype", "float32",
+                   "--device", "cpu", "--families", "DEV01", "--out", str(out), "--smoke", "--no-progress",
+                   "--transplant-source", f"trace:{trace_lm['lm']},k=5,n_probe=50"])      # options on the spec string
+    return dict(rc=rc, dir=Path(out) / "L" / "pythia-14m@step98000", transplant_calls=calls)
 
 
 # --------------------------------------------------------------------------------------
@@ -137,6 +151,45 @@ def test_stage_l_trace_end_to_end(stage_run, trace_lm):
     assert vt["claim"].str.contains("PREREGISTRATION 18").all()
     assert (vt.loc[vt["mode"] == "residual", "n_planted_layers"] == 0).all()
     assert (vt.loc[vt["mode"] != "residual", "n_planted_layers"] == 7).all()
+    # the columns added with the stricter rule; the fixture model has no corpus statistics -> does not count
+    for c in ("probe_surface_auc", "probe_beats_surface", "expected_sign_B", "expected_sign_T", "B_vs_plain",
+              "B_vs_plain_ci_lo", "T_vs_plain", "effect_B_vs_plain", "effect_B_vs_controls", "B_damage_random",
+              "B_damage_permuted", "B_damage_identity", "T_damage_random", "lm_corpus_ok", "lm_oov_address_rate"):
+        assert c in vt.columns, c
+    assert (vt["expected_sign_B"] == 1).all() and (vt["expected_sign_T"] == 1).all()
+    assert not vt["lm_corpus_ok"].any() and vt["claim"].str.contains("no corpus statistics").all()
+    assert m["trace"]["lm_corpus"]["ok"] is False and m["trace"]["expected_sign"] == {"B_all": 1, "T": 1}
+    # every arm minus the plain model: the transplant arm repeats trace_effects' "plain" rows, the
+    # control arms are the damage the controls do by themselves (= plain row - control row)
+    dmg = pd.read_csv(d / "trace_damage.csv")
+    assert list(dmg.columns) == SL.EFFECT_COLS
+    assert set(dmg["control"]) == {"none", "random", "identity", "permuted_alignment"}
+    assert set(dmg["quantity"]) == set(SL.TRACE_DAMAGE_QUANTITIES) and len(dmg) == 3 * 4 * 4
+    arm = dmg[dmg["control"] == "none"].set_index(["mode", "quantity"])["mean"]
+    pl = eff[eff["control"] == "plain"].set_index(["mode", "quantity"])["mean"]
+    assert np.allclose(arm.sort_index(), pl.reindex(arm.index).sort_index())
+    bt_id = bt[(bt["mode"] == "residual") & (bt["control"] == "identity")]
+    one = dmg[(dmg["mode"] == "residual") & (dmg["control"] == "identity") & (dmg["quantity"] == "B_all")]
+    assert one["mean"].iloc[0] == pytest.approx(bt_id["B"].mean(), abs=1e-6)   # one family: the mean of its rows
+    v_res = vt.set_index("mode").loc["residual"]
+    assert v_res["B_damage_identity"] == pytest.approx(one["mean"].iloc[0])
+
+
+def test_trace_dose_is_explicit_and_independent_of_the_standin_dose(stage_run):
+    """The trace transplant doses at TRACE_EPS (1.0, the dose the path was built with and the
+    first A100 trace run used) whatever the stand-in's Limits.l_eps is (0.3 in the fixture):
+    the manifest records it and transplant_experiment receives it."""
+    m = json.loads((stage_run["dir"] / "manifest.json").read_text(encoding="utf-8"))
+    assert m["limits"]["l_eps"] == pytest.approx(0.3)                        # the stand-in dose of this run ...
+    assert m["transplant"]["eps"] == SL.TRACE_EPS == 1.0 and m["transplant"]["eps_source"] == "TRACE_EPS"
+    calls = stage_run["transplant_calls"]
+    assert calls and all(c["eps"] == pytest.approx(SL.TRACE_EPS) for c in calls)     # ... does not reach the trace path
+    tp = pd.read_csv(stage_run["dir"] / "transplant.csv")
+    assert np.allclose(tp["eps"], SL.TRACE_EPS)
+    # an explicit dose: keyword trace_eps or eps= on the spec string
+    assert SL.trace_eps({}, C.Limits()) == 1.0 and C.Limits().l_eps == 0.3
+    assert SL.trace_eps({"trace_eps": "0.5"}, C.Limits()) == 0.5
+    assert SL.parse_trace_spec("trace:runs/lm,eps=0.5")[1] == {"eps": "0.5"}
 
 
 # --------------------------------------------------------------------------------------
@@ -263,25 +316,33 @@ def test_direction_file(trace_lm, tsrc, tmp_path):
 STANDIN_OK = dict(ok=True, path="runs/L/pythia-160m@step98000/verdict.csv", reason=None)
 
 
+def _eff_row(mode, control, q, mean, lo, hi, n_clusters=4):
+    return dict(mode=mode, control=control, quantity=q, mean=mean, ci_low=lo, ci_high=hi, se=0.1, n_clusters=n_clusters,
+                n_rows=8, enough_clusters=n_clusters >= SL.TRACE_MIN_CLUSTERS,
+                ci_excludes_0=bool(n_clusters >= SL.TRACE_MIN_CLUSTERS and (lo > 0 or hi < 0)))
+
+
 def _verdict_inputs(probe_counts=True, ci_lo=0.05, feature_frozen=True, n_pairs=40, gap=0.5, r2=0.3, effect=True,
-                    spec_ok=True, planted=None):
+                    spec_ok=True, planted=None, surface_auc=0.7, gain_lo=0.02, sign=+1, plain=True):
+    """A run that supports a claim (B and T up against plain, random and permuted), unless an
+    ingredient is switched off."""
     probe = dict(info=dict(feature_frozen=feature_frozen, k_requested=5, k_used=5, match="length"),
                  direction_source="probe:fanout(k=5, match=length)", direction_spec_ok=spec_ok,
                  table=pd.DataFrame([dict(layer=2, n_pairs=n_pairs, auc_trained=0.8, auc_untrained=0.6, delta=0.2,
-                                          delta_ci_lo=ci_lo, delta_ci_hi=0.3, counts=probe_counts)]))
+                                          delta_ci_lo=ci_lo, delta_ci_hi=0.3, counts=probe_counts,
+                                          surface_auc=surface_auc, beats_surface=bool(0.8 > surface_auc))]))
     al_rows = [dict(layer_tgt=2, layer_src=2, r2_holdout=r2, r2_permuted=r2 - gap, gap=gap)]
     for l, (r2_l, gap_l) in (planted or {}).items():        # further planted target layers of the KV prefix
         al_rows.append(dict(layer_tgt=l, layer_src=2, r2_holdout=r2_l, r2_permuted=r2_l - gap_l, gap=gap_l))
     align = dict(alignments=pd.DataFrame(al_rows),
-                 controls=pd.DataFrame([dict(layer_src=2, layer_tgt=2, gain_resid=0.1, gain_resid_ci_lo=0.02,
+                 controls=pd.DataFrame([dict(layer_src=2, layer_tgt=2, gain_resid=0.1, gain_resid_ci_lo=gain_lo,
                                              r2_length_only=0.4)]))
     rows = []
+    m, lo, hi = (0.5 * sign, min(0.2 * sign, 0.8 * sign), max(0.2 * sign, 0.8 * sign)) if effect else (0.5, -0.1, 0.8)
     for mode in SL.TRACE_MODES:
-        for control in ("random", "permuted_alignment", "identity"):
+        for control in ("random", "permuted_alignment", "identity") + (("plain",) if plain else ()):
             for q in ("B_all", "T"):
-                rows.append(dict(mode=mode, control=control, quantity=q, mean=-0.5, ci_low=-0.8 if effect else -0.8,
-                                 ci_high=-0.2 if effect else 0.1, se=0.1, n_clusters=4, n_rows=8, enough_clusters=True,
-                                 ci_excludes_0=bool(effect)))
+                rows.append(_eff_row(mode, control, q, m, lo, hi))
     return probe, align, pd.DataFrame(rows, columns=SL.EFFECT_COLS)
 
 
@@ -316,18 +377,134 @@ def test_trace_verdict_never_claims_without_the_probe_criterion():
     v3 = SL.trace_verdict(p, a, e, pd.DataFrame(), 2, 2, "hub:x/y", False, standin=STANDIN_OK)
     assert v3["claim"].str.contains(r"only 1 families \(< 3\)").all() and (v3["n_clusters"] == 1).all()
     # every single missing ingredient blocks the claim; the probe criterion above all
-    for kw in (dict(probe_counts=False), dict(ci_lo=-0.01), dict(feature_frozen=False), dict(n_pairs=3), dict(spec_ok=False)):
+    for kw in (dict(probe_counts=False), dict(ci_lo=-0.01), dict(feature_frozen=False), dict(n_pairs=3), dict(spec_ok=False),
+               dict(surface_auc=0.9), dict(surface_auc=np.nan)):
         p, a, e = _verdict_inputs(**kw)
         v = SL.trace_verdict(p, a, e, pd.DataFrame(), 2, 2, "hub:x/y", False, standin=STANDIN_OK)
         assert not v["sharing_effect_claimed"].any() and not v["probe_ok"].any(), kw
         assert v["claim"].str.contains("probe").all()
-    for kw in (dict(gap=0.1), dict(r2=-0.2), dict(effect=False)):
+    for kw in (dict(gap=0.1), dict(r2=-0.2), dict(effect=False), dict(gain_lo=-0.04), dict(gain_lo=np.nan),
+               dict(sign=-1), dict(plain=False)):
         p, a, e = _verdict_inputs(**kw)
         v = SL.trace_verdict(p, a, e, pd.DataFrame(), 2, 2, "hub:x/y", False)
         assert v["probe_ok"].all() and not v["sharing_effect_claimed"].any(), kw
     # nothing at all (failed substages): rows for every mode, no claim
     v = SL.trace_verdict({}, {}, pd.DataFrame(columns=SL.EFFECT_COLS), pd.DataFrame(), 2, 2, "none", True)
     assert len(v) == 3 and not v["sharing_effect_claimed"].any() and not v["counts_for_prereg"].any()
+
+
+def test_trace_verdict_needs_the_plain_model_in_the_prespecified_direction():
+    """The first A100 run (review of 27.10.2026): kv B beat the random (+0.028) and the
+    permuted-alignment control (+2.76) only because both controls are more destructive; against
+    the unmodified model the transplant lowered log p(target) (-0.047).  The tightened rule
+    names this and claims nothing; each control's damage relative to plain is recorded."""
+    p, a, _ = _verdict_inputs()
+    rows = []
+    for mode in SL.TRACE_MODES:
+        rows += [_eff_row(mode, "random", "B_all", 0.0275, 0.0086, 0.0482, 24),
+                 _eff_row(mode, "permuted_alignment", "B_all", 2.7646, 1.9841, 3.5889, 24),
+                 _eff_row(mode, "identity", "B_all", 5.4737, 4.5175, 6.4812, 24),
+                 _eff_row(mode, "plain", "B_all", -0.0472, -0.0919, -0.0074, 24),
+                 _eff_row(mode, "random", "T", 0.0144, -0.0063, 0.0392, 24),
+                 _eff_row(mode, "permuted_alignment", "T", 0.3, 0.1, 0.5, 24),
+                 _eff_row(mode, "plain", "T", 0.01, -0.02, 0.04, 24)]
+    e = pd.DataFrame(rows, columns=SL.EFFECT_COLS)
+    v = SL.trace_verdict(p, a, e, pd.DataFrame(), 2, 2, "none", False, standin=STANDIN_OK).set_index("mode")
+    kv = v.loc["kv"]
+    assert kv["effect_B_vs_controls"] and not kv["effect_B_vs_plain"] and not kv["effect_B"]   # the old rule claimed
+    assert not kv["transplant_effect"] and not kv["sharing_effect_claimed"] and kv["probe_ok"] and kv["align_ok"]
+    assert kv["B_vs_plain"] == pytest.approx(-0.0472) and kv["B_vs_plain_ci_hi"] == pytest.approx(-0.0074)
+    # damage relative to plain derived from the effects: (transplant - plain) - (transplant - control)
+    assert kv["B_damage_random"] == pytest.approx(-0.0472 - 0.0275)
+    assert kv["B_damage_permuted"] == pytest.approx(-0.0472 - 2.7646)
+    assert kv["B_damage_identity"] == pytest.approx(-0.0472 - 5.4737)
+    assert "differs from the controls only" in kv["claim"] and "B vs plain -0.047 [-0.092, -0.007]" in kv["claim"]
+    assert "permuted -2.812" in kv["claim"]
+    # given trace_damage, the recorded values are taken from it
+    dmg = pd.DataFrame([_eff_row(m, c, "B_all", -1.0, -1.5, -0.5, 24) for m in SL.TRACE_MODES for c in SL.TRACE_CONTROLS],
+                       columns=SL.EFFECT_COLS)
+    v2 = SL.trace_verdict(p, a, e, pd.DataFrame(), 2, 2, "none", False, standin=STANDIN_OK, damage=dmg)
+    assert (v2["B_damage_random"] == -1.0).all() and v2["T_damage_identity"].isna().all()
+    # every contrast must have the pre-specified sign; the sign is a parameter of the rule
+    p, a, e = _verdict_inputs(sign=-1)
+    up = SL.trace_verdict(p, a, e, pd.DataFrame(), 2, 2, "none", False)
+    assert not up["transplant_effect"].any() and up["effect_B_vs_controls"].all() and not up["effect_B_vs_plain"].any()
+    assert up["claim"].str.contains(r"pre-specified direction \(B_all up, T up\)").all()
+    down = SL.trace_verdict(p, a, e, pd.DataFrame(), 2, 2, "none", False, expected_sign={"B_all": -1, "T": -1})
+    assert down["sharing_effect_claimed"].all() and (down["expected_sign_B"] == -1).all()
+    # helping the target more than plain but less than a random direction is no effect either
+    p, a, e = _verdict_inputs()
+    e.loc[e["control"] == "random", ["mean", "ci_low", "ci_high"]] = [-0.3, -0.5, -0.1]
+    mixed = SL.trace_verdict(p, a, e, pd.DataFrame(), 2, 2, "none", False)
+    assert mixed["effect_B_vs_plain"].all() and not mixed["transplant_effect"].any()
+
+
+def test_trace_verdict_needs_alignment_beyond_untrained_and_probe_beyond_surface():
+    # alignment gain over the untrained twin of the first run: 0.0034, CI lower bound -0.04246
+    p, a, e = _verdict_inputs(gain_lo=-0.04246)
+    v = SL.trace_verdict(p, a, e, pd.DataFrame(), 2, 2, "none", False, standin=STANDIN_OK)
+    assert v["transplant_effect"].all() and v["align_ok"].all() and v["probe_ok"].all()
+    assert not v["align_beats_untrained"].any() and not v["sharing_effect_claimed"].any()
+    assert v["claim"].str.contains("alignment does not beat the untrained twin", regex=False).all()
+    assert v["claim"].str.contains("CI lower bound -0.042", regex=False).all()
+    # the first run's frozen layer 8: surface AUC 0.993 above the trained model's 0.967
+    p, a, e = _verdict_inputs()
+    p["table"] = p["table"].assign(auc_trained=0.9666, surface_auc=0.9933, beats_surface=False)
+    v = SL.trace_verdict(p, a, e, pd.DataFrame(), 2, 2, "none", False, standin=STANDIN_OK)
+    assert v["probe_counts"].all() and not v["probe_ok"].any() and not v["probe_beats_surface"].any()
+    assert (v["probe_surface_auc"] == 0.9933).all() and not v["sharing_effect_claimed"].any()
+    assert v["claim"].str.contains("probe does not beat the surface baseline at layer 2 (AUC trained 0.967 vs surface "
+                                   "0.993)", regex=False).all()
+    # a probe table without the surface baseline never passes
+    p["table"] = p["table"].drop(columns=["surface_auc", "beats_surface"])
+    assert not SL.trace_verdict(p, a, e, pd.DataFrame(), 2, 2, "none", False)["probe_ok"].any()
+
+
+def test_read_lm_corpus_and_counts_for_prereg(tmp_path):
+    def write(name, corpus):
+        d = tmp_path / name
+        d.mkdir()
+        man = dict(kind="trace_lm", **({} if corpus is None else dict(corpus=corpus)))
+        (d / "manifest.json").write_text(json.dumps(man), encoding="utf-8")
+        return str(d)
+    # the first A100 run's model: corpus.oov only (no per-split statistics), 0.967 of the addresses OOV
+    broken = SL.read_lm_corpus(write("broken", dict(n_tx_train=2400000, oov=dict(rate_A=0.967, n_A=1000, n_A_oov=967))))
+    assert broken["ok"] is False and broken["oov_address_rate"] == pytest.approx(0.967)
+    assert "exceeds 0.5" in broken["reason"]
+    ok = SL.read_lm_corpus(write("ok", dict(n_tx_train=100, oov=dict(rate_A=0.6), oov_train=dict(rate_A=0.05))))
+    assert ok["ok"] is True and ok["oov_address_rate"] == pytest.approx(0.05)        # the training split decides
+    assert "0 transactions" in SL.read_lm_corpus(write("empty", dict(n_tx_train=0, oov=dict(rate_A=None))))["reason"]
+    assert "no corpus statistics" in SL.read_lm_corpus(write("bare", None))["reason"]
+    assert "unreadable" in SL.read_lm_corpus(str(tmp_path / "missing"))["reason"]
+    p, a, e = _verdict_inputs()
+    v = SL.trace_verdict(p, a, e, pd.DataFrame(), 2, 2, "hub:x/y", False, standin=STANDIN_OK, lm_corpus=broken)
+    assert v["sharing_effect_claimed"].all() and not v["counts_for_prereg"].any() and not v["lm_corpus_ok"].any()
+    assert v["claim"].str.contains("does not count for PREREGISTRATION 18: trace LM corpus: address OOV rate 0.967",
+                                   regex=False).all()
+    v = SL.trace_verdict(p, a, e, pd.DataFrame(), 2, 2, "hub:x/y", False, standin=STANDIN_OK, lm_corpus=ok)
+    assert v["counts_for_prereg"].all() and v["lm_corpus_ok"].all() and (v["lm_oov_address_rate"] == 0.05).all()
+
+
+def test_rejudge_trace_from_tables(stage_run, tmp_path):
+    """The verdict of a finished run is recomputed from its tables alone; a run that predates
+    trace_damage gets the table rebuilt from trace_bt / trace_T."""
+    import shutil
+
+    d = stage_run["dir"]
+    res = SL.rejudge_trace(d)
+    vt, new = pd.read_csv(d / "trace_verdict.csv"), res["trace_verdict"]
+    for c in ("mode", "probe_ok", "probe_beats_surface", "align_ok", "align_beats_untrained", "effect_B", "effect_T",
+              "transplant_effect", "sharing_effect_claimed", "counts_for_prereg", "lm_corpus_ok", "claim"):
+        assert new[c].tolist() == vt[c].tolist(), c
+    for c in ("B_vs_plain", "B_damage_random", "B_damage_permuted", "T_damage_identity", "align_gain_resid_ci_lo"):
+        assert np.allclose(new[c].astype(float), vt[c].astype(float), equal_nan=True), c
+    old = tmp_path / "old_run"
+    shutil.copytree(d, old)
+    for ext in ("csv", "parquet"):
+        (old / f"trace_damage.{ext}").unlink(missing_ok=True)
+    rebuilt = SL.rejudge_trace(old)["trace_damage"]
+    saved = pd.read_csv(d / "trace_damage.csv")
+    assert len(rebuilt) == len(saved) and np.allclose(rebuilt["mean"], saved["mean"], equal_nan=True)
 
 
 def test_parse_trace_spec_and_prompt_spread():
@@ -351,16 +528,38 @@ def test_parse_trace_spec_and_prompt_spread():
     assert len(SL.trace_prompt_variants(k0, k8, None, C.Limits.smoke())) == C.Limits.smoke().l_n_prompts
 
 
+#: manifest entries the stand-in code of 27.10.2026 writes (stage_l_transplant.run)
+STANDIN_MANIFEST_NEW = dict(stage="L", status="ok", source=dict(kind="hf", name="EleutherAI/pythia-70m@step143000"),
+                            prompt_selection=dict(rule="round_robin_families", n_prompts=12, n_used=12, n_families=12),
+                            transplant=dict(eps=0.3, n_prefix=4, v_src="layer_consistent: per alignment map the source "
+                                                                       "direction at its own source layer"))
+#: ... and what the notebook-11 run at git 76a4a5a wrote (eps 1.0, three prompts of one family, one v_src)
+STANDIN_MANIFEST_OLD = dict(stage="L", status="ok", source=dict(kind="hf", name="EleutherAI/pythia-70m@step143000"),
+                            transplant=dict(eps=1.0, n_prefix=4, n_gen=32, n_samples=2))
+
+
 def test_read_standin(tmp_path):
     """PREREGISTRATION 18: only a validated language-source stand-in counts (verdict.csv, not transfer_summary)."""
-    def write(name, **row):
+    def write(name, manifest=STANDIN_MANIFEST_NEW, **row):
         d = tmp_path / name
         d.mkdir()
         pd.DataFrame([row]).to_csv(d / "verdict.csv", index=False)
+        if manifest is not None:
+            (d / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
         return str(d)
     ok = SL.read_standin(write("ok", source_kind="hf:EleutherAI/pythia-70m@step143000", self_consistency=False,
                                validated=True, counts_for_prereg=True))
-    assert ok["ok"] is True and ok["path"].endswith("verdict.csv")
+    assert ok["ok"] is True and ok["path"].endswith("verdict.csv") and ok["standin_eps"] == 0.3
+    # the old notebook-11 run: validated and counted by its own verdict.csv, but written by the weak design
+    for name, man in (("old", STANDIN_MANIFEST_OLD), ("bare", None)):
+        old = SL.read_standin(write(name, manifest=man, source_kind="hf", self_consistency=False, validated=True,
+                                    counts_for_prereg=True))
+        assert old["ok"] is False and old["reason"] == SL.STANDIN_PREDATES_FIX and "rerun notebook 11" in old["reason"]
+        p, a, e = _verdict_inputs()
+        v = SL.trace_verdict(p, a, e, pd.DataFrame(), 2, 2, "hub:x/y", False, standin=old,
+                             lm_corpus=dict(ok=True, oov_address_rate=0.05))
+        assert v["sharing_effect_claimed"].all() and not v["counts_for_prereg"].any() and not v["standin_validated"].any()
+        assert v["claim"].str.contains("predates the 27.10.2026 fix", regex=False).all()
     rot = SL.read_standin(write("rot", source_kind="rotated_self", self_consistency=True, validated=np.nan,
                                 counts_for_prereg=False))
     assert rot["ok"] is False and "self-consistency" in rot["reason"]

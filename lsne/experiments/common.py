@@ -91,6 +91,21 @@ DOMAIN_GROUPS: dict[str, tuple[str, ...]] = {
     "protein_misfolding": ("F19", "F20"),
 }
 DEFAULT_DOMAIN_GROUP = "everyday"
+#: Pre-registered split (PREREGISTRATION.md section 1): the development families DEV01-DEV04
+#: (dose, layer and threshold choices, every formulation) and the confirmation set = the test
+#: families F01-F12 x formulations {A, B}.  Everything else (F13-F20, formulations C / D of
+#: F01-F12, the original context) is in neither split and enters only the pooled rows.
+DEV_FAMILIES: tuple[str, ...] = tuple(f"DEV{i:02d}" for i in range(1, 5))
+TEST_FAMILIES: tuple[str, ...] = tuple(f"F{i:02d}" for i in range(1, 13))
+TEST_FORMULATIONS: tuple[str, ...] = ("A", "B")
+#: ``split`` values of the bootstrap tables: ``all`` = every standard family (the pooled rows
+#: the tables carried before the split column existed), ``test`` = the confirmation set,
+#: ``dev`` = the development families.
+SPLITS: tuple[str, ...] = ("all", "test", "dev")
+#: Bootstrap resamples of the reduced stages C / D of the scale sweep (stage F, exploratory per
+#: PREREGISTRATION section 5): the draws the running checkpoint sweep was computed with, so that
+#: every checkpoint of the sweep is bootstrapped alike (:meth:`Limits.as_limited`).
+LIMITED_N_BOOT = 2000
 #: Smoke-preset overrides of the stage G-L limits (see :class:`Limits`).
 SMOKE_GL: dict = dict(
     g_k_levels=(0, 8), g_c_levels=("C1",), g_max_masks=3, g_deflate_k=(0, 5), g_r_mean=128, g_r_last=256,
@@ -128,7 +143,7 @@ class Limits:
     n_sae_features: int = 5         # sae_D0..n-1 and sae_E0..n-1 directions
     # stage C
     n_random_patch: int = 10        # random position draws per (site, class)
-    n_boot: int = 2000              # cluster-bootstrap resamples
+    n_boot: int = 10000             # cluster-bootstrap resamples (PREREGISTRATION section 2: 10 000; smoke 200)
     grid_batch_size: int = 64       # grid rows (direction x sign x dose) per batched forward
     # stage D
     damage_doses: tuple = (0.01, 0.05, 0.1)
@@ -199,9 +214,9 @@ class Limits:
     # "Stand-in-Validierung"); "self" / "rotated_self" are plumbing checks without a verdict.
     l_source: str = "EleutherAI/pythia-70m@step143000"   # "model@revision" | "rotated_self" | "self"
     l_n_texts: int = 48                   # paired E/D unit sentences per language
-    l_n_prompts: int = 3                  # prompts of the transplant experiment
+    l_n_prompts: int = 12                 # prompts of the transplant experiment (K=0 variants, round robin over families)
     l_n_prefix: int = 8                   # virtual KV prefix length
-    l_eps: float = 1.0                    # dose of the transferred feature
+    l_eps: float = 0.3                    # dose of the transferred feature (eps = 1 saturates the German fraction)
     l_n_null: int = 10                    # permuted-pair null draws of the functional test
     # shared by H / J / K: use a random TopK SAE when no published SAE is available
     # (smoke runs only: exercises the code paths; every row is marked sae_source)
@@ -222,8 +237,9 @@ class Limits:
     def as_limited(self) -> "Limits":
         """Copy with the reduced-stage flag of the scale sweep set (also caps the D3-D7
         generation core at :data:`LIMITED_GEN_MAX_CORE` variants per (K, C) cell unless
-        ``gen_max_core`` is already set)."""
+        ``gen_max_core`` is already set, and the bootstrap draws at :data:`LIMITED_N_BOOT`)."""
         return replace(self, limited=True, n_random_patch=min(self.n_random_patch, 5),
+                       n_boot=min(int(self.n_boot), LIMITED_N_BOOT),
                        gen_max_core=(self.gen_max_core if self.gen_max_core is not None else LIMITED_GEN_MAX_CORE))
 
 
@@ -875,7 +891,10 @@ def marker_lexicon(tokenizer, words: Optional[dict] = None) -> dict[str, list[in
 # --------------------------------------------------------------------------------------
 def finish_stage(run_dir, stage: str, cfg: RunConfig, mb: ModelBundle, tables: dict[str, pd.DataFrame],
                  limits: Optional[Limits] = None, t0: Optional[float] = None, **meta) -> dict[str, pd.DataFrame]:
-    """Save every table (csv [+ parquet]) and write the manifest; returns ``tables``."""
+    """Save every table (csv [+ parquet]) and write the manifest; returns ``tables``.
+
+    The manifest says ``status='ok'``, so an ``error.txt`` left by an earlier failed run of the
+    stage in the same directory is stale and removed (:func:`clear_stale_error`)."""
     for name, df in tables.items():
         save_df(df, run_dir, name)
     write_manifest(run_dir, stage=stage, status="ok", cfg=cfg, model=mb.spec,
@@ -883,7 +902,42 @@ def finish_stage(run_dir, stage: str, cfg: RunConfig, mb: ModelBundle, tables: d
                    n_layers=mb.n_layers, d_model=mb.d_model, n_heads=mb.n_heads, vocab=mb.vocab,
                    tables={n: int(len(df)) for n, df in tables.items()},
                    runtime_s=(time.perf_counter() - t0) if t0 is not None else None, **meta)
+    clear_stale_error(run_dir)
     return tables
+
+
+def clear_stale_error(run_dir) -> bool:
+    """Remove ``error.txt`` from ``run_dir`` when its manifest says ``status='ok'`` (the
+    traceback then belongs to an earlier, superseded run: :func:`write_error` always rewrites
+    the manifest with ``status='error'``).  Returns True when a file was removed."""
+    d = Path(os.fspath(run_dir))
+    err = d / "error.txt"
+    if not err.exists():
+        return False
+    try:
+        if read_manifest(d).get("status") != "ok":
+            return False
+    except (OSError, ValueError):
+        return False
+    err.unlink()
+    return True
+
+
+def substage_status(run_dir, status: str = "ok") -> dict:
+    """Report entry of a finished stage from its manifest: ``status``, ``n_failed_substages``
+    and ``substage_errors`` (stages G-L record failed substages in ``manifest.json ->
+    substages``).  A stage that ended ``ok`` (or was ``reused``) with a failed substage gets the
+    status ``ok_with_substage_errors`` (``reused_with_substage_errors``), so a run summary never
+    reads plain ``ok`` while a table of the stage is an empty default; other statuses pass."""
+    try:
+        sub = read_manifest(run_dir).get("substages") or {}
+    except (OSError, ValueError):
+        sub = {}
+    errors = {str(k): str(v) for k, v in (sub.get("errors") or {}).items()}
+    n_failed = int(sub.get("n_failed", len(errors)) or 0)
+    if n_failed and status in ("ok", "reused"):
+        status = f"{status}_with_substage_errors"
+    return dict(status=status, n_failed_substages=n_failed, substage_errors=errors)
 
 
 def write_error(run_dir, stage: str, exc: BaseException, cfg: Optional[RunConfig] = None,
@@ -896,6 +950,59 @@ def write_error(run_dir, stage: str, exc: BaseException, cfg: Optional[RunConfig
     write_manifest(d, stage=stage, status="error", error=repr(exc), cfg=cfg,
                    model=(mb.spec if mb is not None else None))
     return d / "error.txt"
+
+
+#: Verdicts of :func:`min_effect_verdict` (the CI rule of PREREGISTRATION section 2).
+VERDICTS = ("supported", "positive_below_min", "open", "null", "negative")
+
+
+def min_effect_verdict(ci_low: float, ci_high: float, min_effect: float) -> tuple[Optional[bool], str]:
+    """``(min_effect_met, verdict)`` of a positive minimum effect ``min_effect`` from the 95 %
+    interval alone (PREREGISTRATION section 2: an interval that includes zero and does not
+    exclude the minimum effect is "open", not a null finding), never from the point estimate:
+
+    * ``supported``: ``ci_low >= min_effect`` (every value in the interval reaches it);
+    * ``positive_below_min``: ``0 < ci_low < min_effect`` (excludes 0, the minimum not established);
+    * ``open``: ``ci_low <= 0`` and ``ci_high >= min_effect``;
+    * ``null``: ``ci_low <= 0 <= ci_high < min_effect`` (the minimum effect is excluded);
+    * ``negative``: ``ci_high < 0``.
+
+    ``min_effect_met`` is True only for ``supported``; ``(None, "")`` for a non-finite interval."""
+    lo, hi, m = float(ci_low), float(ci_high), float(min_effect)
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        return None, ""
+    if lo >= m:
+        verdict = "supported"
+    elif lo > 0:
+        verdict = "positive_below_min"
+    elif hi >= m:
+        verdict = "open"
+    elif hi >= 0:
+        verdict = "null"
+    else:
+        verdict = "negative"
+    return verdict == "supported", verdict
+
+
+#: Soll/Ist bound of a written vector (PREREGISTRATION section 4: relative error, FP32).
+AUDIT_MAX_REL_ERR = 1e-4
+
+
+def audit_summary(df: pd.DataFrame, col: str = "audit_rel_err") -> dict:
+    """Manifest summary of the per-row Soll/Ist record ``col`` (PREREGISTRATION section 4:
+    a run with a relative error above :data:`AUDIT_MAX_REL_ERR` is invalid): ``n_rows``,
+    ``n_finite``, ``max``, quantiles ``q50`` / ``q99`` / ``q999``, ``n_over_1e-4`` (finite rows
+    above the bound) and ``valid`` (no such row)."""
+    v = df[col].to_numpy(dtype=float) if (len(df) and col in df.columns) else np.zeros(0)
+    fin = v[np.isfinite(v)]
+
+    def q(x: float) -> float:
+        return float(np.quantile(fin, x)) if fin.size else float("nan")
+
+    n_over = int((fin > AUDIT_MAX_REL_ERR).sum())
+    return {"column": col, "bound": AUDIT_MAX_REL_ERR, "n_rows": int(v.size), "n_finite": int(fin.size),
+            "max": float(fin.max()) if fin.size else float("nan"), "q50": q(0.5), "q99": q(0.99), "q999": q(0.999),
+            "n_over_1e-4": n_over, "valid": bool(n_over == 0)}
 
 
 def pearson(x, y) -> float:
@@ -918,6 +1025,33 @@ def family_domain(family_id: str) -> str:
         if fid in ids:
             return group
     return DEFAULT_DOMAIN_GROUP
+
+
+def prereg_split(family_id, formulation=None) -> str:
+    """Pre-registered split of a family (and formulation): ``"dev"`` for DEV01-DEV04,
+    ``"test"`` for F01-F12 x {A, B} (any formulation when ``formulation`` is None), else
+    ``"other"`` (:data:`DEV_FAMILIES`, :data:`TEST_FAMILIES`, :data:`TEST_FORMULATIONS`)."""
+    fid = str(family_id)
+    if fid in DEV_FAMILIES:
+        return "dev"
+    if fid in TEST_FAMILIES and (formulation is None or str(formulation) in TEST_FORMULATIONS):
+        return "test"
+    return "other"
+
+
+def split_mask(df: pd.DataFrame, split: str, family_col: str = "family",
+               formulation_col: Optional[str] = "formulation") -> np.ndarray:
+    """Boolean row mask of ``split`` (:data:`SPLITS`) over ``df``: ``all`` keeps every row,
+    ``test`` / ``dev`` the rows whose (family, formulation) :func:`prereg_split` assigns to that
+    split.  Without a formulation column (per-family tables) only the family decides."""
+    if split not in SPLITS:
+        raise ValueError(f"split must be one of {SPLITS}, got {split!r}")
+    if split == "all" or df.empty:
+        return np.ones(len(df), dtype=bool)
+    fams = df[family_col].astype(str).to_numpy()
+    forms = (df[formulation_col].astype(str).to_numpy() if formulation_col and formulation_col in df.columns
+             else [None] * len(df))
+    return np.array([prereg_split(f, fo) == split for f, fo in zip(fams, forms)], dtype=bool)
 
 
 def families_in_group(variants: Sequence, group: str) -> list[str]:
@@ -997,9 +1131,14 @@ class Substages:
                     n_failed=len(self.errors))
 
     def write_tracebacks(self, run_dir) -> Optional[Path]:
-        if not self.tracebacks:
-            return None
+        """Write ``substage_errors.txt``; without a failed substage a file left by an earlier
+        run of the stage is removed (it would contradict this run's manifest)."""
         d = Path(os.fspath(run_dir))
+        if not self.tracebacks:
+            stale = d / "substage_errors.txt"
+            if stale.exists():
+                stale.unlink()
+            return None
         d.mkdir(parents=True, exist_ok=True)
         p = d / "substage_errors.txt"
         p.write_text("\n\n".join(f"=== {k} ===\n{v}" for k, v in self.tracebacks.items()), encoding="utf-8")
@@ -1213,17 +1352,37 @@ def family_text_pairs(fams: Sequence, max_per_lang: Optional[int] = None) -> tup
     return E, D, N
 
 
-def boot_row(df: pd.DataFrame, value_col: str, n_boot: int, seed: int, cluster_col: str = "family", **keys) -> dict:
+def boot_row(df: pd.DataFrame, value_col: str, n_boot: int, seed: int, cluster_col: str = "family",
+             with_p: bool = False, **keys) -> dict:
     """One tidy row of a family cluster bootstrap (``stat_level='cluster'`` when the
     installed :func:`lsne.stats.cluster_bootstrap` supports it, else the row estimator):
-    ``keys`` + ``mean, ci_low, ci_high, se, n_clusters, n_rows``."""
-    from ..stats import cluster_bootstrap
+    ``keys`` + ``mean, ci_low, ci_high, se, n_clusters, n_rows`` (+ ``p_boot``, the two-sided
+    bootstrap p-value of a zero mean, with ``with_p=True``)."""
+    from ..stats import bootstrap_p_two_sided, cluster_bootstrap
     try:
         r = cluster_bootstrap(df, value_col, cluster_col, n_boot=int(n_boot), seed=int(seed), stat_level="cluster")
     except TypeError:            # older signature without stat_level
         r = cluster_bootstrap(df, value_col, cluster_col, n_boot=int(n_boot), seed=int(seed))
-    return dict(keys, mean=float(r["mean"]), ci_low=float(r["ci_low"]), ci_high=float(r["ci_high"]),
-                se=float(r.get("se", float("nan"))), n_clusters=int(r["n_clusters"]), n_rows=int(r.get("n_rows", len(df))))
+    row = dict(keys, mean=float(r["mean"]), ci_low=float(r["ci_low"]), ci_high=float(r["ci_high"]),
+               se=float(r.get("se", float("nan"))), n_clusters=int(r["n_clusters"]), n_rows=int(r.get("n_rows", len(df))))
+    if with_p:
+        row["p_boot"] = bootstrap_p_two_sided(r["boot"], 0.0) if "boot" in r else float("nan")
+    return row
+
+
+def split_boot_rows(df: pd.DataFrame, value_col: str, n_boot: int, seed: int, splits: Sequence[str] = ("all", "test"),
+                    cluster_col: str = "family", family_col: str = "family",
+                    formulation_col: Optional[str] = "formulation", with_p: bool = False, **keys) -> list[dict]:
+    """:func:`boot_row` per pre-registered split (:func:`split_mask`; ``split`` is added to the
+    keys).  The ``all`` row is always written (an undefined statistic stays a row with NaN and no
+    cluster, as before the split existed); another split without a finite value is left out."""
+    out = []
+    for split in splits:
+        part = df[split_mask(df, split, family_col, formulation_col)] if len(df) else df
+        if part.empty or (split != "all" and not np.isfinite(part[value_col].to_numpy(dtype=float)).any()):
+            continue
+        out.append(boot_row(part, value_col, n_boot, seed, cluster_col=cluster_col, with_p=with_p, split=split, **keys))
+    return out
 
 
 __all__ = [
@@ -1239,5 +1398,7 @@ __all__ = [
     "DOMAIN_GROUPS", "DEFAULT_DOMAIN_GROUP", "SMOKE_GL", "family_domain", "families_in_group", "k_subset",
     "prereg_layer_grid", "grid_sites", "last_state", "Substages", "synthetic_sae", "get_sae", "stage_run_dir",
     "load_stage_table", "family_text_pairs", "boot_row", "UnigramFetchError", "LIMITED_GEN_MAX_CORE", "RESUME_CHUNK",
-    "Resume", "resume_signature", "concat_results", "limited_core",
+    "Resume", "resume_signature", "concat_results", "limited_core", "clear_stale_error", "substage_status",
+    "DEV_FAMILIES", "TEST_FAMILIES", "TEST_FORMULATIONS", "SPLITS", "LIMITED_N_BOOT", "prereg_split", "split_mask",
+    "split_boot_rows", "AUDIT_MAX_REL_ERR", "audit_summary", "VERDICTS", "min_effect_verdict",
 ]

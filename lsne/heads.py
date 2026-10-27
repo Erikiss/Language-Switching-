@@ -490,8 +490,9 @@ class HeadInjector:
     (:func:`head_preimage`); ``space="auto"`` decides by length (ambiguous when
     ``dh == d``: pass ``space`` explicitly).  ``audit`` holds ``requested_norm``,
     ``realised_norm`` and ``rel_err = ||W_O u - delta|| / ||delta||`` (the part of a
-    residual-space delta that the head cannot write), plus ``written_norm`` after the
-    first call."""
+    residual-space delta that the head cannot write), plus ``written_norm`` and the Soll/Ist
+    record ``written_rel_err = ||written - u|| / ||u||`` of the head-space write at the edited
+    positions after the first call."""
 
     def __init__(self, mb: ModelBundle, layer: int, head: int, delta: torch.Tensor,
                  positions=None, space: str = "auto"):
@@ -540,7 +541,12 @@ class HeadInjector:
             pos = torch.as_tensor(self.positions, device=x.device)
             x_new[:, pos, self.slice] = x_new[:, pos, self.slice] + u
         if "written_norm" not in self.audit:
-            self.audit["written_norm"] = float((x_new.float() - x.float()).norm())
+            with torch.no_grad():
+                diff = x_new.float() - x.float()
+                self.audit["written_norm"] = float(diff.norm())
+                w = diff[:, :, self.slice] if self.positions is None else diff[:, pos, self.slice]
+                uu = self.u.float().to(x.device)
+                self.audit["written_rel_err"] = float((w - uu).norm() / (uu.norm() * (w[..., 0].numel() ** 0.5)).clamp_min(_EPS))
         return x_new
 
     def __enter__(self):
@@ -577,7 +583,8 @@ def steer_at_head(mb: ModelBundle, input_ids: torch.Tensor, layer: int, head: in
     modified, so earlier positions' logits are unchanged (causality).  With
     ``return_info=True`` returns ``(logits_last, info)`` where ``info`` has
     ``logits_full [T, V]``, ``u``, ``realised`` (the residual delta actually written),
-    ``cos_realised_direction``, ``rms_head``, ``rms_delta`` and ``eps``."""
+    ``cos_realised_direction``, ``rms_head``, ``rms_delta``, ``eps`` and ``audit`` (the
+    :class:`HeadInjector` record, incl. the Soll/Ist ``written_rel_err``)."""
     input_ids = torch.as_tensor(input_ids, dtype=torch.long)
     if input_ids.dim() == 1:
         input_ids = input_ids[None]
@@ -598,7 +605,8 @@ def steer_at_head(mb: ModelBundle, input_ids: torch.Tensor, layer: int, head: in
     target_rms = float(eps) * rms_head
     u = u0 * (target_rms / max(rms_r0, _EPS))
     realised = r0 * (target_rms / max(rms_r0, _EPS))
-    with HeadInjector(mb, layer, head, u, positions=[pos], space="head"):
+    hi = HeadInjector(mb, layer, head, u, positions=[pos], space="head")
+    with hi:
         logits = _forward(mb, input_ids)[0].cpu()                  # [T, V]
     last = logits[-1].contiguous()
     if not return_info:
@@ -606,5 +614,6 @@ def steer_at_head(mb: ModelBundle, input_ids: torch.Tensor, layer: int, head: in
     info = dict(logits_full=logits, u=u, realised=realised, rms_head=rms_head,
                 rms_delta=float(rms(realised)), eps=float(eps), position=pos,
                 cos_realised_direction=float(realised @ vec / (realised.norm() * vec.norm()).clamp_min(_EPS)),
-                preimage_rel_err=float((r0 - unit_dir).norm() / unit_dir.norm().clamp_min(_EPS)))
+                preimage_rel_err=float((r0 - unit_dir).norm() / unit_dir.norm().clamp_min(_EPS)),
+                audit=dict(hi.audit))
     return last, info

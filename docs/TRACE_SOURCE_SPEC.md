@@ -145,9 +145,9 @@ def paired_items(records) -> list[tuple[TxRecord, str]]   # (record for the sour
 ## 8. `lsne/chain/cli.py` and docs
 
 `python -m lsne.chain.cli download --from 1428000 --to 2100000 --every 1 --tables traces,transaction,native_transfers,erc20_transfers,logs,storage_diffs --cache cache/xatu`
-`… serialize --cache cache/xatu --from … --to … --out data/traces/itr` (jsonl shards with tokens + features + era)
-`… vocab --in data/traces/itr --out data/traces/vocab`
-`… train --in data/traces/itr --vocab data/traces/vocab --size blockgpt --out runs/trace_lm --steps 20000`
+`… serialize --cache cache/xatu --from … --to … --out data/traces/itr` (jsonl shards with tokens + features + era; `serialize_params.json` written before the first chunk; failed chunks / a broken worker pool retried with fewer workers; exit 2 listing every chunk still missing)
+`… vocab --in data/traces/itr --out data/traces/vocab` (exit 1 and nothing written when the input holds no transaction)
+`… train --in data/traces/itr --vocab data/traces/vocab --size blockgpt --out runs/trace_lm --steps 20000` (exit 1 before training when the address OOV rate of the training transactions exceeds `--max-oov-address`, default 0.5)
 `… probe --model runs/trace_lm --in data/traces/itr --kind fanout|dao --layer all --out runs/trace_probe`
 `… pair --in data/traces/itr --n 2000 --out runs/trace_pairs.jsonl`
 
