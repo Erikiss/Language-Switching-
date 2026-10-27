@@ -770,12 +770,16 @@ Ziel: Endpunkt 10(i) und `sharing` am präregistrierten Checkpoint, verglichen m
    überschreiben die alten H- und J-Läufe von Lauf 1 dort. Dieser H-Lauf ersetzt Zeile 4 aus §5.3: Mit
    SAE rechnet Stufe H dieselben Tabellen und zusätzlich die SAE-Spalten (die Zufallsrichtungen der
    Bank hängen nicht am SAE).
-3. Lesart:
+3. **Ergebnis (27.10.2026, 16:37 UTC, Konto B):** FVU = **0.198** bei `step98000` (SAE
+   `EleutherAI/sae-pythia-160m-32k`, `layers.10`, k = 32, 170 286 Aktivierungen); `certified = true`.
+   Die übrigen Richtungen der Bank sind gleich wie ohne SAE (z. B. `lang_dom` `diff_norm` 23.7434 in
+   beiden Läufen). 10(i) ist bei 98k damit auswertbar, sobald H mit SAE gelaufen ist.
+4. Lesart:
    * Ist das SAE bei 98k zertifiziert (FVU ≤ 0.4), ist 10(i) bei 98k auswertbar. Die Notebooks
      vermerken „nur bei step143000 zertifizierbar“; gemessen ist das bei 98k bisher nicht.
    * Ist es nicht zertifiziert, ist 10(i) bei 98k nicht interpretierbar, und 143k bleibt die
      beste, explorative Angabe.
-4. **Vorher entscheiden:** Die `sae_feature`-Auswahl prüft die Aktivität des Features nicht. Ohne
+5. **Vorher entscheiden:** Die `sae_feature`-Auswahl prüft die Aktivität des Features nicht. Ohne
    Codeänderung ist Diskriminante (c) wahrscheinlich wieder degeneriert. Für 10(i) selbst spielt
    das keine Rolle, weil 10(i) die Diskriminante `target_logit` nutzt.
 
