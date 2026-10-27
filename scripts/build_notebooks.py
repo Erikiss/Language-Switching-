@@ -4555,8 +4555,8 @@ def nb_13() -> list[tuple[str, str]]:
             `prereg_meta.json` unter `<OUT_ROOT>/prereg_eval/<modell>@<revision>/`; eine Abbildung unter
             `<OUT_ROOT>/figures/13_prereg_evaluation/`; am Ende eine kurze `summary_13_prereg_evaluation_*.json` in `OUT_ROOT`.
 
-            **Ablauf.** Setup → Drive → Wurzeln wählen → Auswertung → gefundene Läufe → Ergebnistabelle und Bericht →
-            Übersichtsabbildung → Zusammenfassung.
+            **Ablauf.** Setup → Drive → Wurzeln wählen → ggf. auf Notebook 12 warten → Auswertung → gefundene Läufe →
+            Ergebnistabelle und Bericht → Übersichtsabbildung → Zusammenfassung.
 
             **Präregistrierung.** Primärer Endpunkt (§2): Δλ(K) = λ(K>0, `lang_dom`) − λ(K=0, `lang_dom`) aus Stufe D
             (`damage`, Tiefen-Injektion), nur Zelle C1 (die einzige, deren Injektionsposition die präregistrierte ist:
@@ -4610,6 +4610,9 @@ def nb_13() -> list[tuple[str, str]]:
             FROZEN_DOSE = None                 # auf DEV01-DEV04 eingefrorene Schadensdosis (z. B. 0.05); None = alle Dosen berichten
             RUN_ROOTS_TEXT = ""  # @param {type:"string"}
             ASK = False                        # True: nach den Wurzeln fragen, wenn RUN_ROOTS_TEXT leer ist (Enter = Standard)
+            WAIT_FOR_12 = "auto"               # "auto": warten, solange Notebook 12 (Spurenmodell) für REVISION läuft; True: immer; False: nie
+            WAIT_MAX_H = 10                    # längstens so viele Stunden warten, dann trotzdem auswerten
+            WAIT_POLL_MIN = 5                  # Prüfabstand in Minuten
 
             MYDRIVE = "/content/drive/MyDrive"
             default_roots = [os.path.join(MYDRIVE, base, child) for base in ("LSNE", "LSNE_B") for child in ("runs", "runs_trace")
@@ -4669,6 +4672,99 @@ def nb_13() -> list[tuple[str, str]]:
                 except Exception:
                     traceback.print_exc()
                     print(f"[{title}] übersprungen (siehe Traceback)")
+            """
+        ),
+        md(
+            """
+            ## Auf Notebook 12 warten (Endpunkt 18T)
+
+            Endpunkt 18T liest den Stufe-L-Lauf des Spurenmodells, den Notebook 12 ganz am Ende schreibt. Mit
+            `WAIT_FOR_12 = "auto"` (Standard) prüft diese Zelle, ob Notebook 12 gerade läuft: Im Ordner
+            `MyDrive/LSNE/trace_2016` (Schrittmarker, Logs, `serialize_params.json`) gibt es dann Aktivität, die neuer ist
+            als die letzte `summary_12_trace_source_<modell>_<revision>_*.json`. Läuft 12, wartet die Zelle und prüft alle
+            `WAIT_POLL_MIN` Minuten. Sie hört auf, sobald eine neue Zusammenfassung von 12 erscheint (12 fertig) oder ein
+            Schritt von 12 mit `status: error` endet und danach 15 Minuten nichts mehr geschieht (12 abgebrochen);
+            spätestens nach `WAIT_MAX_H` Stunden wird trotzdem ausgewertet. Läuft 12 nicht, geht es sofort weiter.
+            So lässt sich dieses Notebook schon starten, während 12 noch rechnet („Alle ausführen“, Laufzeit CPU).
+            `WAIT_FOR_12 = False` schaltet das Warten ab, `True` wartet auch ohne erkannte Aktivität.
+            """
+        ),
+        code(
+            """
+            # --- Auf Notebook 12 warten (nur wenn es gerade läuft) ----------------------------------
+            import datetime
+            import glob
+            import time
+
+            TRACE_ROOT_12 = os.path.join(OUT_ROOT, "trace_2016")
+            SUMMARY_12_GLOB = os.path.join(OUT_ROOT, f"summary_12_trace_source_{MODEL_TAG}_{REVISION}_*.json")
+
+
+            def _mtime(path) -> float:
+                try:
+                    return os.path.getmtime(path)
+                except OSError:
+                    return 0.0
+
+
+            def _when(t: float) -> str:
+                return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%d.%m. %H:%M UTC") if t else "-"
+
+
+            def trace_state() -> dict:
+                \"\"\"Newest summary of notebook 12 for REVISION, newest activity in its trace folder and its newest
+                step marker (Drive is read through the mount; files written by another session can appear late).\"\"\"
+                summaries = glob.glob(SUMMARY_12_GLOB)
+                markers = glob.glob(os.path.join(TRACE_ROOT_12, "steps", "*.json"))
+                files = (markers + glob.glob(os.path.join(TRACE_ROOT_12, "logs", "*"))
+                         + [os.path.join(TRACE_ROOT_12, d, "serialize_params.json") for d in ("itr", "itr_train")])
+                last_marker, t_marker = {}, 0.0
+                for m in markers:
+                    t = _mtime(m)
+                    if t > t_marker:
+                        try:
+                            with open(m, encoding="utf-8") as f:
+                                last_marker, t_marker = json.load(f), t
+                        except (OSError, ValueError):
+                            pass
+                return dict(has_summary=bool(summaries), t_summary=max([_mtime(p) for p in summaries] or [0.0]),
+                            t_activity=max([_mtime(p) for p in files] or [0.0]), marker=last_marker, t_marker=t_marker)
+
+
+            WAIT_INFO = dict(mode=str(WAIT_FOR_12), waited_min=0.0, outcome="not waited")
+            st0 = trace_state()
+            running = (st0["t_activity"] > st0["t_summary"] + 60
+                       and not (st0["marker"].get("status") == "error" and st0["t_marker"] >= st0["t_activity"] - 1))
+            if WAIT_FOR_12 is True or str(WAIT_FOR_12).lower() == "true":
+                wait = True
+            elif str(WAIT_FOR_12).lower() == "auto":
+                wait = st0["has_summary"] and running
+            else:
+                wait = False
+            print(f"Notebook 12 ({REVISION}): letzte Zusammenfassung {_when(st0['t_summary'])}, letzte Aktivität "
+                  f"{_when(st0['t_activity'])}, letzter Schritt {st0['marker'].get('step', '-')} "
+                  f"({st0['marker'].get('status', '-')}) -> {'warten' if wait else 'nicht warten'}")
+            if wait:
+                t_start, deadline = time.time(), time.time() + float(WAIT_MAX_H) * 3600
+                WAIT_INFO["outcome"] = "timeout"
+                while time.time() < deadline:
+                    time.sleep(float(WAIT_POLL_MIN) * 60)
+                    st = trace_state()
+                    WAIT_INFO["waited_min"] = round((time.time() - t_start) / 60, 1)
+                    if st["t_summary"] > st0["t_summary"]:
+                        WAIT_INFO["outcome"] = "notebook 12 finished"
+                        print(f"Notebook 12 ist fertig (Zusammenfassung {_when(st['t_summary'])}) -> Auswertung startet.")
+                        break
+                    if (st["marker"].get("status") == "error" and st["t_marker"] > st0["t_activity"]
+                            and st["t_marker"] >= st["t_activity"] - 1 and time.time() - st["t_marker"] > 15 * 60):
+                        WAIT_INFO["outcome"] = "notebook 12 stopped with an error"
+                        print(f"Notebook 12 hat mit einem Fehler aufgehört (Schritt {st['marker'].get('step')}, "
+                              f"{_when(st['t_marker'])}) -> Auswertung startet ohne neuen Spurenmodell-Lauf.")
+                        break
+                    print(f"{_when(time.time())}: Notebook 12 läuft noch (letzter Schritt {st['marker'].get('step', '-')}: "
+                          f"{st['marker'].get('status', '-')}, letzte Aktivität {_when(st['t_activity'])})", flush=True)
+                else:
+                    print(f"Nach {WAIT_MAX_H} h keine neue Zusammenfassung von Notebook 12 -> Auswertung startet trotzdem.")
             """
         ),
         code(
@@ -4756,7 +4852,7 @@ def nb_13() -> list[tuple[str, str]]:
                 summary = dict(
                     notebook=NOTEBOOK, stage=STAGE, model=MODEL_TAG, revision=REVISION, n_boot=N_BOOT, seed=SEED,
                     frozen_dose=FROZEN_DOSE, run_roots=RUN_ROOTS, out=EVAL_OUT, cli_command=CLI_COMMAND,
-                    timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    wait_for_12=WAIT_INFO, timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                     runs_used={k: p for k, p, u in zip(res["runs"]["key"], res["runs"]["path"], res["runs"]["used"]) if u},
                     verdicts=tab["verdict"].value_counts().to_dict(),
                     primary=tab[tab["role"] == "primary"][["id", "estimate", "ci_low", "ci_high", "verdict"]].to_dict("records"),
