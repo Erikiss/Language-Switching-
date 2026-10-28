@@ -506,7 +506,8 @@ of `code_version()` — `git_sha` and `prereg_eval_sha256` = `PREREG_EVAL_SHA256
 module's source at import, which also covers uncommitted changes — and `previous_evaluation_archive`).
 The files of an earlier evaluation in `--out` are first moved to `archive/<stamp>/` (`archive_outputs`;
 stamp = the UTC timestamp of its `prereg_meta.json`, e.g. `2026-10-28T07-07-48Z` for the report of
-28.10.2026 07:07 UTC cited in `docs/RESULTS_PREREG.md`, else the newest mtime of its files; an existing
+28.10.2026 07:07 UTC, archived by the evaluation of the control run at 20:54 UTC, else the newest mtime of
+its files; an existing
 folder is never reused: `<stamp>_2`, `<stamp>_3`, …), never overwritten. Notebook 13 prints, after the
 evaluation, one `ACHTUNG` line per control-run audit that fails (or, when a control run is used but has
 no audit rows because its audits could not be computed, one `ACHTUNG` line saying that it is not

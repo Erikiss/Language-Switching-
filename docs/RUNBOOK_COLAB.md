@@ -445,8 +445,9 @@ Notebook 05 wird also nicht gestört.
 4. **Ergebnis.** `MyDrive/LSNE/prereg_eval/pythia-160m@step98000/prereg_results.{csv,md}`,
    `prereg_runs.csv` und `prereg_meta.json`. Liegt dort schon eine Auswertung, werden diese Dateien von ihr
    vorher nach `archive/<Zeitstempel>/` verschoben, nie überschrieben. Der Zeitstempel kommt aus ihrem
-   `prereg_meta.json` (UTC); der Bericht vom 28.10.2026, 07:07 UTC, auf den sich `docs/RESULTS_PREREG.md`
-   stützt, landet so in `archive/2026-10-28T07-07-48Z/`. Ein schon vorhandener Ordner wird nie
+   `prereg_meta.json` (UTC); der Bericht vom 28.10.2026, 07:07 UTC, liegt so seit der Auswertung des
+   Kontrolllaufs (20:54 UTC, jetzt maßgeblich für `docs/RESULTS_PREREG.md`) in
+   `archive/2026-10-28T07-07-48Z/`. Ein schon vorhandener Ordner wird nie
    wiederverwendet (dann `_2`, `_3`, …). `prereg_meta.json` nennt den Ordner unter
    `previous_evaluation_archive`. Die Übersichtsabbildung (`figures/13_prereg_evaluation/`) und
    `summary_13_prereg_evaluation_<modell>_<revision>.json` in `MyDrive/LSNE` tragen feste Namen und werden

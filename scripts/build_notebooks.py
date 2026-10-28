@@ -4648,7 +4648,7 @@ def nb_13() -> list[tuple[str, str]]:
             `lsne/prereg_eval.py` (in `prereg_meta.json`: `git_sha`, `prereg_eval_sha256`); die Notiz von `audit.D1ctl.run`
             vergleicht ihn mit `eval_code_sha256` im Manifest des Kontrolllaufs, denn der Code der Auswertung ist
             eingefroren, sobald die Kontrolle gelaufen ist. Ein früherer Bericht im Ausgabeordner (etwa der vom 28.10.2026,
-            07:07 UTC, auf den sich `docs/RESULTS_PREREG.md` stützt) wird vor dem Schreiben nach `archive/<zeitstempel>/`
+            07:07 UTC, heute unter `archive/2026-10-28T07-07-48Z/`) wird vor dem Schreiben nach `archive/<zeitstempel>/`
             verschoben (`prereg_meta.json`: `previous_evaluation_archive`); die Zelle nach der Auswertung nennt den Ordner.
 
             Hinweise: Die Zellen sind gegen Fehler abgesichert (ein fehlgeschlagener Abschnitt druckt den Traceback und das
