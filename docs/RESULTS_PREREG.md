@@ -11,6 +11,9 @@ Quellen auf Drive (Konto A, `MyDrive/LSNE/prereg_eval/`):
 * `pythia-160m@step98000/`: maßgebliche Auswertung vom 28.10.2026, 07:07 UTC (Code `e0e7481`). Vorher:
   04:55 UTC nach dem Ende von Notebook 12 (Notebook 13 hatte 360 Minuten auf Notebook 12 gewartet) und
   06:42 UTC, versehentlich mit dem alten Code (Setup-Fehler, §9); beide mit den Regeln vor dem 28.10.
+  Der nächste Lauf von Notebook 13 überschreibt den Bericht von 07:07 UTC nicht, sondern verschiebt ihn
+  vorher nach `MyDrive/LSNE/prereg_eval/pythia-160m@step98000/archive/2026-10-28T07-07-48Z/` (Zeitstempel
+  aus seinem `prereg_meta.json`: 07:07:48 UTC).
 * `pythia-160m@step99000/`: Auswertung vom 27.10.2026, 19:22 UTC. Bei 99k gibt es nur Stufe H.
 
 **Stand der Regeln.** Der Bericht von 07:07 UTC wendet die beiden Festlegungen vom 28.10.2026 an:
@@ -309,3 +312,17 @@ anderen Endpunkte erscheinen bei 99k als „nicht getestet“, weil es dort nur 
   Korrekturen; seit dem Bericht von 07:07 UTC sind sie aktuell.
 * Nachtrag 6.11 (Kontrolle der Sprache an der Injektionsstelle) ist seit dem 28.10.2026, 08:05 UTC committet
   (`2ce9c71`), also vor dem Kontrolllauf mit Notebook 14, der noch aussteht.
+* **28.10.2026, vor dem Kontrolllauf festgehalten:**
+  * Referenz der Bank des Hauptlaufs von Stufe D:
+    `MyDrive/LSNE/runs/D/pythia-160m@step98000/directions_depth.npz` (Konto A), 120 512 Bytes, geändert am
+    26.10.2026 um 21:31:11 UTC (Beginn des Hauptlaufs), SHA-256
+    `d9f05cd61e73b74bcba072e104ca6781c3419570142b25c0b8d4dda4f8a120be`. Der Kontrolllauf lädt genau diese
+    Bank: `bank.sha256` in seinem Manifest und `MAIN_BANK_SHA256` in Notebook 14 (Zelle 1b,
+    `main_run.bank_sha256` in der Zusammenfassung) müssen diesem Wert gleichen.
+  * Plattform des Hauptlaufs laut Manifest: Torch 2.11.0+cu130, transformers 5.20.2 (die GPU verzeichnet das
+    Manifest nicht; laut einer früheren Meldung über fehlenden Speicher eine A100 40 GB). Der Kontrolllauf
+    muss auf derselben Plattform laufen (`docs/RUNBOOK_COLAB.md` §12).
+  * Der Code der Auswertung (`lsne/prereg_eval.py`) ist eingefroren, sobald der Kontrolllauf gelaufen ist.
+    Belegt wird das durch `prereg_eval_sha256` in der Kopfzeile „Code der Auswertung“ des Berichts (und in
+    `prereg_meta.json`) und durch `eval_code_sha256` im Manifest des Kontrolllaufs; die Notiz von
+    `audit.D1ctl.run` vergleicht beide.

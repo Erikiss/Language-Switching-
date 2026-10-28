@@ -6,7 +6,8 @@ Nicht-Gleichgewichts-Gitterphysik. Python-Paket `lsne`, Colab-Notebooks `noteboo
 Versuchsdesign `docs/DESIGN.md`, Präregistrierung `docs/PREREGISTRATION.md`,
 Modulverträge `docs/SPEC.md`.
 
-Ergebnisse und Prüfung des ersten Colab-Laufs (pythia-160m@step98000, vorläufig): `docs/RESULTS_RUN1.md`.
+Ergebnisse und Prüfung des ersten Colab-Laufs (pythia-160m@step98000, vorläufig): `docs/RESULTS_RUN1.md`;
+präregistrierte Auswertung nach den Neuläufen (Notebook 13): `docs/RESULTS_PREREG.md`.
 
 Das Dossier „State 2143“ zeigt einen reproduzierbaren lokalen Eingriffseffekt (ein
 Schritt der Dosis ε entlang des Entropiegradienten am Eingang von Block 11), aber keinen
@@ -189,19 +190,26 @@ Details, Herleitung und Grenzen: `docs/TNCO_INTEGRATION.md`.
 | `notebooks/09_rdx_sharing.ipynb` | J | Pile-Schwierigkeitsrangfolge (Gegenpol), RDX-z-Karten pro Kontrast × Basis × Layer, Stabilität, Sharing-Index und Netzwerkaktivität |
 | `notebooks/10_ttt_injection.ipynb` | K | Korpora (Platzhalter markiert), Memorisationsgeschwindigkeit, Trainingsverlauf, Vorher/Nachher-Effekte gegen drei Kontrollarme |
 | `notebooks/11_transplant.ipynb` | L | Funktionaler Transfertest pro Layer, Layer-Matching, Residual-Substitution / KV-Pflanzung / beides gegen Kontrollen |
-| `notebooks/13_prereg_evaluation.ipynb` | C, D, G–L (CPU) | Präregistrierte Auswertung der vorhandenen Läufe beider Konten (`lsne.prereg_eval`): Primärendpunkt, Sekundärendpunkte mit BH, G0-Gate, übernommene 11–18 (`docs/RUNBOOK_COLAB.md` §11) |
+| `notebooks/12_trace_source.ipynb` | L (A100) | Spurenmodell 2016 als Quelle für Stufe L: Xatu-Download, Serialisierung, Vokabular mit Hold-out-OOV, Training `blockgpt` (bf16), Evaluation, Sonden, Alignment, Stufe L mit `trace:<modell>` (`docs/RUNBOOK_COLAB.md` §10) |
+| `notebooks/14_token_control.ipynb` | D, Kontrolllauf (A100) | Kontrolle der Sprache an der Injektionsstelle (Nachtrag 6.11 der Präregistrierung): reduzierter D1-Lauf mit Bank, Richtungen und Dosen des Hauptlaufs von 03, eigene Wurzel `runs_ctl`; nach 03 und vor 13, auf der Plattform des Hauptlaufs (`docs/RUNBOOK_COLAB.md` §12) |
+| `notebooks/13_prereg_evaluation.ipynb` | C, D, G–L (CPU) | Präregistrierte Auswertung der vorhandenen Läufe beider Konten (`lsne.prereg_eval`): Primärendpunkt mit der Kontrolle aus 14, Sekundärendpunkte mit BH, G0-Gate, übernommene 11–18; läuft zuletzt (`docs/RUNBOOK_COLAB.md` §11) |
 
 Jedes Notebook klont den Branch `claude/language-switching-non-equilibrium-ejpz0q` dieses
-Repositories nach `/content/lsne-repo`, installiert `requirements.txt` + `pip install -e .`,
-bindet Google Drive ein (`OUT_ROOT = /content/drive/MyDrive/LSNE`), ruft die Stufenfunktion
-`lsne.experiments.<stage>.run()` direkt auf und zeichnet die Kerntabellen. Mit `SMOKE = True`
-läuft jedes Notebook in wenigen Minuten auf CPU (pythia-14m). Die Notebooks 06–11 haben
+Repositories nach `/content/lsne-repo`, installiert `requirements.txt` + `pip install -e .` und
+bindet Google Drive ein (`OUT_ROOT = /content/drive/MyDrive/LSNE`). Die Notebooks 00–11 rufen
+die Stufenfunktion `lsne.experiments.<stage>.run()` direkt auf und zeichnen die Kerntabellen;
+12 und 14 starten die Kommandozeile in eigenen Prozessen (Logs auf Drive), 13 wertet nur aus.
+Mit `SMOKE = True` läuft jedes Notebook außer 13 (es hat keinen Rauchtest und braucht ohnehin
+nur die CPU) in wenigen Minuten auf CPU mit pythia-14m; Notebook 12 nimmt dazu den
+Xatu-Testausschnitt, Notebook 14 baut seinen eigenen Rauch-Hauptlauf von Stufe D unter
+`OUT_ROOT/smoke_14` (Notebook 03 ist dafür nicht nötig). Die Notebooks 06–11 haben
 zusätzlich eine Parameterzelle für die vom Auftraggeber gelieferten Eingaben
 (`ATLAS_DIR`, `TTT_INPUTS`/`TTT_CORPUS`/`TTT_CHECKPOINTS`, `TRANSPLANT_SOURCE`), einen
 Substufen-Bericht aus dem Manifest und im Kopf die präregistrierten Kontraste mit den
 Tabellen, die sie tragen. Die Notebooks werden von `scripts/build_notebooks.py` erzeugt
-(`tests/test_notebooks.py` prüft, dass sie nicht abdriften, und führt 00 und 06 im
-Rauchtest kopflos aus). Schritt-für-Schritt-Anleitung für zwei Colab-Konten:
+(`tests/test_notebooks.py` prüft, dass sie nicht abdriften, führt 00, 06, 12 und 14 im
+Rauchtest kopflos aus und 13 auf einer kleinen synthetischen Laufwurzel sowie auf den
+Rauchläufen von 14). Schritt-für-Schritt-Anleitung für zwei Colab-Konten:
 `docs/RUNBOOK_COLAB.md`.
 
 ### Kommandozeile
@@ -222,6 +230,10 @@ python -m lsne.cli run --stage K --model EleutherAI/pythia-160m --revision step9
 # Rauchtest auf CPU, alle Stufen A-L (~1-2 min unbelastet)
 python -m lsne.cli run --stage all --model EleutherAI/pythia-14m --revision step98000 \
     --device cpu --families DEV01 --out runs/smoke --smoke
+# Kontrolllauf von Stufe D nach Nachtrag 6.11 (Notebook 14): eigene Wurzel, der Hauptlauf wird nur gelesen;
+# gültig nur auf der Plattform des Hauptlaufs (A100, dieselbe Torch- und transformers-Version)
+python -m lsne.cli run --stage D --d-control token_language --d-main-run runs/D/pythia-160m@step98000 \
+    --out runs_ctl --model EleutherAI/pythia-160m --revision step98000 --dtype float32
 # Tabellen aller Läufe zusammenführen
 python -m lsne.cli merge --root runs --out runs/merged
 ```
@@ -229,7 +241,9 @@ python -m lsne.cli merge --root runs --out runs/merged
 Weitere Optionen: `--use-sae`, `--axis-npz`, `--k-levels`, `--c-levels`, `--k-extreme`,
 `--n-random-dirs`, `--gen-n-new`, `--gen-n-samples`, `--tn-rank`, `--tn-window`,
 `--limit-variants`, `--limit-families`, `--seed`; für G–L `--ttt-corpus`,
-`--ttt-checkpoints`, `--transplant-source`, `--atlas-dir` (`python -m lsne.cli run --help`).
+`--ttt-checkpoints`, `--transplant-source`, `--atlas-dir`; für den Kontrolllauf von Stufe D
+`--d-control`, `--d-main-run`, `--d-allow-platform-mismatch` (`docs/STAGES.md`;
+`python -m lsne.cli run --help`).
 Umgebungsvariablen: `LSNE_CACHE` (Anker-/Unigramm-/Pile-NLL-Cache), `LSNE_RUNS`
 (Standard-`--out` außerhalb von Colab), `LSNE_OFFLINE=1` (keine Netzzugriffe; `freq` aus
 der Stimulusbank, Stufe J ohne Schwierigkeitsrangfolge), `HF_TOKEN` (nur bei Rate-Limits).
@@ -255,8 +269,8 @@ im Manifest. Nichts davon wird eingecheckt (`.gitignore`), nur die Ablagenotizen
 ```bash
 python -m pytest tests -q -p no:warnings              # CPU, pythia-14m step98000 (gecacht)
 python -m pytest tests -q -m "not slow and not network"
-python -m pytest tests/test_notebooks.py -q -m "not slow"   # Notebooks regenerieren + Drift-Check
-python -m pytest tests/test_notebooks.py -q -m slow         # Notebooks 00 und 06 kopflos im Rauchtest ausführen (nbclient, ipykernel)
+python -m pytest tests/test_notebooks.py -q -m "not slow"   # Notebooks regenerieren + Drift-Check; 13 und 14 auf synthetischen Läufen
+python -m pytest tests/test_notebooks.py -q -m slow         # Notebooks 00, 06, 12 und 14 (danach 13 auf dessen Rauchläufen) kopflos im Rauchtest (nbclient, ipykernel)
 ```
 
 ## Rechenplan: 7 A100-Shards (`jobs/shards.yaml`)
@@ -301,6 +315,13 @@ weil `all` auch Stufe F (den Checkpoint-Sweep) anstoßen würde.
 │   ├── merged/                     Ausgabe von `lsne.cli merge` (Spalten run_id, run_stage, run_model, run_revision)
 │   └── run_report_<modell>_<rev>_<dtype>.json
 ├── runs_ttt/K/…                    Shard 7 (Stufe K über drei Checkpoints), getrennt vom Kernlauf
+├── runs_trace/L/<modell>@<rev>/    Notebook 12: Stufe L mit dem Spurenmodell, getrennt vom Stand-in-Lauf in runs/L/…
+├── runs_ctl/
+│   ├── D/<modell>@<rev>/           Notebook 14: Kontrolllauf von Stufe D (Nachtrag 6.11): damage_ctl, damage_ctl_profile,
+│   │                               damage_ctl_checks, damage_ctl_contrasts, manifest.json (control = token_language)
+│   └── logs/                       Logs der CLI-Aufrufe von Notebook 14 (Vorabprüfung, Kontrolllauf)
+├── prereg_eval/<modell>@<rev>/     Notebook 13: prereg_results.{csv,md}, prereg_runs.csv, prereg_meta.json
+│   └── archive/<zeitstempel>/      frühere Auswertungen; ein neuer Lauf verschiebt die vorige hierher, statt sie zu überschreiben
 ├── cache/                          state2143/ (Anker), unigram/ (Zählungen), pile_nll/ (Stufe J) — LSNE_CACHE
 ├── figures/<notebook>/             PNG-Abbildungen der Notebooks
 └── summary_<notebook>_*.json       kurze Laufzusammenfassung je Notebook
@@ -328,7 +349,10 @@ Schwierigkeitsrangfolge, Test-Time-Training, Transplantations-Validierung — Ko
 1–18) BH-korrigiert; Ausschlussregeln vor Sichtung der Modellwerte. Alles darüber hinaus
 (Phasendiagramme, Checkpoint-Sweeps, Skalierungsarme, SAE-Feature-Auswahl, FDT) ist
 explorativ. `docs/STAGES.md` ordnet jedem Kontrast die Stufe, die Tabelle und die Spalten
-zu, die ihn tragen.
+zu, die ihn tragen. Nach Lauf 1 kamen datierte Nachträge hinzu (`docs/PREREGISTRATION.md` §6),
+zuletzt 6.11 vom 28.10.2026: die Kontrolle der Sprache an der Injektionsstelle mit einem eigenen
+Kontrolllauf von Stufe D (Notebook 14); ohne gültigen Kontrolllauf ist der Primärendpunkt
+höchstens „offen“.
 
 ## Grenzen
 
@@ -384,14 +408,16 @@ lsne/            Paket: config, anchor, pile_fetch, model, stimuli, lang_id, dir
                  rdx, pile_domains, sharing, ttt, transplant, stats, io, cli,
                  prereg_eval (präregistrierte Auswertung vorhandener Läufe, CPU)
 lsne/chain       Quelladapter für ein BlockGPT-artiges Spurenmodell (Xatu-Traces 2016, docs/TRACE_SOURCE_SPEC.md)
-lsne/experiments Stufen A-L (run() je Stufe) + common (Limits, Stimulusbank, Richtungsbank, Substufen, Familiengruppen)
+lsne/experiments Stufen A-L (run() je Stufe) + stage_d_control (Kontrolllauf von Stufe D, Nachtrag 6.11)
+                 + common (Limits, Stimulusbank, Richtungsbank, Substufen, Familiengruppen)
 data/stimuli     Familien F01-F20, DEV01-DEV04 (Formulierungen A-D), original_2143.json, SCHEMA.md, review.csv
 data/lexicon     Funktionswort-Lexikon (Sprachklassifikation), domains.json (Domänenlexika E/D)
 data/ttt, data/atlas, data/s4   Ablagen für die Eingaben des Auftraggebers (nur die Notizen sind eingecheckt)
 docs/            DESIGN.md, PREREGISTRATION.md, SPEC.md, STAGES.md, RUNBOOK_COLAB.md, TNCO_INTEGRATION.md,
-                 BLOCKGPT_FEASIBILITY.md, TRACE_SOURCE_SPEC.md, ROUND2_ITEMS.md
+                 BLOCKGPT_FEASIBILITY.md, TRACE_SOURCE_SPEC.md, TRACE_SOURCE.md, RESULTS_RUN1.md,
+                 RESULTS_PREREG.md, LITERATUR.md, ROUND2_ITEMS.md, berichte/ (PDF-Berichte)
 jobs/shards.yaml Rechenplan (7 Shards)
-notebooks/       generierte Colab-Notebooks 00-13
+notebooks/       generierte Colab-Notebooks 00-14
 scripts/         build_notebooks.py
 tests/           pytest (CPU, pythia-14m); test_experiments_smoke.py = Rauchtest A-L über die CLI
 ```

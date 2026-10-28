@@ -22,18 +22,24 @@ to the generator output.
 Notebook 13 (``13_prereg_evaluation``, CPU runtime without accelerator metadata) has its own
 tests: the skeleton (header, the ``LSNE_B`` shortcut note, the run roots asked for in the
 configuration cell, the evaluation through ``lsne.prereg_eval``), the CLI equivalent (only
-options of ``python -m lsne.prereg_eval``) and a headless execution on a tiny synthetic run
-root (no model, so it is not marked ``slow``; skipped without a Jupyter kernel).
+options of ``python -m lsne.prereg_eval``), a headless execution on a tiny synthetic run root
+(no model, so it is not marked ``slow``; skipped without a Jupyter kernel) and its cells in
+this process on synthetic control runs (one ``ACHTUNG`` line per failing audit, the choice
+among several control runs, the code version, the archive of the previous report).
 
 Notebook 14 (``14_token_control``, the A100 control run of the injection-site language,
 PREREGISTRATION 6.11) has its own tests: the skeleton and defaults (main run of account A,
-the ``LSNE_B`` shortcut only when it is missing, the own root ``runs_ctl``, ``REUSE = False``),
-the CLI call (only options of ``python -m lsne.cli run``, the control flags included), its
-cells executed in this process on synthetic runs (the stops with a German message: main run
-missing, not ok, without its bank, a foreign run in the control directory, no GPU; the
-descriptive check and the summary; nothing is written below ``RUNS_ROOT``) and, marked
-``slow``, a headless execution in smoke mode that runs the control through the CLI against a
-main run built here with pythia-14m.
+the ``LSNE_B`` shortcut only when it is missing, the own root ``runs_ctl``, ``REUSE = True``,
+``ALLOW_PLATFORM_MISMATCH = False``), the CLI calls (only options of ``python -m lsne.cli
+run``), its cells executed in this process on synthetic runs with the CLI stubbed (the stops
+with a German message: main run missing, not ok, without its bank or damage table, a foreign
+run in the control directory, another GPU / torch / transformers, a main run that was not
+reproducible for identical shapes, a pre-flight that is not bit-identical; the self-contained
+smoke mode; REUSE of a finished run, never of a narrowed one; section 3 printing exactly the
+audits of ``lsne.prereg_eval.control_audits_for``; the summary; nothing is written below
+``RUNS_ROOT``) and, marked ``slow``, a headless execution in smoke mode that builds its own
+smoke main run, runs the pre-flight and the control through the CLI, a second execution that
+only reuses it, and notebook 13 on the smoke roots.
 
 ``test_notebook_runs_headless_in_smoke_mode`` (marked ``slow``) executes notebooks 00 and
 06 with ``SMOKE = True`` (pythia-14m, DEV01) through nbclient inside this checkout: every
@@ -552,9 +558,11 @@ def _prereg_nb(regenerated) -> nbformat.NotebookNode:
 
 
 def test_prereg_notebook_skeleton(regenerated):
-    """Header (German prose, CPU runtime, the pre-registered rules), the LSNE_B shortcut
-    note, setup / Drive / run roots (asked for, defaults MyDrive/LSNE/runs + LSNE_B/runs) /
-    evaluation / tables / figure / summary; no model and no stage run."""
+    """Header (German prose, CPU runtime, the pre-registered rules, the four audits of the
+    control run and the choice of the first valid one, provenance and the archive), the LSNE_B
+    shortcut note, setup / Drive / run roots (asked for, defaults MyDrive/LSNE/runs + LSNE_B/runs)
+    / evaluation / control run, code version and archive / tables / figure / summary; no model and
+    no stage run."""
     nb = _prereg_nb(regenerated)
     head = nb.cells[0].source
     assert head.startswith("# LS-NEQ 13_prereg_evaluation")
@@ -563,7 +571,14 @@ def test_prereg_notebook_skeleton(regenerated):
               "not_tested", "Notebook 05", "docs/STAGES.md",
               # amendment 6.11: the control rows, their role and the cap on P without a valid control run
               "**Nachtrag 6.11", "`runs_ctl`", "Notebook 14", "`P.ctl…`", "`primary_control`", "„Wechsel“", "„lokal“",
-              "ohne gültigen Kontrolllauf ist P höchstens „offen“", "`audit.D1ctl.rep`"):
+              "ohne gültigen Kontrolllauf ist P höchstens „offen“", "`audit.D1ctl.rep`",
+              # the four audits (reverse coverage, design cells, complete pairs with finite lambda, no smoke run), the
+              # first valid control run, the ACHTUNG lines, provenance and the archive
+              "`audit.D1ctl`:", "`audit.D1ctl.rep`:", "`audit.D1ctl.site`:", "`audit.D1ctl.run`:", "ihre Kontrollzeile",
+              "jede Zelle des Designs", "alle mit endlichem λ", "kein Rauch- oder eingeschränkter Lauf",
+              "dessen vier Audits bestehen", "„ACHTUNG: Kontrolllauf ungültig – …“", "**Herkunft und Archiv.**",
+              "„Code der Auswertung“", "`git_sha`, `prereg_eval_sha256`", "`eval_code_sha256`", "`archive/<zeitstempel>/`",
+              "07:07 UTC", "`previous_evaluation_archive`"):
         assert s in head, s
     md_all = "\n".join(c.source for c in nb.cells if c.cell_type == "markdown")
     for s in ("## Zweites Konto einbinden (`LSNE_B`)", "Verknüpfung", "Für mich freigegeben", "/content/drive/MyDrive/LSNE_B",
@@ -576,7 +591,14 @@ def test_prereg_notebook_skeleton(regenerated):
               'RUN_ROOTS_TEXT = ""  # @param {type:"string"}', "input(", "from lsne import prereg_eval as PE",
               "PE.evaluate(RUN_ROOTS", "PE.write_outputs(res, EVAL_OUT)", "N_BOOT = 10000", 'REVISION = "step98000"',
               "FROZEN_DOSE = None", "PE.EVAL_KEYS", "summary_", "json.dump", "def guarded(", "traceback", "plt.show()",
-              "fig.savefig("):
+              "fig.savefig(",
+              # after the evaluation: failing audits of the control run, the choice among control runs, code version, archive
+              "PE.CTL_AUDIT_IDS", "PE.control_valid(", "ACHTUNG: Kontrolllauf ungültig – ", "Auswahl des Kontrolllaufs",
+              '"control run "', "Code der Auswertung: Git", 'meta.get("prereg_eval_sha256")', '"eval_code_sha256"',
+              'paths.get("archive")', "Frühere Auswertung archiviert nach",
+              # the summary
+              'git_sha=res["meta"].get("git_sha")', 'prereg_eval_sha256=res["meta"].get("prereg_eval_sha256")',
+              "archive=None if", "control_valid=PE.control_valid("):
         assert s in src, s
     # the control rows reach the result table, the overview figure (P.ctl1-3 per dose) and the summary
     assert src.count('"primary_control"') >= 3 and 'r"P\\.ctl[123](@.+)?"' in src and "primary_control=tab[" in src
@@ -667,6 +689,75 @@ def test_prereg_notebook_runs_headless(regenerated, tmp_path, monkeypatch):
     assert len(summaries) == 1
     s = json.loads(summaries[0].read_text(encoding="utf-8"))
     assert s["runs_used"] == {"C": str(run)} and s["figures"] and s["n_boot"] == 10000
+    # provenance and the archive (no earlier report: nothing archived); no control run: no audits, control_valid None
+    from lsne import prereg_eval as PE
+
+    assert s["prereg_eval_sha256"] == PE.PREREG_EVAL_SHA256 and s["git_sha"] == PE.code_version()["git_sha"]
+    assert s["archive"] is None and s["control_valid"] is None and s["control_audits"] == []
+    assert "Code der Auswertung: Git" in text and "Keine frühere Auswertung in" in text and "ACHTUNG" not in text
+
+
+def test_prereg_notebook_reports_control_validity_and_archive(regenerated, tmp_path, capsys):
+    """Notebook 13's cells in this process on synthetic roots (a main stage-D run and control runs of the whole design,
+    built as for notebook 14's tests; the roots given explicitly): one line "ACHTUNG: Kontrolllauf ungültig – <audit>"
+    per failing audit of the control run, the choice among several control runs (meta notes), the code version
+    (git_sha, prereg_eval_sha256, the control run's eval_code_sha256) and, on a second run, the archive folder of the
+    previous report; the summary carries git_sha, prereg_eval_sha256, archive and control_valid."""
+    import os
+
+    from lsne import prereg_eval as PE
+
+    nb = _prereg_nb(regenerated)
+    a, b, out = tmp_path / "A", tmp_path / "B", tmp_path / "LSNE"
+    main = _fake_main_run(a / "runs" / "D" / CTL_TAG)
+    bad = _fake_control_tables()
+    bad.loc[(bad["inject"] == "u9") & (bad["C"] == "C1"), "lam"] += 5e-3            # replication beyond 1e-3
+    bad_dir = _write_ctl_run(b / "runs_ctl" / "D" / CTL_TAG, main, bad, timestamp="2026-10-28T13:00:00+00:00")
+    eval_out = out / "prereg_eval" / CTL_TAG
+    code = PE.code_version()
+
+    def run(*roots) -> tuple:
+        ns = {"__name__": "__main__", "os": os, "OUT_ROOT": str(out), "RUNS_ROOT": str(out / "runs")}
+        _exec_cell(nb, "# --- Konfiguration: Laufwurzeln", ns,
+                   subst={'RUN_ROOTS_TEXT = ""': f"RUN_ROOTS_TEXT = {','.join(map(str, roots))!r}",
+                          "N_BOOT = 10000": "N_BOOT = 200"})
+        for marker in ("# --- Hilfsfunktionen", "# --- Auf Notebook 12 warten", "# --- Auswertung:",
+                       "# --- Kontrolllauf (Nachtrag 6.11)", "# --- Gefundene Läufe", "# --- Kurze Zusammenfassung"):
+            _exec_cell(nb, marker, ns)
+        s = json.loads((out / f"summary_{PREREG_NB}_pythia-160m_step98000.json").read_text(encoding="utf-8"))
+        return ns, capsys.readouterr().out, s
+
+    # 1. only an invalid control run: an ACHTUNG line for its failing audit (replication), none for the others
+    ns, text, s = run(a / "runs", b / "runs_ctl")
+    assert "übersprungen" not in text, text
+    achtung = [ln for ln in text.splitlines() if ln.startswith("ACHTUNG: Kontrolllauf ungültig – ")]
+    assert len(achtung) == 1 and achtung[0].startswith("ACHTUNG: Kontrolllauf ungültig – audit.D1ctl.rep: nicht bestanden "
+                                                       "(not_supported); ")
+    assert "Ohne gültigen Kontrolllauf sind alle Zeilen P.ctl… nicht interpretierbar" in text
+    assert "Mehrere Kontrollläufe" not in text and "Auswahl des Kontrolllaufs" not in text
+    assert f"Code der Auswertung: Git {code['git_sha'][:7] or 'unbekannt'}, lsne/prereg_eval.py SHA-256 " \
+           f"{code['prereg_eval_sha256'][:12]}" in text
+    assert f"Kontrolllauf gerechnet mit lsne/prereg_eval.py SHA-256 {PE.PREREG_EVAL_SHA256[:12]}: derselbe Code" in text
+    assert f"Keine frühere Auswertung in {eval_out}: nichts archiviert." in text and ns["paths"]["archive"] is None
+    assert ns["CONTROL_VALID"] is False and s["control_valid"] is False and s["archive"] is None
+    assert s["git_sha"] == code["git_sha"] and s["prereg_eval_sha256"] == code["prereg_eval_sha256"] == PE.PREREG_EVAL_SHA256
+    assert {r["id"]: r["verdict"] for r in s["control_audits"]}["audit.D1ctl.rep"] == "not_supported"
+    assert "archive" not in s["files"] and s["runs_used"]["D_ctl"] == str(bad_dir)
+
+    # 2. a valid older control run next to it: the first valid one is used (reason printed); the earlier report is archived
+    good_dir = _write_ctl_run(a / "runs_ctl" / "D" / CTL_TAG, main, timestamp="2026-10-28T12:00:00+00:00")
+    ns, text, s = run(a / "runs", a / "runs_ctl", b / "runs_ctl")
+    assert "ACHTUNG: Kontrolllauf ungültig" not in text and "Kontrolllauf gültig: alle vier Audits bestanden" in text
+    assert f"Mehrere Kontrollläufe gefunden (2); verwendet: {good_dir}." in text
+    flat = " ".join(text.split())                                       # the selection note is wrapped
+    assert f"Auswahl des Kontrolllaufs: control run {good_dir}: used instead of the control run(s) preferred by " \
+           f"select_runs that fail their audits: {bad_dir} (audit.D1ctl.rep not_supported)" in flat
+    arch = ns["paths"]["archive"]
+    assert arch is not None and arch.parent == eval_out / "archive" and f"Frühere Auswertung archiviert nach: {arch}" in text
+    assert sorted(p.name for p in arch.iterdir()) == ["prereg_meta.json", "prereg_results.csv", "prereg_results.md",
+                                                      "prereg_runs.csv"]
+    assert s["archive"] == str(arch) and s["control_valid"] is True and s["runs_used"]["D_ctl"] == str(good_dir)
+    assert json.loads((eval_out / "prereg_meta.json").read_text(encoding="utf-8"))["previous_evaluation_archive"] == str(arch)
 
 
 # --------------------------------------------------------------------------------------
@@ -675,8 +766,18 @@ def test_prereg_notebook_runs_headless(regenerated, tmp_path, monkeypatch):
 #: run-directory tag of the smoke model (SMOKE = True) and of the default model
 CTL_SMOKE_TAG = "pythia-14m@step98000"
 CTL_TAG = "pythia-160m@step98000"
-#: (K, C) -> (position of the last token of unit 9, tail_start, language there) of the synthetic control run
-CTL_CELLS = {(0, "C1"): (86, 94, "E"), (8, "C1"): (119, 127, "D"), (8, "C2"): (117, 125, "E"), (2, "u9D"): (95, 103, "D")}
+#: the synthetic main run of notebook 14's in-process tests: 3 directions x 3 doses = 9 (direction, dose) pairs per
+#: injection, run in forwards of 4 + 4 + 1 perturbed rows plus the reference (two full-size forwards and a short one)
+FAKE_LATTICE, FAKE_DOSES, FAKE_BATCH = ["ent", "lang_dom", "rand_00"], [0.01, 0.1, 0.5], 5
+FAKE_MAIN_TS = "2026-10-27T00:45:36+00:00"
+#: position of the last token of unit 9 per (K, C) of the synthetic variants; the tail starts 8 tokens later everywhere
+FAKE_U9 = {(0, "C1"): 86, (2, "C1"): 95, (4, "C1"): 103, (8, "C1"): 119, (2, "C2"): 93, (4, "C2"): 99, (8, "C2"): 111,
+           (2, "C3"): 91, (4, "C3"): 97, (8, "C3"): 109, (2, "u9D"): 95}
+FAKE_GAP = 8
+#: the markers of notebook 14's code cells after the configuration, in their order
+CTL_CELLS = ("# --- Hilfsfunktionen", "# --- 1a. Rauch-Hauptlauf", "# --- 1b. Hauptlauf", "# --- 2a. Vorabprüfung",
+             "# --- 2b. Kontrolllauf", "# --- 3. Audits", "# --- Zusammenfassung", "# --- Drive leeren")
+AUDIT_DE = {"supported": "bestanden", "not_supported": "nicht bestanden", "not_tested": "nicht getestet"}
 
 
 def _ctl_nb(regenerated) -> nbformat.NotebookNode:
@@ -696,158 +797,304 @@ def _ctl_namespace(out_root: Path) -> dict:
             "RUNS_ROOT": str(out_root / "runs")}
 
 
-def _fake_main_run(path: Path, model: str = "EleutherAI/pythia-14m", **over) -> Path:
-    """A main stage-D run as notebook 14 checks it: an ok manifest with the inputs of the control and
-    the two depth-bank files (the notebook hashes the bank but does not load it)."""
+def _dir_family(name: str) -> str:
+    return "rand" if name.startswith("rand") else name
+
+
+def _fake_lam(form: str, K: int, Cc: str, site: str, direction: str, eps: float) -> float:
+    """lambda of the synthetic runs: the same number in the main run's depth rows and the control's u9 / C1 rows."""
+    return (0.1 * K + 0.01 * FAKE_LATTICE.index(direction) + eps + (0.5 if site == "u10" else 0.0)
+            + (0.001 if form == "B" else 0.0) + 0.002 * ("C1", "C2", "C3", "u9D").index(Cc))
+
+
+def _fake_main_damage():
+    """The main run's ``damage`` rows of the synthetic C1 variants (F01A / F01B at K 0, 2, 4, 8): both injections, the 9
+    (direction, dose) pairs in the manifest order, ``depth`` at the last token of unit 9; ``logp_target_ref`` is the
+    reference of the row's forward: the same in every full-size forward of a variant (both injections) and another one
+    in the short last forward (another shape), as on a device that is bitwise reproducible for identical shapes."""
+    import pandas as pd
+
+    step, pairs = FAKE_BATCH - 1, [(d, e) for d in FAKE_LATTICE for e in FAKE_DOSES]
+    rows = []
+    for form in "AB":
+        for K in (0, 2, 4, 8):
+            pos = FAKE_U9[(K, "C1")]
+            for inject, ipos in (("depth", pos), ("dossier", pos + FAKE_GAP + 2)):
+                for r, (d, e) in enumerate(pairs):
+                    short = min(step, len(pairs) - (r // step) * step) < step
+                    rows.append(dict(tag=f"F01{form}:K{K}:C1", family="F01", formulation=form, K=K, C="C1", kind="standard",
+                                     inject=inject, inject_pos=ipos, direction=d, dir_family=_dir_family(d), eps=e,
+                                     lam=_fake_lam(form, K, "C1", "u9", d, e) if inject == "depth" else 0.3,
+                                     logp_target_ref=-1.0 - 0.1 * K - 0.05 * (form == "B") + (0.25 if short else 0.0),
+                                     audit_rel_err=1e-7))
+    return pd.DataFrame(rows)
+
+
+def _fake_main_run(path: Path, model: str = "EleutherAI/pythia-160m", damage=True, **over) -> Path:
+    """A main stage-D run as notebook 14 checks it: an ok manifest with the inputs of the control (this runtime's torch
+    and transformers unless ``over`` says otherwise), the two depth-bank files (the notebook hashes the bank but does
+    not load it) and ``damage.csv`` (``damage``: True = :func:`_fake_main_damage`, a DataFrame, or False = none)."""
     from lsne.io import write_manifest
 
     path.mkdir(parents=True, exist_ok=True)
     (path / "directions_depth.npz").write_bytes(b"depth bank")
     (path / "directions_depth_meta.json").write_text("{}", encoding="utf-8")
-    meta = dict(stage="D", status="ok", model=dict(name=model, revision="step98000", dtype="float32", device="auto"),
-                lattice_directions=["lang_dom", "rand_00"], doses=[0.01, 0.1], limits=dict(damage_batch_size=5))
+    if damage is not False:
+        (_fake_main_damage() if damage is True else damage).to_csv(path / "damage.csv", index=False)
+    meta = dict(stage="D", status="ok", timestamp=FAKE_MAIN_TS,
+                model=dict(name=model, revision="step98000", dtype="float32", device="auto"),
+                lattice_directions=FAKE_LATTICE, doses=FAKE_DOSES,
+                limits=dict(damage_batch_size=FAKE_BATCH, is_smoke=False, limited=False))
     meta.update(over)
     write_manifest(path, **meta)
     return path
 
 
 def _fake_control_tables():
-    """``(damage_ctl, damage)``: a synthetic control run of F01A / F01B (the sites of CTL_CELLS, two
-    directions, two doses) and the main run's rows of the pre-registered site (``depth``, lambda
-    shifted by 2e-4) plus dossier rows."""
-    import numpy as np
+    """``damage_ctl`` of a synthetic control run of the whole design (``lsne.prereg_eval.CTL_DESIGN``) on F01A / F01B:
+    every cell at its site with the 9 (direction, dose) pairs, "." with the language mark, unit and distance of
+    amendment 6.11 (c), lambda at u9 / C1 equal to the main run's depth rows (:func:`_fake_lam`)."""
     import pandas as pd
 
-    rows, main = [], []
+    from lsne import prereg_eval as PE
+
+    rows = []
     for form in "AB":
-        for (K, Cc), (p9, ts, lang9) in CTL_CELLS.items():
-            tag = f"F01{form}:K{K}:{Cc}"
-            sites = [("u9", p9, lang9, 9)] + ([("u10", ts - 1, "E", 10)] if K == 0 or Cc == "C1" else [])
-            for inj, pos, lang, unit in sites:
-                for j, direction in enumerate(("lang_dom", "rand_00")):
-                    for eps in (0.01, 0.1):
-                        lam = 0.1 * K + 0.01 * j + eps + (0.5 if inj == "u10" else 0.0)
-                        rows.append(dict(tag=tag, family="F01", formulation=form, K=K, C=Cc, kind="standard", tail_start=ts,
-                                         inject=inj, inject_pos=pos, inject_lang=lang, inject_unit=unit, inject_token=".",
-                                         inject_klass="punct", inject_token_id=15, site_gap=ts - pos, direction=direction,
-                                         eps=eps, lam=lam, audit_rel_err=1e-7))
-                        if inj == "u9" and Cc == "C1":
-                            main.append(dict(tag=tag, inject="depth", direction=direction, eps=eps, inject_pos=pos,
-                                             lam=lam + 2e-4))
-                            main.append(dict(tag=tag, inject="dossier", direction=direction, eps=eps, inject_pos=ts + 9,
-                                             lam=np.nan))
-    return pd.DataFrame(rows), pd.DataFrame(main)
+        for site, cells in PE.CTL_DESIGN.items():
+            for K, Cc in cells:
+                ts = FAKE_U9[(K, Cc)] + FAKE_GAP
+                pos = FAKE_U9[(K, Cc)] if site == "u9" else ts - 1
+                lang = "E" if site == "u10" or K == 0 or Cc in ("C2", "C3") else "D"
+                for d in FAKE_LATTICE:
+                    for e in FAKE_DOSES:
+                        rows.append(dict(tag=f"F01{form}:K{K}:{Cc}", family="F01", formulation=form, K=K, C=Cc,
+                                         kind="standard", tail_start=ts, inject=site, inject_pos=pos, inject_lang=lang,
+                                         inject_unit=9 if site == "u9" else 10, inject_token=".", inject_klass="punct",
+                                         inject_token_id=15, site_gap=ts - pos, direction=d, dir_family=_dir_family(d),
+                                         eps=e, lam=_fake_lam(form, K, Cc, site, d, e), audit_rel_err=1e-7))
+    return pd.DataFrame(rows)
+
+
+def _write_ctl_run(ctl_dir: Path, main: Path, ctl=None, timestamp: str = "2026-10-28T12:00:00+00:00",
+                   bank_sha: str | None = None, **over) -> Path:
+    """A finished control run of ``main`` in ``ctl_dir`` (``damage_ctl.csv`` + ok manifest with the control marks, the
+    main run's path and timestamp and the SHA-256 of its bank: what notebook 14's REUSE compares)."""
+    import hashlib
+
+    from lsne import prereg_eval as PE
+    from lsne.io import read_manifest, write_manifest
+
+    ctl_dir.mkdir(parents=True, exist_ok=True)
+    ctl = _fake_control_tables() if ctl is None else ctl
+    ctl.to_csv(ctl_dir / "damage_ctl.csv", index=False)
+    mm = read_manifest(main)
+    meta = dict(stage="D", status="ok", control="token_language", amendment="6.11", timestamp=timestamp,
+                model=mm["model"], main_run=dict(path=str(main.resolve()), timestamp=mm["timestamp"], git_sha=mm.get("git_sha")),
+                bank=dict(file="directions_depth.npz", sha256=bank_sha or hashlib.sha256(b"depth bank").hexdigest()),
+                audit={"max": 1e-7, "n_over_1e-4": 0, "valid": True}, limits=dict(is_smoke=False, limited=False),
+                n_variants=int(ctl["tag"].nunique()), n_excluded=0, design_filters=[], tables=dict(damage_ctl=len(ctl)),
+                eval_code_sha256=PE.PREREG_EVAL_SHA256, platform_mismatch=[])
+    meta.update(over)
+    write_manifest(ctl_dir, **meta)
+    return ctl_dir
+
+
+def _fake_gpu(monkeypatch, name: str | None = "NVIDIA A100-SXM4-40GB") -> None:
+    """This process looks like a runtime with the GPU ``name`` (None: without a GPU) to the notebook's platform check
+    (the cells never touch the GPU)."""
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: name is not None)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *a, **k: name)
+
+
+def _ctl_cells(nb, out: Path, mydrive: Path, cells=CTL_CELLS, smoke: bool = False, stub=None, **subst) -> dict:
+    """Notebook 14's configuration and then ``cells`` executed in this process (``subst``: source replacements of the
+    configuration cell; ``stub``: a function ``ns -> run_cli`` installed after the helpers cell)."""
+    ns = _ctl_namespace(out)
+    _exec_cell(nb, "# --- Konfiguration", ns, smoke=smoke,
+               subst={'MYDRIVE = "/content/drive/MyDrive"': f"MYDRIVE = {str(mydrive)!r}", **subst})
+    for marker in cells:
+        _exec_cell(nb, marker, ns)
+        if marker == "# --- Hilfsfunktionen" and stub is not None:
+            ns["run_cli"] = stub(ns)
+    return ns
+
+
+def _cli_stub(calls: list):
+    """A stand-in for the notebook's ``run_cli`` (``ns -> run_cli``) that records every call and writes what the real
+    command would write below its ``--out``: the pre-flight (``--limit-variants``) the u9 / C1 rows of F01A at K 0 and 8
+    with the true lambda (:func:`_fake_lam`), the control run the whole synthetic design; both with an ok manifest of a
+    control run of the ``--d-main-run`` directory."""
+    def make(ns):
+        def run_cli(name, args, module="lsne.cli"):
+            args = [str(a) for a in args]
+            calls.append((name, args))
+            ns["CLI_LOG"].append("python -m lsne.cli " + " ".join(args))
+            main = Path(args[args.index("--d-main-run") + 1])
+            rd = Path(args[args.index("--out") + 1]) / "D" / main.name
+            ctl = _fake_control_tables()
+            if "--limit-variants" in args:
+                ctl = ctl[(ctl["formulation"] == "A") & (ctl["C"] == "C1") & ctl["K"].isin([0, 8])].copy()
+            _write_ctl_run(rd, main, ctl, timestamp=ns["now_utc"](),
+                           design_filters=["families", "limit_variants"] if "--limit-variants" in args else [])
+            return 0
+        return run_cli
+    return make
 
 
 def test_token_control_notebook_skeleton(regenerated):
-    """Header (German, amendment 6.11, the controls, the own root runs_ctl, the rule and its effect on
-    P, next notebook 13), setup / Drive / configuration / helpers / checks / CLI run / check / summary;
-    the model is loaded only by the CLI subprocess and RUNS_ROOT is never created."""
+    """Header (German, amendment 6.11, the controls, the own root runs_ctl, the four audits, the first valid control run
+    of notebook 13, bit-identity: platform, determinism of the main run, pre-flight; REUSE, ALLOW_PLATFORM_MISMATCH,
+    resume, the self-contained smoke test), setup / Drive / configuration / helpers / smoke main run / checks / pre-flight
+    / CLI run / audits / summary / Drive flush; the model is loaded only by the CLI subprocess, RUNS_ROOT is never created
+    and notebook 03 is never asked for a smoke run."""
     nb = _ctl_nb(regenerated)
     assert nb.metadata["lsne"]["stage"] == "D" and nb.metadata["colab"]["gpuType"] == "A100"
     head = nb.cells[0].source
     assert head.startswith("# LS-NEQ 14_token_control — Kontrolle der Sprache an der Injektionsstelle (Nachtrag 6.11, A100)")
     for s in ("Dossier-Stufe D, Kontrolllauf", "**Zweck.**", "**Eingaben.**", "**Ausgaben.**", "**Laufzeit.**", "**Ablauf.**",
-              "**Präregistrierung.**", "`docs/PREREGISTRATION.md` §6", "Commit `2ce9c71`", "MyDrive/LSNE/runs/D/<modell>@<revision>/",
-              "MyDrive/LSNE_B/runs/D/<modell>@<revision>/", "MyDrive/LSNE/runs_ctl/", "Punkt „.“", "1 (entscheidet)",
-              "2 (entscheidet)", "3 (nur berichtet)", "`u9D`", "EEEEEEEEDE", "`u9`", "`u10`", "C2 und C3",
-              "directions_depth.npz", "nicht neu angepasst", "`damage_ctl`", "`damage_ctl_checks`", "`damage_ctl_contrasts`",
-              "`inject_token_id`", "`site_gap`", "„Wechsel“", "„lokal“", "„offen“", "1e-3", "nur schwächen", "Notebook 13",
-              "`P.ctl…`", "`audit.D1ctl…`", "_resume", "wiederverwendete Colab-Laufzeit", "`REUSE = False`", "`SMOKE = True`",
-              '`FAMILIES = ["F01A"]`', "SHA-256 der Bank", "In `MyDrive/LSNE/runs/` schreibt"):
+              "**Präregistrierung.**", "**Bitgleichheit.**", "`docs/PREREGISTRATION.md` §6", "Commit `2ce9c71`",
+              "MyDrive/LSNE/runs/D/<modell>@<revision>/", "MyDrive/LSNE_B/runs/D/<modell>@<revision>/", "MyDrive/LSNE/runs_ctl/",
+              "Punkt „.“", "1 (entscheidet)", "2 (entscheidet)", "3 (nur berichtet)", "`u9D`", "EEEEEEEEDE", "`u9`", "`u10`",
+              "C2 und C3", "directions_depth.npz", "nicht neu angepasst", "`ent`, `lang_dom`, 32 × `rand`", "`damage_ctl`",
+              "`damage_ctl_checks`", "`damage_ctl_contrasts`", "`inject_token_id`", "`site_gap`", "„Wechsel“", "„lokal“",
+              "„offen“", "1e-3", "nur schwächen", "Notebook 13", "`P.ctl…`", "`audit.D1ctl…`",
+              # the four audits with the reverse coverage, the design cells, the complete pairs with finite lambda, no smoke
+              "`audit.D1ctl`:", "`audit.D1ctl.rep`:", "`audit.D1ctl.site`:", "`audit.D1ctl.run`:", "ihre Kontrollzeile",
+              "jede Zelle des Designs", "alle mit endlichem λ", "kein Rauch- oder eingeschränkter Lauf",
+              "den ersten (voller Lauf vor Rauchlauf, ganzes", "dessen vier Audits bestehen",
+              # bit identity: platform, determinism of the main run, pre-flight
+              "1,8e-2", "**Plattform**", "**Reproduzierbarkeit des Hauptlaufs**", "`logp_target_ref`",
+              "`damage_batch_size − 1`", "datierter Nachtrag zu 6.11 (b)", "**Vorabprüfung**", "max |Δλ| = 0",
+              "`ALLOW_PLATFORM_MISMATCH = True`", "`--d-allow-platform-mismatch`", "fast sicher ungültig",
+              # reuse, resume, smoke
+              "`REUSE = True` (Standard)", "`design_filters`", "`REUSE = False`", "_resume", "derselben Plattform",
+              "Git-SHA", "wiederverwendete Colab-Laufzeit", "`SMOKE = True`", "`<OUT_ROOT>/smoke_14/runs`",
+              "`<OUT_ROOT>/smoke_14/runs_ctl`", "Standardwurzeln von Notebook 13", "SHA-256 der Bank",
+              "In `MyDrive/LSNE/runs/` schreibt"):
         assert s in head, s
     md_all = "\n".join(c.source for c in nb.cells if c.cell_type == "markdown")
-    assert "## Weiter mit Notebook 13" in md_all and "höchstens „offen“" in md_all and "`D_ctl`" in md_all
+    for s in ("## 1. Hauptlauf, Plattform und Reproduzierbarkeit", "## 2. Vorabprüfung und Kontrolllauf",
+              "## 3. Prüfung mit den Audits von Notebook 13", "lsne.prereg_eval.control_audits_for",
+              "## Drive leeren, dann Notebook 13 in einer neuen Sitzung", "drive.flush_and_unmount()", "**neuen Sitzung**",
+              "höchstens „offen“", "`D_ctl`"):
+        assert s in md_all, s
+    assert "mit denselben Regeln wie die Audits" not in md_all          # section 3 shows the audits themselves
     src = _code(nb)
     for s in ("https://github.com/Erikiss/Language-Switching-.git", "claude/language-switching-non-equilibrium-ejpz0q",
               "/content/lsne-repo", "requirements.txt", "pip install -q -e .", "google.colab", "drive_root", "OUT_ROOT",
               'MODEL = "EleutherAI/pythia-160m"', 'REVISION = "step98000"', 'DTYPE = "float32"', "MAIN_D_RUN = None",
-              "REUSE = False", "SMOKE = False", 'MYDRIVE = "/content/drive/MyDrive"', 'Path(MYDRIVE, "LSNE_B", "runs", "D", TAG)',
-              'RUNS_CTL = os.path.join(OUT_ROOT, "runs_ctl")', '"--d-control", "token_language"', '"--d-main-run", MAIN_D_RUN',
-              '"--out", RUNS_CTL', "class ControlStop(RuntimeError)", "def run_cli(", "LOG_DIR", "def main_run_problems(",
-              "torch.cuda.is_available()", '"A100" not in GPU_NAME', 'MAIN_MANIFEST.get("torch_version")', "REUSE_RUN",
-              'read_table(CTL_DIR, "damage_ctl"', 'read_table(MAIN_D_RUN, "damage"', 'main["inject"] == "depth"', "AMENDMENT_611",
-              "def guarded(", "traceback", "summary_", "json.dump", "Notebook 13"):
+              "REUSE = True ", "ALLOW_PLATFORM_MISMATCH = False", "SMOKE = False", 'MYDRIVE = "/content/drive/MyDrive"',
+              'Path(MYDRIVE, "LSNE_B", "runs", "D", TAG)', 'RUNS_CTL = os.path.join(OUT_ROOT, "runs_ctl")',
+              'SMOKE_ROOT = os.path.join(OUT_ROOT, "smoke_14")', '"--d-control", "token_language"', '"--d-main-run", MAIN_D_RUN',
+              '"--out", RUNS_CTL', "class ControlStop(RuntimeError)", "def run_cli(", "os.makedirs(LOG_DIR, exist_ok=True)",
+              "def main_run_problems(", "def determinism_check(", "def compare_with_main(", "def pip_hint(",
+              "torch.cuda.is_available()", '"A100" in GPU_NAME', 'MAIN_MANIFEST.get("torch_version")',
+              'MAIN_MANIFEST.get("transformers_version")', "transformers.__version__", "REUSE_RUN",
+              'CTL_MANIFEST.get("design_filters")',
+              '"--d-allow-platform-mismatch"', 'tempfile.mkdtemp(prefix="lsne_preflight_")', "shutil.rmtree(PREFLIGHT_ROOT",
+              '["--families", "F01A", "--limit-variants", "2"]',
+              "PE.control_audits_for(MAIN_D_RUN, CTL_DIR, model=MODEL, revision=REVISION)", "PE.control_valid(AUDITS)",
+              "Kontrolllauf gültig: alle vier Audits bestanden (dieselben Regeln und derselbe Code wie Notebook 13)",
+              "ACHTUNG, Kontrolllauf ungültig:", "PE.PREREG_EVAL_SHA256", "eval_code_sha256", "platform_mismatch",
+              "MAIN_BANK_SHA256", "wiederverwendet (nur geprüft)", "flush_and_unmount()", "def guarded(", "traceback",
+              "summary_", "json.dump", "Notebook 13"):
         assert s in src, s
-    # the CLI subprocess loads the model; nothing runs a stage in this kernel, nothing creates RUNS_ROOT
+    # the CLI subprocess loads the model; nothing runs a stage in this kernel, nothing creates RUNS_ROOT; the
+    # configuration creates no folder (LOG_DIR only right before a CLI call); the smoke test needs no notebook 03
     for s in ("load_model", "run_stage(", "STAGES[", "os.makedirs(RUNS_ROOT"):
         assert s not in src, s
     assert "os.makedirs(OUT_ROOT, exist_ok=True)" in src
+    assert "os.makedirs" not in _config_source(nb)
+    everything = "\n".join(c.source for c in nb.cells)
+    assert 'FAMILIES = ["F01A"]' not in everything and "Notebook 03 mit SMOKE" not in everything
+    assert 'status="reused"' not in src and 'status="wiederverwendet (nur geprüft)"' in src     # German status words
+    assert nb.cells[-1].cell_type == "code" and "flush_and_unmount" in nb.cells[-1].source
 
 
 def test_token_control_notebook_cli_options_exist(regenerated):
-    """The CLI call of notebook 14 (``CLI_ARGS``, smoke additions included) uses only options of
-    ``python -m lsne.cli run``, the stage-D control flags among them, with a known control."""
+    """Every option notebook 14 passes to ``python -m lsne.cli run`` (``CLI_ARGS`` with its smoke additions, the smoke
+    main run, the pre-flight's ``--families`` / ``--limit-variants`` and ``--d-allow-platform-mismatch``) exists in that
+    parser; the control is a known one."""
     import ast
 
     from lsne.cli import build_parser
     from lsne.experiments import stage_d_control as SDC
 
-    cfg = _config_source(_ctl_nb(regenerated))
-    consts = [n.value for n in ast.walk(ast.parse(cfg)) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
-    used = {c for c in consts if c.startswith("--")}
+    nb = _ctl_nb(regenerated)
+    consts = []
+    for c in nb.cells:
+        if c.cell_type == "code" and c.source.startswith(("# --- Konfiguration", "# --- 1b.", "# --- 2a.")):
+            consts += [n.value for n in ast.walk(ast.parse(c.source)) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+    used = {c for c in consts if c.startswith("--") and " " not in c}
     assert {"--stage", "--model", "--revision", "--dtype", "--device", "--out", "--d-control", "--d-main-run", "--smoke",
-            "--families"} <= used
+            "--families", "--limit-variants", "--d-allow-platform-mismatch"} <= used
     missing = sorted(used - set(_subparser_options(build_parser())["run"]))
     assert not missing, f"lsne.cli run has no option(s) {missing}"
     assert "token_language" in consts and "token_language" in SDC.CONTROLS
 
 
-def test_token_control_notebook_stops_before_the_run(regenerated, tmp_path):
-    """Notebook 14's cells in this process (smoke model): the main run of account A, the LSNE_B
-    shortcut only when account A has none; German stops before the CLI runs when the main run is
-    missing, not ok, without its bank, of another model or a control run, when a foreign run sits in
-    the control directory and when the control root is not separate.  RUNS_ROOT is never created."""
+def test_token_control_notebook_stops_before_the_run(regenerated, tmp_path, monkeypatch):
+    """Notebook 14's cells in this process (defaults: pythia-160m, an A100 faked): the main run of account A, the LSNE_B
+    shortcut only when account A has none; German stops before any CLI call when the main run is missing, not ok, without
+    its bank or damage table, of another model or a control run, when a foreign run sits in the control directory and
+    when the control root is not separate.  Neither RUNS_ROOT nor runs_ctl is created."""
     import hashlib
 
     from lsne.io import write_manifest
 
+    _fake_gpu(monkeypatch)
     nb = _ctl_nb(regenerated)
     out, mydrive = tmp_path / "LSNE", tmp_path / "MyDrive"
-    my = {'MYDRIVE = "/content/drive/MyDrive"': f"MYDRIVE = {str(mydrive)!r}"}
 
-    def cells(smoke: bool = True, **subst) -> dict:
-        ns = _ctl_namespace(out)
-        _exec_cell(nb, "# --- Konfiguration", ns, smoke=smoke, subst={**my, **subst})
-        _exec_cell(nb, "# --- Hilfsfunktionen", ns)
-        return ns
+    def cells(**subst) -> dict:
+        return _ctl_cells(nb, out, mydrive, cells=CTL_CELLS[:2], **subst)
 
     def stops(ns: dict, match: str) -> None:
         with pytest.raises(ns["ControlStop"], match=match):
-            _exec_cell(nb, "# --- 1. Hauptlauf und Umgebung", ns)
+            _exec_cell(nb, "# --- 1b. Hauptlauf", ns)
+        assert ns["CLI_LOG"] == []
 
-    # 1. no main run anywhere: account A's directory is named, the stop is German; RUNS_ROOT is not created
+    # 1. no main run anywhere: account A's directory is named, the stop is German; nothing is created
     ns = cells()
-    assert ns["MAIN_D_RUN"] == str(out / "runs" / "D" / CTL_SMOKE_TAG) and ns["MAIN_SOURCE"].startswith("Konto A")
-    stops(ns, r"Hauptlauf von Stufe D nicht verwendbar .*manifest\.json fehlt \(kein Hauptlauf")
-    assert not (out / "runs").exists() and (out / "runs_ctl" / "logs").is_dir()
+    assert ns["MAIN_D_RUN"] == str(out / "runs" / "D" / CTL_TAG) and ns["MAIN_SOURCE"].startswith("Konto A")
+    assert ns["SMOKE_ROOT"] is None and ns["RESULT"]["smoke_main"] is None
+    stops(ns, r"Hauptlauf von Stufe D nicht verwendbar .*manifest\.json fehlt \(kein Hauptlauf: Notebook 03")
+    assert not (out / "runs").exists() and not (out / "runs_ctl").exists()
     args = ns["CLI_ARGS"]
     assert args[args.index("--out") + 1] == str(out / "runs_ctl") and args[args.index("--d-main-run") + 1] == ns["MAIN_D_RUN"]
-    assert args[-3:] == ["--smoke", "--families", "F01A"] and ns["CLI_COMMAND"].startswith("python -m lsne.cli run --stage D ")
+    assert "--smoke" not in args and "--families" not in args and ns["CLI_COMMAND"].startswith("python -m lsne.cli run --stage D ")
+    assert ns["LOG_DIR"] == str(out / "runs_ctl" / "logs")
 
     # 2. only the LSNE_B shortcut holds a main run: it is used; once account A has a run, account A's wins
-    main_b = _fake_main_run(mydrive / "LSNE_B" / "runs" / "D" / CTL_SMOKE_TAG)
+    main_b = _fake_main_run(mydrive / "LSNE_B" / "runs" / "D" / CTL_TAG)
     ns = cells()
     assert ns["MAIN_D_RUN"] == str(main_b) and ns["MAIN_SOURCE"].startswith("Konto B")
-    _exec_cell(nb, "# --- 1. Hauptlauf und Umgebung", ns)              # smoke run: no GPU needed
-    assert ns["REUSE_RUN"] is False and ns["MAIN_BANK_SHA256"] == hashlib.sha256(b"depth bank").hexdigest()
-    main_a = _fake_main_run(out / "runs" / "D" / CTL_SMOKE_TAG, status="error")
+    _exec_cell(nb, "# --- 1b. Hauptlauf", ns)                          # platform ok, reproducible: no stop
+    assert ns["REUSE_RUN"] is False and ns["COMPUTE"] is True and ns["MISMATCH"] == []
+    assert ns["MAIN_BANK_SHA256"] == hashlib.sha256(b"depth bank").hexdigest() and ns["DETERMINISM"]["reproducible"] is True
+    assert "--d-allow-platform-mismatch" not in ns["CLI_ARGS"] and not (out / "runs_ctl").exists()
+    main_a = _fake_main_run(out / "runs" / "D" / CTL_TAG, status="error")
     ns = cells()
     assert ns["MAIN_D_RUN"] == str(main_a) and ns["MAIN_SOURCE"].startswith("Konto A")
     stops(ns, "Status 'error' statt 'ok'")
 
-    # 3. the main run without its bank, of another model, or a control run itself
+    # 3. the main run without its bank or its damage table, of another model, or a control run itself
     _fake_main_run(main_a)
     (main_a / "directions_depth_meta.json").unlink()
     stops(cells(), "directions_depth_meta.json fehlt")
-    _fake_main_run(main_a, model="EleutherAI/pythia-160m")
-    stops(cells(), "Modell-name 'EleutherAI/pythia-160m' statt 'EleutherAI/pythia-14m'")
+    _fake_main_run(main_a)
+    (main_a / "damage.csv").unlink()
+    stops(cells(), r"damage\.parquet / damage\.csv fehlt")
+    _fake_main_run(main_a, model="EleutherAI/pythia-14m")
+    stops(cells(), "Modell-name 'EleutherAI/pythia-14m' statt 'EleutherAI/pythia-160m'")
     _fake_main_run(main_a, control="token_language")
     stops(cells(), "das ist ein Kontrolllauf")
 
     # 4. another run in the control directory is never overwritten (a manifest without the control mark, a depth bank)
     _fake_main_run(main_a)
-    ctl_dir = out / "runs_ctl" / "D" / CTL_SMOKE_TAG
+    ctl_dir = out / "runs_ctl" / "D" / CTL_TAG
     write_manifest(ctl_dir, stage="D", status="ok")
     before = _snapshot(out)
     stops(cells(), "In .* liegt ein anderer Lauf als dieser Kontrolllauf")
@@ -866,101 +1113,331 @@ def test_token_control_notebook_stops_before_the_run(regenerated, tmp_path):
     assert ns["ControlStop"].__mro__[1] is RuntimeError
 
 
-def test_token_control_notebook_check_and_summary(regenerated, tmp_path, capsys):
-    """Notebook 14 with the defaults (pythia-160m) and REUSE = True on a finished synthetic control
-    run, in this process: the run cell only reuses it (no CLI, no GPU), the check counts the rows per
-    site / K / C, replicates the pre-registered site against the main run's depth rows and runs the
-    site checks; a wrong language mark, a replication beyond 1e-3 and a run older than amendment 6.11
-    are reported; the summary goes to OUT_ROOT and nothing below RUNS_ROOT changes.  Without REUSE
-    the finished run would be recomputed, which needs a GPU."""
-    import hashlib
-
-    import torch
-
-    from lsne.io import read_manifest, write_manifest
+def test_token_control_notebook_smoke_mode_is_self_contained(regenerated, tmp_path, monkeypatch, capsys):
+    """SMOKE = True: the main run is the notebook's own smoke run below OUT_ROOT/smoke_14 (MAIN_D_RUN ignored), the control
+    root is OUT_ROOT/smoke_14/runs_ctl, the smoke main run is built by ``python -m lsne.cli run --stage D --smoke --families
+    F01A`` (reused when an ok one with F01A rows of this runtime's versions exists); a main run that is not reproducible
+    and another platform are only reported; notebook 13's default roots never see smoke_14."""
+    import os
 
     nb = _ctl_nb(regenerated)
-    out = tmp_path / "LSNE"
-    main = _fake_main_run(out / "runs" / "D" / CTL_TAG, model="EleutherAI/pythia-160m")
-    ctl_dir = out / "runs_ctl" / "D" / CTL_TAG
-    ctl_dir.mkdir(parents=True)
-    ctl, dmg = _fake_control_tables()
-    bank_sha = hashlib.sha256(b"depth bank").hexdigest()
+    out, mydrive = tmp_path / "LSNE", tmp_path / "MyDrive"
+    _fake_main_run(out / "runs" / "D" / CTL_TAG)                         # the real main run: never used by the smoke test
+    real_main = _snapshot(out / "runs")
+    calls: list = []
 
-    def write(ctl, dmg, timestamp: str, sha: str = bank_sha) -> None:
-        # the control run of this main run: its path, its timestamp and the SHA-256 of its bank (REUSE checks all three)
-        ctl.to_csv(ctl_dir / "damage_ctl.csv", index=False)
-        dmg.to_csv(main / "damage.csv", index=False)
-        write_manifest(ctl_dir, stage="D", status="ok", control="token_language", amendment="6.11", timestamp=timestamp,
-                       main_run=dict(path=str(main.resolve()), timestamp=read_manifest(main)["timestamp"]),
-                       bank=dict(file="directions_depth.npz", sha256=sha),
-                       audit={"max": 1e-7, "n_over_1e-4": 0, "valid": True},
-                       limits=dict(is_smoke=False, limited=False), n_variants=8, n_excluded=0,
-                       tables=dict(damage_ctl=len(ctl)))
+    def stub(ns):
+        def run_cli(name, args, module="lsne.cli"):          # builds the smoke main run as the CLI would
+            calls.append((name, [str(a) for a in args]))
+            assert args[args.index("--out") + 1] == str(out / "smoke_14" / "runs")
+            _fake_main_run(out / "smoke_14" / "runs" / "D" / CTL_SMOKE_TAG, model="EleutherAI/pythia-14m")
+            return 0
+        return run_cli
 
-    def run_all(reuse: bool = True) -> dict:
-        ns = _ctl_namespace(out)
-        _exec_cell(nb, "# --- Konfiguration", ns, subst={'MYDRIVE = "/content/drive/MyDrive"':
-                                                       f"MYDRIVE = {str(tmp_path / 'MyDrive')!r}",
-                                                       "REUSE = False": f"REUSE = {reuse}"})
-        for marker in ("# --- Hilfsfunktionen", "# --- 1. Hauptlauf und Umgebung", "# --- 2. Kontrolllauf",
-                       "# --- 3. Kurze Prüfung", "# --- Zusammenfassung"):
-            _exec_cell(nb, marker, ns)
-        return ns
+    ns = _ctl_cells(nb, out, mydrive, cells=CTL_CELLS[:3], smoke=True, stub=stub,
+                    **{"MAIN_D_RUN = None": f"MAIN_D_RUN = {str(out / 'runs' / 'D' / CTL_TAG)!r}"})
+    smoke = out / "smoke_14"
+    assert ns["SMOKE_ROOT"] == str(smoke) and ns["MAIN_D_RUN"] == str(smoke / "runs" / "D" / CTL_SMOKE_TAG)
+    assert ns["RUNS_CTL"] == str(smoke / "runs_ctl") and ns["CTL_DIR"] == smoke / "runs_ctl" / "D" / CTL_SMOKE_TAG
+    assert ns["CLI_ARGS"][-3:] == ["--smoke", "--families", "F01A"] and "nimmt nicht MAIN_D_RUN" in capsys.readouterr().out
+    assert len(calls) == 1 and calls[0][1] == ["run", "--stage", "D", "--model", "EleutherAI/pythia-14m", "--revision",
+                                               "step98000", "--dtype", "float32", "--device", "auto", "--smoke",
+                                               "--families", "F01A", "--out", str(smoke / "runs")]
+    assert ns["RESULT"]["smoke_main"]["status"] == "gerechnet"
+    # a second start reuses the smoke main run; one of another torch version is removed and built again
+    ns = _ctl_cells(nb, out, mydrive, cells=CTL_CELLS[:3], smoke=True, stub=stub)
+    assert len(calls) == 1 and ns["RESULT"]["smoke_main"]["status"] == "wiederverwendet"
+    _fake_main_run(smoke / "runs" / "D" / CTL_SMOKE_TAG, model="EleutherAI/pythia-14m", torch_version="2.11.0+cu130")
+    ns = _ctl_cells(nb, out, mydrive, cells=CTL_CELLS[:3], smoke=True, stub=stub)
+    assert len(calls) == 2 and ns["RESULT"]["smoke_main"]["status"] == "gerechnet"
+    assert "Alter Rauch-Hauptlauf entfernt (andere Torch- oder transformers-Version)" in capsys.readouterr().out
 
-    write(ctl, dmg, "2026-10-28T12:00:00+00:00")
+    # a smoke main run that is not reproducible and a runtime without GPU: reported, no stop
+    _fake_gpu(monkeypatch, None)
+    dmg = _fake_main_damage()
+    dmg.loc[(dmg["tag"] == "F01A:K8:C1") & (dmg["inject"] == "depth") & (dmg["direction"] == "lang_dom"),
+            "logp_target_ref"] += 1e-7
+    _fake_main_run(smoke / "runs" / "D" / CTL_SMOKE_TAG, model="EleutherAI/pythia-14m", damage=dmg)
+    capsys.readouterr()
+    ns = _ctl_cells(nb, out, mydrive, cells=CTL_CELLS[:3], smoke=True, stub=stub)
+    text = capsys.readouterr().out
+    assert ns["DETERMINISM"]["reproducible"] is False and ns["COMPUTE"] is True and len(calls) == 2
+    assert "Rauchtest: Plattform und Reproduzierbarkeit werden nur berichtet" in text and "NICHT reproduzierbar" in text
+    assert not (out / "runs_ctl").exists() and _snapshot(out / "runs") == real_main
+
+    # notebook 13's default roots (outside Colab: the run roots below OUT_ROOT) never reach smoke_14
+    from lsne import prereg_eval as PE
+
+    ns13 = {"__name__": "__main__", "os": os, "OUT_ROOT": str(out), "RUNS_ROOT": str(out / "runs")}
+    _exec_cell(_prereg_nb(regenerated), "# --- Konfiguration: Laufwurzeln", ns13,
+               subst={'MYDRIVE = "/content/drive/MyDrive"': f"MYDRIVE = {str(mydrive)!r}"})
+    assert ns13["RUN_ROOTS"] == [str(out / "runs")]
+    roots, _ = PE.resolve_roots(ns13["RUN_ROOTS"])
+    assert all("smoke_14" not in str(r) for r in roots)
+
+
+def test_token_control_notebook_platform_stop(regenerated, tmp_path, monkeypatch, capsys):
+    """Another torch / transformers version than the main run (an A100 faked) or no A100 stops notebook 14 before any CLI
+    call with the remedy (an A100 with the main run's versions, the pip commands built from its manifest, restart);
+    ALLOW_PLATFORM_MISMATCH = True runs on with warnings and passes --d-allow-platform-mismatch to the pre-flight and the
+    run.  A finished control run that is only checked never stops."""
+    import torch
+    import transformers
+
+    nb = _ctl_nb(regenerated)
+    out, mydrive = tmp_path / "LSNE", tmp_path / "MyDrive"
+    main = _fake_main_run(out / "runs" / "D" / CTL_TAG, torch_version="2.11.0+cu130", transformers_version="4.57.1")
+    upto_check = CTL_CELLS[:3]
+
+    # no GPU at all, or another GPU than an A100: the GPU is a mismatch too
+    for gpu, shown in ((None, "GPU keine statt A100"), ("Tesla T4", "GPU Tesla T4 statt A100")):
+        _fake_gpu(monkeypatch, gpu)
+        with pytest.raises(RuntimeError, match=shown) as e:
+            _ctl_cells(nb, out, mydrive, cells=upto_check)
+        assert type(e.value).__name__ == "ControlStop"
+    _fake_gpu(monkeypatch)
+    ns = None
+    with pytest.raises(RuntimeError) as e:
+        ns = _ctl_cells(nb, out, mydrive, cells=upto_check)
+    msg = str(e.value)
+    assert type(e.value).__name__ == "ControlStop" and ns is None
+    for s in (f"Torch {torch.__version__} statt 2.11.0+cu130", f"transformers {transformers.__version__} statt 4.57.1",
+              "|Δλ| ≤ 1e-3 bei ε 0,01", "bitgleiches λ", "fast sicher ungültig", "A100-Laufzeit",
+              "`pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130`",
+              "`pip install transformers==4.57.1`", "Laufzeit neu starten", "alle Zellen erneut ausführen",
+              "ALLOW_PLATFORM_MISMATCH = True"):
+        assert s in msg, s
+    assert "statt A100" not in msg                                     # the A100 is no mismatch
+    assert not (out / "runs_ctl").exists()
+    text = capsys.readouterr().out
+    assert "Plattform (diese Laufzeit | Hauptlauf):" in text and "2.11.0+cu130" in text and "ABWEICHEND" in text
+
+    # ALLOW_PLATFORM_MISMATCH = True: warnings, and the flag reaches the pre-flight and the run
+    calls: list = []
+    ns = _ctl_cells(nb, out, mydrive, stub=_cli_stub(calls),
+                    **{"ALLOW_PLATFORM_MISMATCH = False": "ALLOW_PLATFORM_MISMATCH = True"})
+    text = capsys.readouterr().out
+    assert f"WARNUNG: Torch {torch.__version__} statt 2.11.0+cu130" in text and "--d-allow-platform-mismatch" in ns["CLI_COMMAND"]
+    assert ns["CLI_ARGS"][-1] == "--d-allow-platform-mismatch" and [c[0] for c in calls] == [
+        "14_token_control_pythia-160m_step98000_preflight", "14_token_control_pythia-160m_step98000"]
+    assert all("--d-allow-platform-mismatch" in a for _, a in calls)
+    s = json.loads((out / f"summary_{CTL_NB}_pythia-160m_step98000_float32.json").read_text(encoding="utf-8"))
+    assert s["allow_platform_mismatch"] is True and len(s["platform"]["mismatch"]) == 2 and s["preflight"]["exact"] is True
+    assert s["control_valid"] is True and s["run"]["status"] == "gerechnet"
+
+    # a finished control run of this main run is only checked: no stop on the platform, no CLI call
+    calls.clear()
+    ns = _ctl_cells(nb, out, mydrive, stub=_cli_stub(calls))
+    assert ns["REUSE_RUN"] is True and calls == [] and ns["RESULT"]["run"]["status"] == "wiederverwendet (nur geprüft)"
+    assert "Nur geprüft: Plattform und Reproduzierbarkeit dienen hier nur der Information." in capsys.readouterr().out
+    assert main.exists()
+
+
+def test_token_control_notebook_determinism_check(regenerated, tmp_path, monkeypatch, capsys):
+    """The same-shape determinism of the main run from its own damage table (no GPU): logp_target_ref is the same in
+    every full-size forward of a variant (both injections) and in the short last forwards of the same size; the short
+    forward may differ from the full-size ones.  One perturbed reference stops a run that computes (German message: a
+    dated amendment of 6.11 (b) is needed, do not run the control), unless ALLOW_PLATFORM_MISMATCH; not checkable when the
+    rows cannot be assigned to forwards."""
+    _fake_gpu(monkeypatch)
+    nb = _ctl_nb(regenerated)
+    out, mydrive = tmp_path / "LSNE", tmp_path / "MyDrive"
+    main = out / "runs" / "D" / CTL_TAG
+    upto_check = CTL_CELLS[:3]
+
+    # spread 0 (and a short forward that differs from the full-size ones): reproducible, no stop
+    _fake_main_run(main)
+    ns = _ctl_cells(nb, out, mydrive, cells=upto_check)
+    d = ns["DETERMINISM"]
+    assert d["status"] == "reproduzierbar" and d["reproducible"] is True and d["n_nonzero"] == 0
+    assert (d["n_variants"], d["injections"], d["batch"], d["n_pairs_max"], d["forwards_max"]) == \
+        (8, ["depth", "dossier"], 5, 9, 3)
+    assert d["full_per_injection"] == dict(n_groups=16, n_nonzero=0, max_spread=0.0)
+    assert d["full_per_variant"] == dict(n_groups=8, n_nonzero=0, max_spread=0.0)
+    assert d["short_same_size"] == dict(n_groups=8, n_nonzero=0, max_spread=0.0) and d["short_rows"] == [2]
+    assert d["short_vs_full"]["n_nonzero"] == 8 and d["short_vs_full"]["max_abs_diff"] == pytest.approx(0.25)
+    assert "bei gleicher Form bitgleich reproduzierbar" in capsys.readouterr().out
+    # the same from the parquet file
+    (main / "damage.csv").rename(main / "damage.csv.bak")
+    _fake_main_damage().to_parquet(main / "damage.parquet", index=False)
+    assert ns["determinism_check"](str(main), ns["MAIN_MANIFEST"])["reproducible"] is True
+    (main / "damage.parquet").unlink()
+    (main / "damage.csv.bak").rename(main / "damage.csv")
+
+    def perturbed(where) -> None:
+        dmg = _fake_main_damage()
+        dmg.loc[where(dmg), "logp_target_ref"] += 1e-7
+        _fake_main_run(main, damage=dmg)
+
+    # one full-size forward of one injection perturbed (its second forward: pairs 4-7 in the manifest order): stop
+    # before any CLI call
+    perturbed(lambda x: (x["tag"] == "F01A:K8:C1") & (x["inject"] == "depth")
+              & (((x["direction"] == "lang_dom") & (x["eps"] > 0.01)) | ((x["direction"] == "rand_00") & (x["eps"] < 0.5))))
+    with pytest.raises(RuntimeError) as e:
+        _ctl_cells(nb, out, mydrive, cells=upto_check)
+    msg = str(e.value)
+    assert type(e.value).__name__ == "ControlStop" and not (out / "runs_ctl").exists()
+    for s in ("nicht bitgleich reproduzierbar", "Forwards gleicher Größe", "kein neuer Lauf Nachtrag 6.11 (b) erfüllen",
+              "Den Kontrolllauf nicht rechnen", "datierter Nachtrag zu 6.11 (b)"):
+        assert s in msg, s
+    text = capsys.readouterr().out
+    assert "NICHT reproduzierbar bei gleicher Form" in text and "> 0 in 1 von 16" in text
+    # only the short last forward of one injection perturbed (same size as the other injection's): stop too
+    perturbed(lambda x: (x["tag"] == "F01B:K2:C1") & (x["inject"] == "dossier") & (x["direction"] == "rand_00")
+              & (x["eps"] == 0.5))
+    with pytest.raises(RuntimeError, match="nicht bitgleich reproduzierbar"):
+        _ctl_cells(nb, out, mydrive, cells=upto_check)
+    ns = _ctl_cells(nb, out, mydrive, cells=upto_check, **{"ALLOW_PLATFORM_MISMATCH = False": "ALLOW_PLATFORM_MISMATCH = True"})
+    assert ns["DETERMINISM"]["short_same_size"]["n_nonzero"] == 1 and ns["DETERMINISM"]["full_per_variant"]["n_nonzero"] == 0
+    assert "WARNUNG: Der Hauptlauf war auf seiner GPU" in capsys.readouterr().out
+    assert "--d-allow-platform-mismatch" not in ns["CLI_ARGS"]          # no platform mismatch here
+
+    # rows that cannot be assigned to forwards (a dose outside the manifest): not checkable, a warning only
+    dmg = _fake_main_damage()
+    dmg.loc[0, "eps"] = 0.3
+    _fake_main_run(main, damage=dmg)
+    ns = _ctl_cells(nb, out, mydrive, cells=upto_check)
+    assert ns["DETERMINISM"]["reproducible"] is None and "außerhalb des Manifests" in ns["DETERMINISM"]["reason"]
+    assert "WARNUNG: Reproduzierbarkeit des Hauptlaufs nicht prüfbar" in capsys.readouterr().out
+
+
+def test_token_control_notebook_preflight(regenerated, tmp_path, monkeypatch, capsys):
+    """The live pre-flight (CLI stubbed): the same command with --families F01A --limit-variants 2 into a fresh local temp
+    root (never below OUT_ROOT, removed afterwards); bit-identical lambda at u9 / C1 (K 0 and 8) passes and the run
+    follows; a main depth lambda perturbed by 1e-6 stops before the control run (German message), unless
+    ALLOW_PLATFORM_MISMATCH."""
+    import os
+
+    _fake_gpu(monkeypatch)
+    nb = _ctl_nb(regenerated)
+    out, mydrive = tmp_path / "LSNE", tmp_path / "MyDrive"
+    main = _fake_main_run(out / "runs" / "D" / CTL_TAG)
     before = _snapshot(out / "runs")
-    ns = run_all()
+    calls: list = []
+    ns = _ctl_cells(nb, out, mydrive, cells=CTL_CELLS[:5], stub=_cli_stub(calls))
+    pf = ns["RESULT"]["preflight"]
+    assert pf["status"] == "bitgleich" and pf["exact"] is True and pf["n_rows"] == 2 * 9 and pf["max_abs_dlam"] == 0.0
+    assert pf["ks"] == [0, 8] and [r["rows"] for r in pf["per_dose"]] == [6, 6, 6] and pf["root_removed"] is True
+    name, args = calls[0]
+    assert name.endswith("_preflight") and args[-4:] == ["--families", "F01A", "--limit-variants", "2"]
+    root = args[args.index("--out") + 1]
+    assert root == pf["root"] and os.path.basename(root).startswith("lsne_preflight_") and not os.path.exists(root)
+    assert str(out) not in root and args[args.index("--d-main-run") + 1] == str(main)
+    assert [a for a in args if a not in ("--families", "F01A", "--limit-variants", "2")] == \
+        [root if a == str(out / "runs_ctl") else a for a in ns["CLI_ARGS"]]
+    text = capsys.readouterr().out
+    assert "-> bitgleich" in text and "Temporärer Ordner entfernt" in text
+    # the run followed: the control run of the whole design, checked by the audits of notebook 13
+    assert calls[1][0] == "14_token_control_pythia-160m_step98000" and ns["RESULT"]["run"]["status"] == "gerechnet"
+    _exec_cell(nb, "# --- 3. Audits", ns)
+    assert ns["RESULT"]["control_valid"] is True
+    assert _snapshot(out / "runs") == before
+
+    # a main depth lambda perturbed by 1e-6: not bit-identical -> stop, no control run
+    dmg = _fake_main_damage()
+    dmg.loc[(dmg["tag"] == "F01A:K8:C1") & (dmg["inject"] == "depth") & (dmg["direction"] == "lang_dom")
+            & (dmg["eps"] == 0.01), "lam"] += 1e-6
+    _fake_main_run(main, damage=dmg)
+    calls.clear()
+    with pytest.raises(RuntimeError) as e:
+        _ctl_cells(nb, out, mydrive, cells=CTL_CELLS[:5], stub=_cli_stub(calls), **{"REUSE = True ": "REUSE = False "})
+    msg = str(e.value)
+    assert type(e.value).__name__ == "ControlStop" and len(calls) == 1 and calls[0][0].endswith("_preflight")
+    for s in ("nicht bitgleich", "nicht Bit für Bit", "6.11 (b)", "sehr wahrscheinlich verfehlen", "A100-Laufzeit",
+              "ALLOW_PLATFORM_MISMATCH = True"):
+        assert s in msg, s
+    text = capsys.readouterr().out
+    assert "nicht bitgleich 1" in text and "-> NICHT bitgleich" in text and "max |Δλ| = 1.000e-06" in text
+    assert not os.path.exists(calls[0][1][calls[0][1].index("--out") + 1])
+    # ALLOW_PLATFORM_MISMATCH = True: a warning, and the control run is computed anyway
+    calls.clear()
+    ns = _ctl_cells(nb, out, mydrive, cells=CTL_CELLS[:5], stub=_cli_stub(calls),
+                    **{"REUSE = True ": "REUSE = False ", "ALLOW_PLATFORM_MISMATCH = False": "ALLOW_PLATFORM_MISMATCH = True"})
+    assert len(calls) == 2 and ns["RESULT"]["preflight"]["exact"] is False
+    assert "WARNUNG: Die Vorabprüfung reproduziert den Hauptlauf nicht bitgleich" in capsys.readouterr().out
+
+
+def test_token_control_notebook_check_and_summary(regenerated, tmp_path, monkeypatch, capsys):
+    """Notebook 14 with the defaults (pythia-160m, REUSE = True) on a finished synthetic control run of the whole design,
+    in this process: it is only checked (no CLI, no GPU, no pre-flight), section 3 prints exactly the verdicts of
+    ``lsne.prereg_eval.control_audits_for`` (all four pass: valid), the summary carries the platform comparison, the
+    determinism check, the audits, control_valid, the evaluation-code hashes and the bank hash; a wrong language mark, a
+    replication beyond 1e-3 and a run older than amendment 6.11 fail exactly those audits ("ACHTUNG, Kontrolllauf
+    ungültig").  A narrowed run, REUSE = False and a control run of another main run are recomputed (overwritten);
+    nothing below RUNS_ROOT changes."""
+    import hashlib
+
+    from lsne import prereg_eval as PE
+
+    nb = _ctl_nb(regenerated)
+    out, mydrive = tmp_path / "LSNE", tmp_path / "MyDrive"
+    main = _fake_main_run(out / "runs" / "D" / CTL_TAG)
+    ctl_dir = _write_ctl_run(out / "runs_ctl" / "D" / CTL_TAG, main)
+    before = _snapshot(out / "runs")
+    manifest_bytes = (ctl_dir / "manifest.json").read_bytes()
+
+    def printed_audits(text: str) -> list:
+        rows = PE.control_audits_for(main, ctl_dir, model="EleutherAI/pythia-160m", revision="step98000")
+        for a in rows:
+            assert f"  {a['id']:<17s} {AUDIT_DE[a['verdict']]} ({a['verdict']})" in text, a["id"]
+        return rows
+
+    ns = _ctl_cells(nb, out, mydrive)
     text = capsys.readouterr().out
     assert "übersprungen" not in text, text
-    assert ns["REUSE_RUN"] is True and ns["RESULT"]["run"]["status"] == "reused" and ns["CLI_LOG"] == []
+    assert ns["REUSE_RUN"] is True and ns["COMPUTE"] is False and ns["CLI_LOG"] == []
+    assert ns["RESULT"]["run"]["status"] == "wiederverwendet (nur geprüft)" and ns["RESULT"]["preflight"]["exact"] is None
+    assert "Vorabprüfung entfällt" in text and "Kontrolllauf wiederverwendet (nur geprüft)" in text
+    rows = printed_audits(text)
+    assert [a["verdict"] for a in rows] == ["supported"] * 4 and PE.control_valid(rows)
+    assert "Kontrolllauf gültig: alle vier Audits bestanden (dieselben Regeln und derselbe Code wie Notebook 13)" in text
+    assert "ACHTUNG" not in text and "Kein Rauchtest: der Hauptlauf wird nur gelesen" in text
+    assert not any(ln.startswith("Rauchtest:") for ln in text.splitlines())
     chk = ns["RESULT"]["checks"]
-    rows = {(r["inject"], r["K"], r["C"]): r for r in chk["rows"]}
-    assert set(rows) == {("u9", 0, "C1"), ("u9", 8, "C1"), ("u9", 8, "C2"), ("u9", 2, "u9D"), ("u10", 0, "C1"), ("u10", 8, "C1")}
-    assert all((r["rows"], r["variants"], r["families"], r["lam_finite"]) == (8, 2, 1, 8) for r in rows.values())
-    rep = chk["replication"]
-    assert rep["ok"] and rep["n_rows"] == 16 and (rep["n_missing"], rep["n_position_mismatch"], rep["n_nan_mismatch"]) == (0, 0, 0)
-    assert rep["max_abs_dlam"] == pytest.approx(2e-4)
-    assert chk["site"] == dict(token=0, lang=0, unit=0, gap=0) and chk["site_ok"] and chk["audit_valid"]
-    assert chk["marks_ok"] and chk["newer_than_amendment"] and not chk["smoke"]
-    assert "ACHTUNG" not in text and "-> ok" in text and "Weiter mit Notebook 13" in text and "Nächster Schritt: Notebook 13" in text
+    assert {(r["inject"], r["K"], r["C"]) for r in chk["rows"]} == \
+        {(site, k, c) for site, cells in PE.CTL_DESIGN.items() for k, c in cells}
+    assert chk["replication"]["exact"] and chk["replication"]["n_rows"] == 2 * 4 * 9
     s = json.loads((out / f"summary_{CTL_NB}_pythia-160m_step98000_float32.json").read_text(encoding="utf-8"))
-    assert s["run"]["status"] == "reused" and s["checks"]["replication"]["ok"] and s["main_run"]["path"] == str(main)
-    assert s["manifest"]["control"] == "token_language" and s["control"] == "token_language" and s["amendment"] == "6.11"
-    assert s["run_dir"] == str(ctl_dir) and s["next_step"].startswith("Notebook 13") and "--d-control token_language" in s["cli_command"]
+    assert s["run"]["status"] == "wiederverwendet (nur geprüft)" and s["reuse"] is True and s["allow_platform_mismatch"] is False
+    assert [(a["id"], a["verdict"]) for a in s["audits"]] == [(a["id"], a["verdict"]) for a in rows] and s["control_valid"] is True
+    assert s["main_run"]["bank_sha256"] == hashlib.sha256(b"depth bank").hexdigest() and s["main_run"]["path"] == str(main)
+    assert s["eval_code"] == dict(prereg_eval_sha256=PE.PREREG_EVAL_SHA256, control_run=PE.PREREG_EVAL_SHA256, same=True)
+    assert s["manifest"]["eval_code_sha256"] == PE.PREREG_EVAL_SHA256 and s["manifest"]["platform_mismatch"] == []
+    assert [p["item"] for p in s["platform"]["rows"]] == ["GPU", "Torch", "transformers"]
+    assert s["determinism"]["status"] == "reproduzierbar" and s["preflight"]["status"] == "nicht nötig (nur geprüft)"
+    assert s["run_dir"] == str(ctl_dir) and s["next_step"].startswith("Drive leeren")
+    assert "--d-control token_language" in s["cli_command"]
     assert _snapshot(out / "runs") == before and not list(out.glob("runs/**/summary_*"))
+    assert (ctl_dir / "manifest.json").read_bytes() == manifest_bytes
+    assert "Kein eingebundenes Google Drive" in text
 
-    # a wrong language mark, a replication beyond 1e-3 and a run older than the amendment are found and reported
-    bad_ctl, bad_dmg = ctl.copy(), dmg.copy()
+    # a wrong language mark, a replication beyond 1e-3 and a run older than the amendment: the audits of notebook 13 fail
+    bad_ctl, bad_dmg = _fake_control_tables(), _fake_main_damage()
     assert (bad_ctl.loc[0, "inject"], bad_ctl.loc[0, "K"], bad_ctl.loc[0, "inject_lang"]) == ("u9", 0, "E")
     bad_ctl.loc[0, "inject_lang"] = "D"
     assert bad_dmg.loc[0, "inject"] == "depth"
     bad_dmg.loc[0, "lam"] += 5e-3
-    write(bad_ctl, bad_dmg, "2026-10-28T08:00:00+00:00")
-    before = _snapshot(out / "runs")
-    ns = run_all()
+    _fake_main_run(main, damage=bad_dmg)
+    _write_ctl_run(ctl_dir, main, bad_ctl, timestamp="2026-10-28T08:00:00+00:00")
+    ns = _ctl_cells(nb, out, mydrive)
     text = capsys.readouterr().out
-    chk = ns["RESULT"]["checks"]
-    assert not chk["replication"]["ok"] and chk["replication"]["max_abs_dlam"] == pytest.approx(5.2e-3)
-    assert chk["site"] == dict(token=0, lang=1, unit=0, gap=0) and not chk["site_ok"]
-    assert not chk["newer_than_amendment"] and not chk["marks_ok"]
-    assert "ACHTUNG, nicht bestanden: Reproduktion, Stellenprüfungen, Manifest-Marken." in text
-    assert "NICHT ok" in text and "NICHT nach dem Commit von Nachtrag 6.11" in text
-    assert _snapshot(out / "runs") == before
+    rows = printed_audits(text)
+    assert [a["verdict"] for a in rows] == ["supported", "not_supported", "not_supported", "not_supported"]
+    assert ns["RESULT"]["control_valid"] is False and ns["RESULT"]["checks"]["replication"]["max_abs_dlam"] == pytest.approx(5e-3)
+    assert "ACHTUNG, Kontrolllauf ungültig: audit.D1ctl.rep, audit.D1ctl.site, audit.D1ctl.run nicht bestanden." in text
 
-    # REUSE = False: the finished run is recomputed (and overwritten), which needs a GPU; so is, with REUSE = True, a
-    # control run of an earlier main run at the same path (another bank) or of another main run
-    if not torch.cuda.is_available():
-        with pytest.raises(RuntimeError, match="Keine GPU"):
-            run_all(reuse=False)
-        assert "wird neu gerechnet und überschrieben (REUSE = False)" in capsys.readouterr().out
-        for stale in (dict(sha="0" * 64), dict()):
-            write(ctl, dmg, "2026-10-28T12:00:00+00:00", **stale)
-            if not stale:                                   # the main run was recomputed after the control run
-                _fake_main_run(main, model="EleutherAI/pythia-160m", timestamp="2026-10-28T13:00:00+00:00")
-            with pytest.raises(RuntimeError, match="Keine GPU"):
-                run_all(reuse=True)
-            assert "gehört zu einem früheren oder anderen Hauptlauf" in capsys.readouterr().out
+    # a narrowed run of this main run is never kept; REUSE = False recomputes; so does a control run of another main run
+    _fake_main_run(main)
+    _fake_gpu(monkeypatch)
+    for kw, subst, why in ((dict(design_filters=["limit_variants"]), {},
+                            "er ist eingeschränkt (design_filters ['limit_variants'])"),
+                           ({}, {"REUSE = True ": "REUSE = False "}, "(REUSE = False)"),
+                           (dict(bank_sha="0" * 64), {}, "gehört zu einem früheren oder anderen Hauptlauf")):
+        _write_ctl_run(ctl_dir, main, **kw)
+        ns = _ctl_cells(nb, out, mydrive, cells=CTL_CELLS[:3], **subst)
+        text = capsys.readouterr().out
+        assert ns["REUSE_RUN"] is False and ns["COMPUTE"] is True
+        assert "wird neu gerechnet und überschrieben" in text and why in text, text
 
 
 # --------------------------------------------------------------------------------------
@@ -1099,78 +1576,122 @@ def test_trace_notebook_runs_headless_in_smoke_mode(regenerated, tmp_path, monke
 
 
 @pytest.mark.slow
-def test_token_control_notebook_runs_headless_in_smoke_mode(regenerated, tmp_path, monkeypatch, mb):
-    """Execute notebook 14 with SMOKE = True through nbclient against a main stage-D run built here
-    with pythia-14m on F01A (depth bank, damage table of the C1 variants, ok manifest): the control
-    runs through ``python -m lsne.cli`` in a subprocess, its manifest carries the control marks, the
-    pre-registered site replicates the main run, the site checks pass, the summary goes to OUT_ROOT
-    and nothing below RUNS_ROOT changes."""
+def test_token_control_notebook_runs_headless_in_smoke_mode(regenerated, tmp_path, monkeypatch):
+    """Execute notebook 14 with SMOKE = True through nbclient, self-contained: it builds its own smoke main run (pythia-14m,
+    F01A) by the command line below OUT_ROOT/smoke_14, checks that run's same-shape determinism, runs the pre-flight into
+    a local temp root (bit-identical lambda at u9 / C1), the control run through ``python -m lsne.cli`` and prints the
+    four audits of notebook 13 (write audit and replication pass; .site and .run fail by design in a smoke run).  A second
+    execution with the default REUSE makes no CLI call and leaves the smoke folder byte-identical.  Then notebook 13 on
+    the smoke roots (given explicitly) reports the invalid control run (ACHTUNG lines) and, on a second run, the archive of
+    its first report.  Nothing is written to OUT_ROOT/runs or OUT_ROOT/runs_ctl."""
+    import os
+
+    import pandas as pd
+
     nbclient = pytest.importorskip("nbclient")
     pytest.importorskip("ipykernel")
-    from dataclasses import asdict, replace
-
     from nbclient.exceptions import CellExecutionError, CellTimeoutError
 
-    from lsne import stimuli
-    from lsne.config import RunConfig
-    from lsne.experiments import common as C
-    from lsne.experiments import stage_d_noneq as SD
-    from lsne.io import RunDir, read_manifest, save_df, write_manifest
+    from lsne import prereg_eval as PE
+    from lsne.io import read_manifest
 
-    lattice, doses, batch = ["ent", "lang_dom", "rand_00", "rand_01"], [0.01, 0.1], 5
     out_root = tmp_path / "lsne_out"
-    main = RunDir(out_root / "runs", "D", mb.spec).path
-    vs = stimuli.build_variants(next(f for f in stimuli.load_families() if f.tag == "F01A"), mb.tokenizer)
-    with monkeypatch.context() as mp:
-        mp.setenv("LSNE_OFFLINE", "1")
-        bank = C.direction_bank(RunConfig(model=mb.spec, families=["F01"], n_random_dirs=2, seed=0), mb, vs[:4],
-                                C.depth_site(mb), limits=C.Limits.smoke(progress=False))
-    C.save_bank(bank, main, name="directions_depth")
-    dmg, _ = SD.damage_tables(mb, [v for v in vs if v.C == "C1"], bank, lattice, doses, enabled=False, batch_size=batch)
-    save_df(dmg, main, "damage")
-    write_manifest(main, stage="D", status="ok", cfg=RunConfig(model=mb.spec), model=mb.spec,
-                   limits=asdict(replace(C.Limits.smoke(), damage_batch_size=batch)), lattice_directions=lattice, doses=doses)
-    before = _snapshot(out_root / "runs")
-
-    nb = _ctl_nb(regenerated)
-    for c in nb.cells:
-        if c.cell_type == "code" and "SMOKE = False" in c.source:
-            c.source = c.source.replace("SMOKE = False", "SMOKE = True")
-    monkeypatch.setenv("LSNE_RUNS", str(out_root))
+    monkeypatch.setenv("LSNE_RUNS", str(out_root))                 # drive_root() outside Colab
     monkeypatch.setenv("LSNE_CACHE", str(REPO / "cache"))
     monkeypatch.delenv("LSNE_REPO_DIR", raising=False)
-    client = nbclient.NotebookClient(nb, timeout=1800, kernel_name="python3", allow_errors=False,
-                                     resources={"metadata": {"path": str(REPO)}})
-    started = False
-    try:
-        with client.setup_kernel():
-            started = True
-            client.reset_execution_trackers()
-            for i, cell in enumerate(nb.cells):
-                client.execute_cell(cell, i)
-    except (CellExecutionError, CellTimeoutError) as e:
-        pytest.fail(f"{CTL_NB}: {e}")
-    except Exception as e:  # noqa: BLE001 - no kernel on this machine
-        if not started:
-            pytest.skip(f"no Jupyter kernel could be started: {e!r}")
-        raise
 
-    text = "\n".join(_cell_text(c) for c in nb.cells if c.cell_type == "code")
+    def execute(nb, subst: dict) -> str:
+        for old, new in subst.items():
+            hits = [c for c in nb.cells if c.cell_type == "code" and old in c.source]
+            assert len(hits) == 1, old
+            hits[0].source = hits[0].source.replace(old, new)
+        client = nbclient.NotebookClient(nb, timeout=1800, kernel_name="python3", allow_errors=False,
+                                         resources={"metadata": {"path": str(REPO)}})
+        started = False
+        try:
+            with client.setup_kernel():
+                started = True
+                client.reset_execution_trackers()
+                for i, cell in enumerate(nb.cells):
+                    client.execute_cell(cell, i)
+        except (CellExecutionError, CellTimeoutError) as e:
+            pytest.fail(f"{nb.metadata['colab']['name']}: {e}")
+        except Exception as e:  # noqa: BLE001 - no kernel on this machine
+            if not started:
+                pytest.skip(f"no Jupyter kernel could be started: {e!r}")
+            raise
+        return "\n".join(_cell_text(c) for c in nb.cells if c.cell_type == "code")
+
+    smoke = out_root / "smoke_14"
+    main, rd = smoke / "runs" / "D" / CTL_SMOKE_TAG, smoke / "runs_ctl" / "D" / CTL_SMOKE_TAG
+    summary_path = out_root / f"summary_{CTL_NB}_pythia-14m_step98000_float32.json"
+
+    # 1. the self-contained smoke flow
+    text = execute(_ctl_nb(regenerated), {"SMOKE = False": "SMOKE = True"})
     assert "übersprungen (siehe Traceback)" not in text, text[-4000:]
-    assert "Vorhandener Checkout" in text and "Hauptlauf ok:" in text and "Weiter mit Notebook 13" in text
-    # a smoke run fails only its manifest marks (it never counts as the control run of PREREGISTRATION 6.11)
-    assert "ACHTUNG, nicht bestanden: Manifest-Marken (Rauchlauf)." in text, text[-4000:]
-    rd = out_root / "runs_ctl" / "D" / main.name
+    for s in ("Vorhandener Checkout", "Rauch-Hauptlauf gerechnet:", "Hauptlauf ok:", "bei gleicher Form bitgleich reproduzierbar",
+              "-> bitgleich", "Temporärer Ordner entfernt", "Kontrolllauf gerechnet:", "audit.D1ctl.rep   bestanden (supported)",
+              "ACHTUNG, Kontrolllauf ungültig: audit.D1ctl.site, audit.D1ctl.run nicht bestanden.",
+              "Rauchtest: audit.D1ctl.site und audit.D1ctl.run scheitern hier absichtlich", "Rauchtest: Notebook 13 sieht ihn",
+              "Kein eingebundenes Google Drive"):
+        assert s in text, (s, text[-4000:])
     m = read_manifest(rd)
     assert m["status"] == "ok" and m["control"] == "token_language" and m["amendment"] == "6.11"
-    assert m["main_run"]["path"] == str(main.resolve()) and m["limits"]["is_smoke"] is True
-    assert (rd / "damage_ctl.csv").exists() and not (rd / "_resume").exists()
-    s = json.loads(next(out_root.glob(f"summary_{CTL_NB}_*.json")).read_text(encoding="utf-8"))
-    assert s["smoke"] is True and s["run"]["status"] == "ok" and s["run"]["rc"] == 0
-    chk = s["checks"]
-    assert chk["replication"]["ok"] and chk["replication"]["n_rows"] > 0, chk["replication"]
-    assert chk["site_ok"] and chk["audit_valid"] and chk["smoke"] is True and chk["marks_ok"] is False   # a smoke run never counts
-    assert {(r["inject"], r["K"], r["C"]) for r in chk["rows"]} >= {("u9", 0, "C1"), ("u10", 0, "C1")}
-    assert list((out_root / "runs_ctl" / "logs").glob(f"{CTL_NB}_*.log"))
-    assert s["cli_commands"] and "--d-control token_language" in s["cli_commands"][0] and "--smoke" in s["cli_commands"][0]
-    assert _snapshot(out_root / "runs") == before
+    assert m["main_run"]["path"] == str(main.resolve()) and m["limits"]["is_smoke"] is True and m["platform_mismatch"] == []
+    assert m["eval_code_sha256"] == PE.PREREG_EVAL_SHA256 and (rd / "damage_ctl.csv").exists() and not (rd / "_resume").exists()
+    assert read_manifest(main)["status"] == "ok"
+    s = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert s["smoke"] is True and s["smoke_root"] == str(smoke) and s["smoke_main"]["status"] == "gerechnet"
+    assert s["run"]["status"] == "gerechnet" and s["run"]["rc"] == 0 and s["determinism"]["reproducible"] is True
+    pf = s["preflight"]
+    assert pf["status"] == "bitgleich" and pf["exact"] is True and pf["n_rows"] > 0 and pf["max_abs_dlam"] == 0.0
+    assert pf["ks"] == [0, 8] and pf["root_removed"] is True and not os.path.exists(pf["root"])
+    assert not str(pf["root"]).startswith(str(out_root))
+    audits = [(a["id"], a["verdict"]) for a in s["audits"]]
+    assert audits == [("audit.D1ctl", "supported"), ("audit.D1ctl.rep", "supported"), ("audit.D1ctl.site", "not_supported"),
+                      ("audit.D1ctl.run", "not_supported")]
+    assert audits == [(a["id"], a["verdict"]) for a in PE.control_audits_for(main, rd, model="EleutherAI/pythia-14m",
+                                                                             revision="step98000")]
+    assert s["control_valid"] is False and s["eval_code"]["same"] is True and s["main_run"]["bank_sha256"]
+    cmds = s["cli_commands"]
+    assert len(cmds) == 3 and "--smoke --families F01A --out" in cmds[0] and "--d-control" not in cmds[0]
+    assert "--d-control token_language" in cmds[1] and cmds[1].endswith("--smoke --families F01A --limit-variants 2")
+    assert "--d-control token_language" in cmds[2] and cmds[2].endswith("--smoke --families F01A")
+    logs = sorted(p.name for p in (smoke / "runs_ctl" / "logs").glob("*.log"))
+    assert logs == [f"{CTL_NB}_pythia-14m_step98000.log", f"{CTL_NB}_pythia-14m_step98000_preflight.log",
+                    f"{CTL_NB}_smoke_main_pythia-14m_step98000.log"]
+    assert not (out_root / "runs").exists() and not (out_root / "runs_ctl").exists()
+
+    # 2. a second execution with the default REUSE: nothing is computed, nothing changes
+    before = _snapshot(smoke)
+    text = execute(_ctl_nb(regenerated), {"SMOKE = False": "SMOKE = True"})
+    assert "übersprungen (siehe Traceback)" not in text, text[-4000:]
+    s = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert s["cli_commands"] == [] and s["run"]["status"] == "wiederverwendet (nur geprüft)"
+    assert s["smoke_main"]["status"] == "wiederverwendet" and s["preflight"]["status"] == "nicht nötig (nur geprüft)"
+    assert [(a["id"], a["verdict"]) for a in s["audits"]] == audits and "Vorabprüfung entfällt" in text
+    assert _snapshot(smoke) == before
+
+    # 3. notebook 13 on the smoke roots (explicit roots; its default roots never see smoke_14), twice
+    nb13 = {'RUN_ROOTS_TEXT = ""': f"RUN_ROOTS_TEXT = {str(smoke / 'runs') + ',' + str(smoke / 'runs_ctl')!r}",
+            'MODEL_TAG = "pythia-160m"': 'MODEL_TAG = "pythia-14m"', "N_BOOT = 10000": "N_BOOT = 200"}
+    text = execute(_prereg_nb(regenerated), dict(nb13))
+    assert "übersprungen" not in text, text[-4000:]
+    achtung = [ln for ln in text.splitlines() if ln.startswith("ACHTUNG: Kontrolllauf ungültig – ")]
+    assert [ln.split(":")[1].split("–")[1].strip() for ln in achtung] == ["audit.D1ctl.site", "audit.D1ctl.run"], achtung
+    assert "Code der Auswertung: Git" in text and "Keine frühere Auswertung" in text
+    res_dir = out_root / "prereg_eval" / CTL_SMOKE_TAG
+    df = pd.read_csv(res_dir / "prereg_results.csv").set_index("id")
+    assert df.loc["audit.D1ctl.rep", "verdict"] == "supported" and df.loc["audit.D1ctl.run", "verdict"] == "not_supported"
+    ctl_rows = df[df["role"] == "primary_control"]
+    assert len(ctl_rows) and set(ctl_rows["verdict"]) == {"not_interpretable"}
+    text = execute(_prereg_nb(regenerated), dict(nb13))
+    arch = [ln for ln in text.splitlines() if ln.startswith("Frühere Auswertung archiviert nach: ")]
+    assert len(arch) == 1, text[-4000:]
+    arch_dir = Path(arch[0].split(": ", 1)[1])
+    assert arch_dir.parent == res_dir / "archive" and (arch_dir / "prereg_results.md").exists()
+    s13 = json.loads((out_root / f"summary_{PREREG_NB}_pythia-14m_step98000.json").read_text(encoding="utf-8"))
+    assert s13["archive"] == str(arch_dir) and s13["control_valid"] is False
+    assert s13["prereg_eval_sha256"] == PE.PREREG_EVAL_SHA256 and s13["git_sha"] == PE.code_version()["git_sha"]
+    # notebook 13's Drive cell creates RUNS_ROOT (empty); the smoke test still wrote nothing to runs or runs_ctl
+    assert not any((out_root / "runs").iterdir()) and not (out_root / "runs_ctl").exists()

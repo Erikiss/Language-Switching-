@@ -700,7 +700,8 @@ Das stört den Sweep nicht: Stufe F wird nie geöffnet.
    `N_BOOT = 10000`, `FROZEN_DOSE = None` (es gibt keine auf DEV eingefrorene Dosis).
 3. Die Ausgabe `MyDrive/LSNE/prereg_eval/pythia-160m@step98000/` danach z. B. in `….run1`
    umbenennen oder kopieren, damit eine spätere Auswertung nach den Neuläufen sie nicht
-   überschreibt.
+   überschreibt. (Seit dem 28.10.2026 nicht mehr nötig: Notebook 13 verschiebt eine frühere
+   Auswertung vor dem Schreiben selbst nach `archive/<Zeitstempel>/`, `docs/RUNBOOK_COLAB.md` §11.)
 
 Was Notebook 13 aus Lauf 1 liefern kann:
 

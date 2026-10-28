@@ -279,24 +279,46 @@ clause.
 ```
 python -m lsne.cli run --stage D --d-control token_language \
     --d-main-run <LSNE>/runs/D/pythia-160m@step98000 --out <LSNE>/runs_ctl \
-    --model EleutherAI/pythia-160m --revision step98000 --dtype float32
+    --model EleutherAI/pythia-160m --revision step98000 --dtype float32 [--d-allow-platform-mismatch]
 ```
 
 `stage_d_noneq.run` dispatches to `stage_d_control.run` when `kw["d_control"]` is set (only
 `"token_language"` is valid); the run directory is the usual `<out>/D/<model>@<revision>`, so the
 control lives under its own root `runs_ctl` and never in the main run's `runs/D/…`.
 
-* **Guards** (`ControlRunError`, raised before anything is written; the CLI checks them before it
-  loads the model): the run directory is the main run's (also through a link), lies inside it, or
-  holds a stage-D run without `control == "token_language"` (any status) or a `directions_depth.npz`
-  (an interrupted main run); the root (`--out`) is a `runs` folder (a main-run root, of either
-  account), lies inside the main run's root or holds the main run; the main run directory has no ok
-  stage-D manifest, is itself a control run, has another model name / revision / dtype, or lacks
-  `directions_depth.npz` / `directions_depth_meta.json`; no control variant is selected (no test
-  formulation among `cfg.families`, or none left after the filters). A failed (not a refused) control
-  run leaves an error manifest with the control marks, so a restart resumes it.
+* **Guards** (`ControlRunError`, raised before anything is written into the run directory). *Before
+  the model is loaded* the CLI refuses (`lsne.cli.check_d_control`, SystemExit `[lsne] …`; the guards of
+  `stage_d_control` as `control run refused: …`): `--d-control` without `--d-main-run` or the reverse,
+  `--d-allow-platform-mismatch` without them, any stage list other than `D`; a run directory that is
+  the main run's (also through a link), lies inside it, or holds a stage-D run without
+  `control == "token_language"` (any status) or a `directions_depth.npz` (an interrupted main run); a
+  root (`--out`) that is a `runs` folder (a main-run root, of either account; by its name or by the name
+  it resolves to, so a link to a `runs` folder or `runs/x/..` counts), lies inside the main run's root
+  or holds the main run; a main run directory without an ok stage-D manifest, that is itself a control
+  run, has another model name / revision / dtype, or lacks `lattice_directions` / `doses` /
+  `limits.damage_batch_size` or `directions_depth.npz` / `directions_depth_meta.json`; a selection
+  without a test formulation (`check_formulations`: none of F01–F12 × {A, B} among `cfg.families`);
+  and torch or transformers versions other than the main run's (the platform guard below). *After the
+  model is loaded*, still before anything is written, `run` refuses the two cases that need the model or
+  its tokenizer: a depth bank at another site than this model's depth site, and a selection whose
+  variants all drop out (K / C levels, section-4 exclusions). The CLI creates the control run's
+  directory only when the run writes into it, removes it when a refusal leaves it empty
+  (`remove_empty_run_dir`) and records a refusal after the load in its run report in `--out`. A failed
+  (not a refused) control run leaves an error manifest with the control marks, so a restart resumes it.
+* **Platform guard** (`check_platform`, `platform_mismatches`). At ε 0.01 the replication audit 6.11 (b)
+  (|Δλ| ≤ 1e-3 at `u9` / C1) asks in practice for bit-identical λ: another attention kernel alone
+  (eager vs sdpa) moved λ by up to 1.8e-2 on pythia-160m (25 of 32 rows above 1e-3), and round-off-level
+  input changes move it by up to ~5e-3; on an identical platform the replication is bit-exact (CPU,
+  against a main run computed there with the main run's code `76a4a5a`: 2 448 rows, max |Δλ| 0.0). So
+  the run refuses a `torch.__version__` / `transformers.__version__` other than the main manifest's
+  `torch_version` / `transformers_version` (a field the main manifest lacks compares nothing). The GPU
+  is not compared here, because the main manifest records none; notebook 14 compares it (main run of
+  run 1: torch 2.11.0+cu130, transformers 5.20.2, by an earlier out-of-memory message an A100 40 GB).
+  `--d-allow-platform-mismatch`
+  (`kw['d_allow_platform_mismatch']`) runs anyway and records the differences in the manifest
+  (`platform_mismatch`); such a run will most likely fail `audit.D1ctl.rep`.
 * **Inputs from the main run**, never refitted: its manifest's `lattice_directions` and `doses`
-  (order kept; run 1: `lang_dom`, `ent`, `rand_00`…`rand_31` × 0.01, 0.05, 0.1, 0.2, 0.5, 1.0) and
+  (order kept; run 1: `ent`, `lang_dom`, `rand_00`…`rand_31` × 0.01, 0.05, 0.1, 0.2, 0.5, 1.0) and
   `limits.damage_batch_size` (64), and its depth bank `directions_depth.npz`, loaded with the vectors
   exactly as stored (`load_main_bank`, no re-normalisation). Every (variant, site) runs all (direction,
   dose) pairs in stage D's order and chunks, so λ at the pre-registered site replicates the main run.
@@ -331,26 +353,72 @@ stage D's own injections (`dossier`, `depth`) are unchanged.
 | `damage_ctl_contrasts` | descriptive: `stage_d_noneq.damage_contrasts` at `u9` and at `u10`, concatenated (not used by the evaluation; `position_deviation` there only means C ≠ C1) |
 
 Manifest (`finish_stage(run_dir, "D", …)`): `control = "token_language"`, `amendment = "6.11"`,
-`main_run` (`path, git_sha, timestamp, model, revision`), `bank` (`file, sha256, names`),
-`lattice_directions`, `doses`, `damage_batch_size`, `sites` (the site rules), `cells` (per site the
-(K, C) cells run), `u9D_unit_mask`, `n_variants`, `n_formulations`, `design_filters` ([] for the
-whole design), `n_excluded`, `audit` (`audit_summary` of `damage_ctl`) and `replication_platform`
-(torch / CUDA / device next to the main run's torch and OS, `main_torch` / `main_platform`; this run's
-OS is the manifest's own `platform`: the replication is exact on the main run's platform, while
-round-off of another build or GPU can move λ at the smallest dose beyond 1e-3). Resume: its own
-`_resume` in the control run directory with its own signature (stage `"D_ctl"`, version, variant
-tags, model, dtype, depth site, bank sha256, directions, doses, batch size, site rules, chunk size);
-the main run's `_resume` is never shared or wiped. Size of the
+`main_run` (`path, git_sha, timestamp, model, revision`), `bank` (`file, sha256, names`; `sha256` is
+the main run's `directions_depth.npz`, for run 1 `d9f05cd6…a120be`, recorded before the control run in
+`docs/RESULTS_PREREG.md` §9), `lattice_directions`, `doses`, `damage_batch_size`, `sites` (the site
+rules), `cells` (per site the (K, C) cells run), `u9D_unit_mask`, `n_variants`, `n_formulations`,
+`design_filters` ([] for the whole design), `n_excluded`, `resumed_checkpoints`, `audit`
+(`audit_summary` of `damage_ctl`), `replication_platform` (`platform_info`: this run's `torch`, `cuda`
+build, `device`, `gpu` and `transformers` next to the main run's `main_torch`, `main_transformers` and
+OS `main_platform`; this run's OS is the manifest's own `platform`; the main manifest records no GPU),
+`platform_mismatch` (the differences of `check_platform` the run was computed despite with
+`--d-allow-platform-mismatch`, [] when none) and `eval_code_sha256` (SHA-256 of `lsne/prereg_eval.py`
+when the run was made, `eval_code_sha256()`: the evaluation code is frozen once the control has run,
+and the evaluation compares it with its own `prereg_eval_sha256`). Resume: its own `_resume` in the
+control run directory with its own signature (stage `"D_ctl"`, version, variant tags, model, dtype,
+depth site, bank sha256, directions, doses, batch size, site rules, chunk size, the platform of
+`run_platform` — torch, CUDA build, device type, GPU, transformers, attention implementation — and the
+git sha of the code): checkpoints of another platform or code version are discarded and the run starts
+over instead of mixing chunks; the main run's `_resume` is never shared or wiped. Size of the
 full run: 24 formulations × 11 variants = 264 variants, 360 (variant, site) pairs × 204 (direction,
 dose) pairs = 73 440 rows of `damage_ctl`, ≈ 1 440 batched forwards of 64 rows, about a sixth of D1 in
 the main run (estimate, not measured).
 
-Notebook 14 (`14_token_control`, A100) runs this command in a subprocess against the main run of
-account A (`MyDrive/LSNE/runs/D/…`; the `LSNE_B` shortcut only when account A has none), stops with a
-German message when the main run is missing or not ok, when there is no GPU or when another run sits in
-the control directory, never writes below `MyDrive/LSNE/runs`, and prints a descriptive check (rows per
-site / K / C, replication against the main run's `depth` rows, site checks, write audit, manifest
-marks). The verdicts are made by `lsne.prereg_eval` (notebook 13).
+Notebook 14 (`14_token_control`, A100) runs this command in a subprocess (the kernel never loads the
+model, so a reused runtime runs the current checkout) against the main run of account A
+(`MyDrive/LSNE/runs/D/…`; the `LSNE_B` shortcut only when account A has none; `MAIN_D_RUN` overrides),
+with its own root `<OUT_ROOT>/runs_ctl`, and never writes below `MyDrive/LSNE/runs`. Defaults:
+`REUSE = True`, `ALLOW_PLATFORM_MISMATCH = False`, `SMOKE = False`. Cells after setup, Drive,
+configuration and helpers:
+
+1. *1a* (smoke test only) builds the smoke main run (below).
+2. *1b* stops "Run all" with a German message when the main run is missing, not ok, a control run, of
+   another model / revision / dtype, or without lattice / doses / batch size, depth bank or `damage`
+   table, and when another run sits in the control directory. A finished control run of this very main
+   run (same path, timestamp, bank SHA-256 and amendment 6.11) is only checked with `REUSE = True`
+   (whatever its audits; a narrowed one, `design_filters`, is recomputed outside the smoke test). When
+   the notebook computes, it also stops on another platform than the main run's (GPU name without
+   "A100", another torch or transformers; the message names an A100 runtime, the pip commands of the
+   main run's versions and a restart) and when the main run was not bitwise reproducible for identical
+   shapes: row 0 of every D1 forward is the unperturbed reference whose `logp_target_ref` is stored on
+   every row of that forward, and per (tag, inject) the (direction, dose) pairs ran in the manifest
+   order in forwards of `damage_batch_size − 1` perturbed rows plus the reference, so on a device that
+   is bitwise reproducible for identical shapes `logp_target_ref` is equal in every forward of the same
+   size of a variant, over both injections (`determinism_check`, five columns of `damage`, no GPU; the
+   full-size forwards and the short last ones; the short-vs-full difference is reported only). Any
+   spread above 0 means that no new run can meet 6.11 (b): a dated amendment of 6.11 (b) is needed
+   before any control run. Rows that cannot be assigned to forwards ("nicht prüfbar") only warn.
+3. *2a pre-flight* (only when computing, also in the smoke test): the same command with
+   `--families F01A --limit-variants 2` (smoke: `--limit-variants 2`) into a fresh local temp root
+   (`tempfile`, never on Drive or below `OUT_ROOT`, removed afterwards); λ at `u9` / C1 (K 0 and 8)
+   must equal the main run's `depth` rows exactly (same `inject_pos`; a NaN counts as unequal), else it
+   stops; a failed CLI call always stops.
+4. *2b* the control run (log under `runs_ctl/logs/`, as the pre-flight's); stops when it fails or is
+   refused.
+5. *3* rows per site / K / C and max |Δλ| per dose at `u9` / C1 (descriptive), then the four validity
+   audits exactly as notebook 13 computes them (`lsne.prereg_eval.control_audits_for`) and
+   `control_valid`.
+6. The summary json (platform, determinism, pre-flight, run, audits, `control_valid`, bank SHA-256,
+   `eval_code_sha256` against this checkout's `PREREG_EVAL_SHA256`), then a Drive flush
+   (`drive.flush_and_unmount()`); notebook 13 follows in a new session.
+
+`ALLOW_PLATFORM_MISMATCH = True` turns the platform, determinism and pre-flight stops into warnings and
+passes `--d-allow-platform-mismatch` to the pre-flight and the run. `SMOKE = True` is self-contained:
+cell 1a builds its own smoke main run of stage D (pythia-14m, F01A, `--smoke`) by the command line below
+`<OUT_ROOT>/smoke_14/runs` (an ok one with F01A rows and this runtime's torch and transformers is
+reused), the control root is `<OUT_ROOT>/smoke_14/runs_ctl` (notebook 13's default roots never see it),
+platform and determinism are only reported, and `audit.D1ctl.site` / `.run` fail by design. The
+verdicts are made by `lsne.prereg_eval` (notebook 13).
 
 ---
 
@@ -361,18 +429,26 @@ GPU stage is re-run; CPU is enough):
 
 ```
 python -m lsne.prereg_eval --runs /content/drive/MyDrive/LSNE/runs \
-    [--runs /content/drive/MyDrive/LSNE/runs_ctl] [--runs /content/drive/MyDrive/LSNE_B/runs] --out DIR \
+    [--runs /content/drive/MyDrive/LSNE/runs_trace] [--runs /content/drive/MyDrive/LSNE/runs_ctl] \
+    [--runs /content/drive/MyDrive/LSNE_B/runs ...] --out DIR \
     [--n-boot 10000] [--seed 0] [--model pythia-160m] [--revision step98000] [--frozen-dose EPS]
 ```
 
-Every root is searched for `<stage>/<model>@<revision>/manifest.json` with `status: ok` (a
-parent folder contributes its `runs` / `runs_trace` / `runs_ctl`; with several ok runs of a stage the
-newest manifest wins; stage L is split into the stand-in run and the trace-source run by
-`manifest.source.kind`; stage D is split into the main run (key `D`) and the token-language control
-run (key `D_ctl`, `manifest.control == "token_language"`), so a control run never replaces the main
-run, and a control run with `design_filters` never one of the whole design; stage F and its sub-runs
-are never opened). Confirmation set F01–F12 ×
-{A, B}, statistic = mean of family means, family cluster bootstrap (`stat_level="cluster"`),
+(Notebook 13 passes every existing child `runs` / `runs_trace` / `runs_ctl` of `MyDrive/LSNE` and
+`MyDrive/LSNE_B` and prints its exact command.) Every root is searched for
+`<stage>/<model>@<revision>/manifest.json` with `status: ok` (a parent folder contributes its `runs` /
+`runs_trace` / `runs_ctl`; with several ok runs of a key a full run wins over a smoke / limited one,
+then the newest manifest, `select_runs`; stage L is split into the stand-in run and the trace-source
+run by `manifest.source.kind`; stage D is split into the main run (key `D`) and the token-language
+control run (key `D_ctl`, `manifest.control == "token_language"`), so a control run never replaces the
+main run, and a control run with `design_filters` never one of the whole design; stage F and its
+sub-runs are never opened). Of several ok control runs the first in that order (`CTL_RUN_ORDER`: full
+before smoke / limited, whole design before narrowed, newest first) whose four validity audits pass is
+used (`select_control_run`; only the audits decide, never an outcome or estimate of `P.ctl`), so a newer
+invalid run, e.g. one computed later on another platform, never displaces a valid one; if none passes,
+`select_runs`' choice is evaluated and there is no valid control run. The runs table, the evaluation's
+notes (`prereg_meta.json → notes`, the report) and the `audit.D1ctl.run` note give the reason.
+Confirmation set F01–F12 × {A, B}, statistic = mean of family means, family cluster bootstrap (`stat_level="cluster"`),
 BH over the secondary group 1–6, 8 and 9 (when G0 passes), 10, 13 and 14 (one test per sub-row;
 the copied rows of 8, 9, 13, 14 take the table's `p_boot`, one-sided `p_boot / 2` on the H1 side
 where a direction is pre-registered; a table without `p_boot` — runs written before the column —
@@ -387,7 +463,7 @@ the point estimate.
 | `P` / `P@<eps>` | D `damage` | primary: depth injection, C1 only for K > 0, K = 0 reference; per family dlam(K) of `lang_dom`, the same for `rand` (mean over the directions present), DiD; components `P.lang.K*`, `P.did.K*`, `P.mono`; every pre-registered dose present (`P` = the DEV-frozen dose if one is recorded); deviation rows `P.dev.{C2,C3,seg}.*` (`not_interpretable`); gated by `P.ctl` of the same dose (below): without a valid control run at most `open` |
 | `P.ctl` / `P.ctl@<eps>` (+ `P.ctl1`, `P.ctl2`, `P.ctl3`, components) | D control run (key `D_ctl`) `damage_ctl` | PREREGISTRATION 6.11, role `primary_control`, outside the BH group (m stays 26). Same confirmation set, bootstrap and rules as P (interval rule with 0.05, DiD against `rand` at the same site, `primary_verdict(lang, did, "pass")` at K = 8, per pre-registered dose with P's suffix). `P.ctl1`: inject `u9`, C2 and C3 pooled in one family mean, K = 2 / 4 / 8 vs K = 0 at `u9`; `P.ctl2`: inject `u10`, C1 vs K = 0 at `u10`; components `P.ctl{1,2}.lang.K*`, `P.ctl{1,2}.did.K*`; `P.ctl3` (+ `.lang`, `.did`): `u9D` (K = 2) vs K = 0 at `u9`, reported only. `P.ctl`: the outcome "Wechsel" (`supported`: `P.ctl1` and `P.ctl2` supported), "lokal" (`not_supported`: dlam(lang_dom, K = 8) fails, `ci_high` < 0.05, in both) or "offen" (`open`); without a control run one row `P.ctl`, `not_tested` |
 | `audit.D1`, `audit.C` | D `damage`, C `grid` | max / quantiles of `audit_rel_err`, rows > 1e-4 (PREREGISTRATION §4; a failed D1 audit makes the primary rows `not_interpretable`) |
-| `audit.D1ctl`, `.rep`, `.site`, `.run` | D control run `damage_ctl` (+ D `damage`, the control manifest) | write audit of `damage_ctl` (rule of `audit.D1`); replication: every control row at `u9` with C1 (K 0/2/4/8) has a main-run row (inject `depth`, same tag, direction, eps) at the same `inject_pos` with \|λ_ctl − λ_main\| ≤ 1e-3 (estimate = the largest difference), and every `depth` row of the main run at C1 (K 0/2/4/8) in the confirmation set (the rows of P) has its control row, so a run narrowed by cfg filters does not count; sites: "." at every row, language E at `u10`, at K = 0 and at C2 / C3, D at `u9` with C1 (K > 0) and at `u9D`, unit 9 / 10, `site_gap` of the `u9` rows as at K = 0 and 1 at `u10`, no row outside the design, and every cell of the design (`u9`: K = 0, C1 / C2 / C3 at K 2/4/8, `u9D`; `u10`: K = 0, C1 at K 2/4/8) for every formulation of the confirmation set in the run (a variant excluded in `damage_ctl_checks` excused); run: manifest `control = "token_language"`, `amendment = "6.11"`, younger than the amendment commit, no smoke / limited run. A failed audit makes every `P.ctl*` row `not_interpretable` (the rule outcome stays in the note) and counts as no valid control run |
+| `audit.D1ctl`, `.rep`, `.site`, `.run` | D control run `damage_ctl` (+ D `damage`, `damage_ctl_checks`, the control manifest) | `control_audits(ctx)`, the one implementation of PREREGISTRATION 6.11 (a)–(d) (`CTL_AUDIT_IDS`; `control_valid` = all four supported; `token_control_rows` and `select_control_run` use it, and notebook 14 prints the same rows through `control_audits_for(main_dir, ctl_dir, model, revision)`, which reads both manifests as `discover_runs` does). **`audit.D1ctl`**: write audit of the whole `damage_ctl` (rule of `audit.D1`). **`.rep`**: every control row at `u9` with C1 (K 0/2/4/8) has a main-run row (inject `depth`, same tag, direction, eps) at the same `inject_pos` with \|λ_ctl − λ_main\| ≤ 1e-3 (a non-finite difference fails; estimate = the largest difference), and every `depth` row of the main run at C1 (K 0/2/4/8) in the confirmation set (the rows of P) has its control row, so a run narrowed by cfg filters does not count; `not_tested` without an ok main run. **`.site`**: every row lies in a cell of the design (no row outside it), is a standard variant (`kind`), injects at ".", has a finite λ and is the only row of its (tag, site, direction, eps) (no duplicates); language E at `u10`, at K = 0 and at C2 / C3, D at `u9` with C1 (K > 0) and at `u9D`; unit 9 / 10; `site_gap` of the `u9` rows as at K = 0 and 1 at `u10`; every cell of the design (`u9`: K = 0, C1 / C2 / C3 at K 2/4/8, `u9D`; `u10`: K = 0, C1 at K 2/4/8) for every formulation of the confirmation set in the run (a variant excluded in `damage_ctl_checks` excused); and every (tag, site) of the design in the confirmation set holds, with a finite λ, exactly the (direction, dose) pairs of the `u9` / K = 0 / C1 rows, so no control lacks a C level, a K, a dose, a direction or a formulation's `lang_dom` row and none is dropped silently by the finite filter of `token_control_rows` (estimate = rows breaking a rule + missing cells + incomplete (tag, site) pairs). **`.run`**: status ok, manifest `control = "token_language"`, `amendment = "6.11"`, younger than the amendment commit, no smoke / limited run; its note, never its verdict, adds the design filters, the run's time and git sha, whether the evaluation code is the one at control-run time (the manifest's `eval_code_sha256` against `PREREG_EVAL_SHA256`; a difference is a deviation from 6.11), the platform (`replication_platform`) and a `platform_mismatch` the run was computed despite, the main run named in the manifest next to the evaluation's, and why this control run was selected among several (`StageRun.selection`). A failed audit makes every `P.ctl*` row `not_interpretable` (the rule outcome stays in the note) and counts as no valid control run |
 | `S1`, `S2` | C `contrasts` | T(8, C1); paired T(8, C3) − T(8, C1) |
 | `S3.<pair>.L<layer>`, `S3x.nats.*` | C `attribution_contrasts` (+ `attribution`) | R_excess of class `delim` per pair and layer (one-sided, DESIGN 4.1); exploratory excess in nats |
 | `S4`, `S4.K*` | D `hysteresis` | `area_minus_null` of `lang_dom` (pooled core variants; by K as sensitivity) |
@@ -412,9 +488,19 @@ excludes the minimum effect, or a secondary without a minimum effect whose inter
 or misses BH), `gate_failed`, `not_interpretable`, `not_tested` (missing stage / table, with the
 reason). Roles: `primary`, `primary_component`, `primary_deviation`, `primary_control` (the `P.ctl*`
 rows of 6.11), `audit`, `secondary`, `sensitivity`, `exploratory`, `gate`, `conditional`, `copied`.
-Outputs: `prereg_results.csv` (`id, name, estimate, ci_low, ci_high, p_two_sided,
-p_one_sided, n_families, n_rows, rule, verdict, bh_q, deviation_note` + `role, stage, direction,
-bh_group, bh_q_endpoint, source, min_effect`; `min_effect` appended 27.10.2026), `prereg_results.md`, `prereg_runs.csv`, `prereg_meta.json`.
+Outputs (`write_outputs`, which returns their paths by key plus `archive`): `prereg_results.csv` (`id,
+name, estimate, ci_low, ci_high, p_two_sided, p_one_sided, n_families, n_rows, rule, verdict, bh_q,
+deviation_note` + `role, stage, direction, bh_group, bh_q_endpoint, source, min_effect`; `min_effect`
+appended 27.10.2026), `prereg_results.md` (header line "Code der Auswertung": git sha and SHA-256 of
+`prereg_eval.py`), `prereg_runs.csv`, `prereg_meta.json` (settings, BH grouping, notes, the code version
+of `code_version()` — `git_sha` and `prereg_eval_sha256` = `PREREG_EVAL_SHA256`, the SHA-256 of the
+module's source at import, which also covers uncommitted changes — and `previous_evaluation_archive`).
+The files of an earlier evaluation in `--out` are first moved to `archive/<stamp>/` (`archive_outputs`;
+stamp = the UTC timestamp of its `prereg_meta.json`, e.g. `2026-10-28T07-07-48Z` for the report of
+28.10.2026 07:07 UTC cited in `docs/RESULTS_PREREG.md`, else the newest mtime of its files; an existing
+folder is never reused: `<stamp>_2`, `<stamp>_3`, …), never overwritten. Notebook 13 prints, after the
+evaluation, one `ACHTUNG` line per control-run audit that fails, the choice among several control runs,
+the code version and the archive folder.
 
 ---
 
@@ -427,7 +513,8 @@ python -m lsne.cli run --stage all --model EleutherAI/pythia-160m --revision ste
 python -m lsne.cli run --stage all --model EleutherAI/pythia-14m --revision step98000 --device cpu \
     --families DEV01 --out /tmp/lsne_smoke --smoke        # CPU smoke run, A-L
 python -m lsne.cli run --stage D --d-control token_language --d-main-run runs/D/pythia-160m@step98000 \
-    --out runs_ctl --model EleutherAI/pythia-160m --revision step98000   # control run of PREREGISTRATION 6.11
+    --out runs_ctl --model EleutherAI/pythia-160m --revision step98000   # control run of PREREGISTRATION 6.11,
+                                                                         # valid only on the main run's platform
 ```
 
 `jobs/shards.yaml` gives the A100 plan (shards 1–3 run A–E and G–L; shard 7 runs stage K
