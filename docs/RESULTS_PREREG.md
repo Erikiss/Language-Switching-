@@ -7,17 +7,17 @@ datierten Nachträgen in Abschnitt 6, zuletzt 6.10 vom 28.10.2026.
 
 Quellen auf Drive (Konto A, `MyDrive/LSNE/prereg_eval/`):
 
-* `pythia-160m@step98000/`: Auswertung vom 28.10.2026, 04:55 UTC, nach dem Ende von Notebook 12 (Notebook 13
-  hatte 360 Minuten auf Notebook 12 gewartet). Ein zweiter Lauf um 06:42 UTC lief versehentlich mit dem
-  alten Code (Setup-Fehler, §9) und ist inhaltlich identisch.
+* `pythia-160m@step98000/`: maßgebliche Auswertung vom 28.10.2026, 07:07 UTC (Code `e0e7481`). Vorher:
+  04:55 UTC nach dem Ende von Notebook 12 (Notebook 13 hatte 360 Minuten auf Notebook 12 gewartet) und
+  06:42 UTC, versehentlich mit dem alten Code (Setup-Fehler, §9); beide mit den Regeln vor dem 28.10.
 * `pythia-160m@step99000/`: Auswertung vom 27.10.2026, 19:22 UTC. Bei 99k gibt es nur Stufe H.
 
-**Stand der Regeln.** Beide Berichte auf Drive entstanden vor zwei Festlegungen vom 28.10.2026:
+**Stand der Regeln.** Der Bericht von 07:07 UTC wendet die beiden Festlegungen vom 28.10.2026 an:
 Nachtrag 6.10 (Monotonie in K) und die Einordnung der Dosis 0,5 bei Endpunkt 14 als explorativ
-(PREREGISTRATION §1). Diese Datei wendet den aktuellen Code an. Die Schätzer und Intervalle sind dieselben;
-die Urteile des Primärendpunkts und die BH-q-Werte (jetzt m = 26 statt 28) wurden mit `lsne.prereg_eval`
-aus den Tabellen des Berichts neu berechnet. Ein erneuter Lauf von Notebook 13 bringt den Bericht auf Drive
-auf denselben Stand.
+(PREREGISTRATION §1). Gegenüber 04:55 UTC sind Schätzer und Intervalle unverändert; geändert haben sich die
+Urteile des Primärendpunkts, die BH-q-Werte (m = 26 statt 28) und die Rolle der Zeilen zu 14 bei ε 0,5;
+neu sind die Zeilen `S14abs`. Alle Zahlen dieser Datei stimmen mit dem Bericht überein (q-Werte bis auf
+Rundung identisch).
 
 Begriffe wie in `docs/RESULTS_RUN1.md`: **gestützt**, **nicht gestützt**, **offen**, **nicht getestet**,
 **nicht interpretierbar**, **Gate verfehlt**. Soweit nicht anders vermerkt, sind Intervalle
@@ -89,7 +89,8 @@ FVU = 0,198 (Grenze 0,4) und ist damit dort zertifiziert (Notebook 01 auf Konto 
 | 0,05 | 0,0993 [0,0736; 0,1248] | −0,0101 [−0,0293; 0,0079] | 0,1094 [0,0910; 0,1289] | 0,0915 / 0,0993 / 0,0993 | 0,258 | **offen** | gestützt |
 | 0,1 | 0,0941 [0,0690; 0,1184] | −0,0105 [−0,0296; 0,0077] | 0,1046 [0,0856; 0,1246] | 0,0882 / 0,0918 / 0,0941 | 0,236 | **offen** | gestützt |
 
-Die letzte Spalte zeigt die Regel vor Nachtrag 6.10. So weisen es die Berichte auf Drive noch aus.
+Die letzte Spalte zeigt die Regel vor Nachtrag 6.10, wie sie die Berichte von 04:55 und 06:42 UTC
+auswiesen.
 
 Zuwächse zwischen den K-Stufen (Δλ `lang_dom`):
 
@@ -293,5 +294,5 @@ anderen Endpunkte erscheinen bei 99k als „nicht getestet“, weil es dort nur 
   Setup-Zelle brachte den flachen Klon nicht auf den neuen Stand (`pull --ff-only` scheitert bei
   Tiefe 1, der Fehler wurde ignoriert), und schon geladene Module überdeckten den Code. Behoben in
   `1e346d8`: Die Zelle setzt den Zweig auf `FETCH_HEAD`, bricht bei Fehlern ab und lädt `lsne` neu.
-* Die Vorbehaltstexte zu 18 und 18T im Bericht auf Drive beschreiben noch das Design vor den Korrekturen;
-  im Code sind sie aktualisiert.
+* Die Vorbehaltstexte zu 18 und 18T beschrieben bis zum Bericht von 06:42 UTC das Design vor den
+  Korrekturen; seit dem Bericht von 07:07 UTC sind sie aktuell.
