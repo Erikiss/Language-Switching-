@@ -36,6 +36,9 @@ den Drive-Daten gelaufen. Alles unten Genannte ist deshalb vorläufig.
   `claude/language-switching-non-equilibrium-ejpz0q` (Basis `76a4a5a`) eingespielt und gepusht
   (§5.0).
 
+> **Stand 28.10.2026:** Die präregistrierte Auswertung nach den Neuläufen (Notebook 13, inklusive
+> Spurenmodell) steht in `docs/RESULTS_PREREG.md`. Diese Datei beschreibt Lauf 1.
+
 ## Kurzfassung
 
 * **Gültigkeit.** Der Anker ist verifiziert, 0 von 1 152 Varianten wurden ausgeschlossen. Die

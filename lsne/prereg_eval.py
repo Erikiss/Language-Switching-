@@ -181,13 +181,14 @@ CAVEATS: dict[str, str] = {
     "S16": "the protein_misfolding bucket is small (keyword-classified Pile sequences)",
     "S17": ("exceeds_all_controls compares |delta| magnitudes without intervals; no DEV/test split; steps_to_threshold "
             "has little dynamic range at the default learning rate"),
-    "S18": ("v_src is taken at one source layer while the transplant maps use the best-gap source layer per target "
-            "layer (layer-inconsistent direction / map pair); the cosine is in-sample; eps = 1.0 saturates f_D; the "
-            "sign test rests on few prompts"),
-    "S18T": ("review 2026-10-27 of the first A100 trace run: its trace LM came from a broken pipeline (serialisation "
-             "crashed, the hash split never ran, the vocabulary was built from 0 transactions, address OOV 0.967); a "
-             "trace_verdict written before the tightened rule (no lm_corpus_ok) is re-judged from the run's tables, "
-             "never copied; sharing / activity need an SAE"),
+    "S18": ("stand-in design of 2026-10-27: v_src at the source layer of each map (layer-consistent), dose "
+            "Limits.l_eps = 0.3, 12 prompts round-robin over the families; a stand-in run that predates this design is "
+            "rejected (read_standin); the cosine is in-sample"),
+    "S18T": ("counts only with a healthy trace-LM corpus (lm_corpus_ok) and a validated stand-in; the first A100 trace "
+             "run (2026-10-26) came from a broken pipeline (serialisation crashed, the hash split never ran, the "
+             "vocabulary was built from 0 transactions, address OOV 0.967); a trace_verdict written before the "
+             "tightened rule of 2026-10-27 (no lm_corpus_ok) is re-judged from the run's tables, never copied; "
+             "transplant dose TRACE_EPS = 1.0; sharing / activity need an SAE"),
 }
 
 
