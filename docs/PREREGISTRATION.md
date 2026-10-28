@@ -166,5 +166,54 @@ Zahlen in `docs/RESULTS_RUN1.md` §4.
     Festlegung erst nach Sichtung der Daten erfolgt und das Ergebnis nicht begünstigen soll.
     Umgesetzt in `lsne/prereg_eval.py` (`P.mono`, `PRIMARY_MONO_RULE`).
 
+11. **Primärendpunkt, Kontrolle der Sprache an der Injektionsstelle** (festgelegt am 28.10.2026,
+    nach Sichtung der Auswertung in `docs/RESULTS_PREREG.md` und vor dem Kontrolllauf). In C1 wird
+    bei K = 0 und bei K > 0 in dasselbe Token injiziert, den Punkt „.“ am Ende von Einheit 9. Bei
+    K > 0 schließt er aber einen deutschen Satzteil ab, und direkt danach folgt der letzte Wechsel
+    zurück ins Englische. Der Kontrast K > 0 gegen K = 0 kann deshalb statt des Sprachwechsels im
+    Text die Sprache unmittelbar an der Injektionsstelle messen. Die Kontrolle prüft das an Stellen,
+    an denen ebenfalls „.“ steht, die aber einen englischen Satzteil abschließen.
+    - **Lauf:** ein eigener, reduzierter D1-Lauf (Notebook 14) im eigenen Ordner
+      `runs_ctl/D/<Modell>@<Revision>/`; das Manifest trägt `control = "token_language"` und
+      `amendment = "6.11"`. Modell, Revision, FP32, Injektion am Block-Eingang von Layer 4,
+      Richtungen, Dosen und Batch-Aufteilung wie im Hauptlauf von Stufe D. Die Richtungen werden aus
+      dessen Bank `directions_depth.npz` geladen, nicht neu angepasst. Testfamilien F01–F12 × {A, B}.
+      λ wird wie in §2 über alle Positionen des gemeinsamen englischen Schlussabschnitts gefittet.
+      Vergleichsbasis ist jeweils K = 0 an derselben, über die Einheit definierten Stelle, im selben
+      Lauf berechnet.
+    - **Kontrolle 1 (entscheidet):** die vorhandenen C2- und C3-Varianten bei K = 2, 4 und 8,
+      injiziert am letzten Token von Einheit 9. Dort steht ebenfalls „.“, aber Einheit 9 ist DDE bzw.
+      DEE: Der Punkt schließt einen englischen Satzteil ab, und der letzte Wechsel liegt vor der
+      Stelle. Kontrast: Familienmittel über C2 und C3 gemeinsam minus K = 0.
+    - **Kontrolle 2 (entscheidet):** die C1-Varianten bei K = 2, 4 und 8, injiziert am letzten Token
+      von Einheit 10 („.“, immer englisch, ein Token vor dem Schlussabschnitt), gegen K = 0 an
+      derselben Stelle.
+    - **Kontrolle 3 (nur berichtet):** eine neue Variante, in der nur Einheit 9 deutsch ist
+      (Einheitenmaske EEEEEEEEDE bei C1, zwei Wechsel, Bezeichnung `u9D`), injiziert am letzten Token
+      von Einheit 9, gegen K = 0. Sie zeigt, ob eine einzige deutsche Einheit direkt vor der Stelle
+      schon genügt. Für sie gelten die Ausschlussregeln aus §4 (Ziel- und Tail-IDs wie bei K = 0).
+    - **Statistik:** wie §2 und Nachtrag 1: Familienmittel, Cluster-Bootstrap mit 10 000 Ziehungen,
+      jede Dosis 0,01 / 0,05 / 0,1 einzeln, Haupt-K = 8. Eine Kontrolle **zeigt den Effekt**, wenn bei
+      K = 8 die untere Grenze des 95-%-Intervalls von Δλ(`lang_dom`) ≥ 0,05 ist und das Intervall der
+      Differenz zu `rand` (Mittel der 32 Richtungen an derselben Stelle) über 0 liegt. Sie **schließt
+      ihn aus**, wenn die obere Grenze von Δλ(`lang_dom`) < 0,05 ist. Monotonie in K wird für die
+      Kontrollen nicht verlangt; K = 2 und 4 werden berichtet.
+    - **Ausgang je Dosis:** „Wechsel“, wenn Kontrolle 1 und 2 den Effekt zeigen; „lokal“, wenn beide
+      ihn ausschließen; sonst „offen“.
+    - **Folge für den Primärendpunkt** (dieselbe Dosis; die Kontrolle kann das Urteil nur schwächen):
+      Bei „lokal“ ist ein gestütztes oder offenes Ergebnis als Sprachwechseleffekt nicht
+      interpretierbar. Bei „offen“ oder ohne gültigen Kontrolllauf ist es höchstens „offen“. Bei
+      „Wechsel“ bleibt es unverändert. Das Ergebnis der Regel ohne Kontrolle bleibt in der Notiz.
+    - **Gültigkeit des Kontrolllaufs:** (a) Schreib-Audit wie §4; (b) Reproduktion: An der
+      präregistrierten Stelle (K = 0 und C1, letztes Token von Einheit 9) weicht λ höchstens um 1e-3
+      vom Hauptlauf ab, bei gleicher Position; (c) an jeder Stelle steht „.“; die Sprachmarke ist E
+      bei Kontrolle 1 und 2 sowie bei K = 0 und D bei C1 (K > 0, Einheit 9) sowie bei Kontrolle 3; bei
+      Kontrolle 1 und 3 ist der Abstand zum Schlussabschnitt gleich dem bei K = 0; (d) der Lauf ist
+      jünger als der Commit dieses Nachtrags und trägt die Manifest-Marken. Ist eine Bedingung
+      verletzt, gilt der Kontrolllauf als ungültig.
+    - Die Kontrollzeilen (`P.ctl…`) gehen nicht in die BH-Gruppe ein (m bleibt 26). Umsetzung in
+      `lsne/prereg_eval.py` (`P.ctl…`) und im Kontrolllauf von Stufe D
+      (`lsne/experiments/stage_d_control.py`, Notebook 14).
+
 Noch offene Entscheidungen (Listen in `docs/RESULTS_RUN1.md` §5.5 und `docs/RESULTS_PREREG.md` §8)
 werden, sobald getroffen, hier mit Datum ergänzt.
