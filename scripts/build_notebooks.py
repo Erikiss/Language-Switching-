@@ -5463,9 +5463,9 @@ def nb_14() -> list[tuple[str, str]]:
             ## 3. Kurze Prüfung
 
             Deskriptiv, mit denselben Regeln wie die Audits von Notebook 13: Zeilen je Stelle, K und C; λ an der
-            präregistrierten Stelle (`u9` bei K = 0 und C1) gegen die Zeilen `depth` des Hauptlaufs (gleiche Position,
-            |Δλ| ≤ 1e-3); die Stellenprüfungen; Schreib-Audit und Manifest-Marken. Effekte und Urteile berechnet
-            erst Notebook 13.
+            präregistrierten Stelle (`u9` bei K = 0 und C1) gegen die Zeilen `depth` des Hauptlaufs (gleiche
+            Position, Abweichung höchstens 1e-3); die Stellenprüfungen; Schreib-Audit und Manifest-Marken. Effekte
+            und Urteile berechnet erst Notebook 13.
             """
         ),
         _ctl_inspect_cell(),
