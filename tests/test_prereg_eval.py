@@ -169,6 +169,10 @@ def test_min_effect_and_secondary_rules():
     assert PE.table_p(dict(p_boot=0.04, mean=-0.2), 0)[0] == 0.04 and np.isnan(PE.table_p(dict(mean=0.2), 0)[0])
     assert PE.primary_verdict("pass", "pass", True) == "supported"
     assert PE.primary_verdict("pass", "pass", False) == "not_supported"
+    assert PE.primary_verdict("pass", "pass", "pass") == "supported"
+    assert PE.primary_verdict("pass", "pass", "open") == "open"           # rise in K neither shown nor refuted
+    assert PE.primary_verdict("pass", "pass", "fail") == "not_supported"   # a step in K with a CI below 0
+    assert PE.primary_verdict("open", "pass", "fail") == "not_supported"
     assert PE.primary_verdict("pass", "open", True) == "open"
     assert PE.primary_verdict("open", "fail", True) == "not_supported"
     assert PE.primary_verdict("pass", "nan", True) == "not_tested"
@@ -302,7 +306,8 @@ def test_primary_monotonicity_needs_increments_with_a_ci_above_zero(tmp_path):
     """PREREGISTRATION 6.10, reading (b): monotone point estimates are not enough; the rise
     from K = 0 to K = 2 and every later step needs a CI above 0.  Here dlam(K=2) is clearly
     positive and the point estimates rise by 0.002 per step, but the per-family steps scatter
-    around 0: the primary endpoint is not supported, and the note keeps reading (a)."""
+    around 0: monotonicity is neither shown nor refuted, so the primary endpoint is open
+    (section 2), and the note keeps reading (a)."""
     spread = (-0.12, 0.10, -0.06, 0.09, 0.0, 0.05, -0.08, 0.11, -0.03, 0.02, -0.09, 0.01)   # mean 0
     rows = []
     for i, fam in enumerate(TEST):
@@ -316,10 +321,10 @@ def test_primary_monotonicity_needs_increments_with_a_ci_above_zero(tmp_path):
     write_run(tmp_path, "D", {"damage": pd.DataFrame(rows)}, frozen_dose=0.05)
     df = PE.evaluate([tmp_path], n_boot=2000, seed=0)["results"].set_index("id")
     assert df.loc["P.lang.K8", "verdict"] == "supported" and df.loc["P.did.K8", "verdict"] == "supported"
-    assert df.loc["P.mono", "verdict"] == "not_supported" and df.loc["P.mono", "estimate"] == 0.0
+    assert df.loc["P.mono", "verdict"] == "open" and df.loc["P.mono", "estimate"] == 0.0
     assert "point estimates monotone (reading (a), not the rule): True" in df.loc["P.mono", "deviation_note"]
-    assert df.loc["P", "verdict"] == "not_supported"
-    assert "monotone False" in df.loc["P", "deviation_note"] and "point estimates monotone True" in df.loc["P", "deviation_note"]
+    assert df.loc["P", "verdict"] == "open"
+    assert "monotone open" in df.loc["P", "deviation_note"] and "point estimates monotone True" in df.loc["P", "deviation_note"]
     assert "6.10" in df.loc["P", "rule"]
 
 
@@ -430,9 +435,13 @@ def test_copied_secondaries_enter_the_bh_group(tmp_path):
     write_run(tmp_path / "new", "I", {"head_steering_boot": head_steering_boot_table(), "direction_domain_boot": dd})
     res = PE.evaluate([tmp_path / "new"], n_boot=500, seed=0)
     df = res["results"].set_index("id")
-    s14 = df.loc[[f"S14.lang_dom.eps{e}" for e in ("0.05", "0.1", "0.2")]]
+    s14 = df.loc[[f"S14.lang_dom.eps{e}" for e in ("0.05", "0.1")]]
     assert s14["bh_group"].all() and (s14["p_two_sided"] == 0.049).all()
     assert (s14["bh_q"] > 0.05).all() and (s14["verdict"] == "open").all()
+    # eps 0.2 is an exploratory steering dose (PREREGISTRATION 1): reported, outside the BH group
+    x14 = df.loc["S14.lang_dom.eps0.2"]
+    assert x14["role"] == "exploratory" and not x14["bh_group"] and "exploratory dose" in x14["deviation_note"]
+    assert "S14.lang_dom.eps0.2" not in set(res["bh"]["ids"])
     assert {"S1", "S2", "S6.sign+1.eps0.05", "S14.lang_dom.eps0.05", "S13.eps0.05"} <= set(res["bh"]["ids"])
     # 13: the pre-registered dose is a BH row judged by the interval (CI [0.02, 0.10]: minimum effect not
     # established -> open, like the table's positive_below_min); the other dose is a sensitivity row
@@ -443,7 +452,7 @@ def test_copied_secondaries_enter_the_bh_group(tmp_path):
     assert df.loc["S13.eps0.1", "role"] == "sensitivity" and not df.loc["S13.eps0.1", "bh_group"]
     # alone, the S14 rows would pass BH (q = 0.049): the group decides
     alone, info = PE.apply_bh(df.reset_index().loc[lambda x: x["id"].str.startswith("S14")])
-    assert info["m"] == 3 and (alone["verdict"] == "supported").all()
+    assert info["m"] == 2 and (alone.loc[alone["bh_group"].astype(bool), "verdict"] == "supported").all()
     # tables without p_boot: verdict capped at open, outside the BH group
     write_run(tmp_path / "old", "I", {"head_steering_boot": head_steering_boot_table(p_boot=None),
                                       "direction_domain_boot": dd.drop(columns=["verdict", "p_boot"]).assign(preregistered=True,
@@ -452,6 +461,22 @@ def test_copied_secondaries_enter_the_bh_group(tmp_path):
     for rid in ("S14.lang_dom.eps0.05", "S13.eps0.05", "S13.eps0.1"):
         assert df.loc[rid, "verdict"] == "open" and not df.loc[rid, "bh_group"] and PE.NO_P_NOTE in df.loc[rid, "deviation_note"]
     assert "min_effect_met (table, point estimate)" in df.loc["S13.eps0.05", "deviation_note"]
+
+
+def test_s14_absolute_norm_rows_are_a_sensitivity(tmp_path):
+    """14: the B_head_minus_residual_abs rows of stage I (residual arm at the head arm's absolute
+    written norm) are reported as S14abs sensitivity rows, never in the BH group."""
+    hb = pd.concat([head_steering_boot_table(doses=(0.1,)),
+                    pd.DataFrame([dict(quantity="B_head_minus_residual_abs", direction="lang_dom", eps=0.1,
+                                       dose_match="absolute", mean=0.0008, ci_low=-0.0013, ci_high=0.003, se=0.001,
+                                       n_clusters=12, n_rows=96, delta_norm_ratio=1.0, p_boot=0.49)])], ignore_index=True)
+    write_run(tmp_path, "I", {"head_steering_boot": hb})
+    res = PE.evaluate([tmp_path], n_boot=100)
+    df = res["results"].set_index("id")
+    row = df.loc["S14abs.lang_dom.eps0.1"]
+    assert row["role"] == "sensitivity" and not row["bh_group"] and row["verdict"] == "open"
+    assert "same absolute norm" in row["name"] and "S14abs.lang_dom.eps0.1" not in set(res["bh"]["ids"])
+    assert df.loc["S14.lang_dom.eps0.1", "bh_group"]
 
 
 def test_s10f_reads_the_dev_frozen_feature_table(tmp_path):

@@ -158,8 +158,10 @@ Zahlen in `docs/RESULTS_RUN1.md` §4.
 10. **Primärendpunkt, „monoton in K“** (festgelegt am 28.10.2026, nach Sichtung der Auswertung
     in `docs/RESULTS_PREREG.md`): Monotonie gilt als gezeigt, wenn das 95-%-Intervall von Δλ beim
     ersten K > 0 und das Intervall jedes Zuwachses Δλ(K_i) − Δλ(K_i−1) zwischen aufeinanderfolgenden
-    K (0 → 2 → 4 → 8) über 0 liegen. Steigende Punktschätzer allein genügen nicht; sie werden als
-    Sensitivität berichtet. Von drei erwogenen Lesarten (Punktschätzer steigend; Anstieg mit
+    K (0 → 2 → 4 → 8) über 0 liegen. Liegt eines dieser Intervalle unter 0, ist Monotonie widerlegt
+    (Primärendpunkt nicht gestützt); ist sie weder gezeigt noch widerlegt, ist der Primärendpunkt
+    „offen“, wie §2 es für unentschiedene Intervalle vorsieht (Festlegung ebenfalls 28.10.2026).
+    Steigende Punktschätzer allein genügen nicht; sie werden als Sensitivität berichtet. Von drei erwogenen Lesarten (Punktschätzer steigend; Anstieg mit
     Intervall belegt; kein belegter Abfall) ist das die strengste. Sie wurde gewählt, weil die
     Festlegung erst nach Sichtung der Daten erfolgt und das Ergebnis nicht begünstigen soll.
     Umgesetzt in `lsne/prereg_eval.py` (`P.mono`, `PRIMARY_MONO_RULE`).

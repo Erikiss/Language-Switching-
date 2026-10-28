@@ -41,8 +41,8 @@ Endpoints (``id`` column)
               stage D's ``damage_boot`` and ``common.min_effect_verdict``), the DiD CI excludes 0
               (positive) and the rise in K is shown (``P.mono``: dlam(K_1) and every increment
               dlam(K_i) - dlam(K_i-1) have a CI above 0; PREREGISTRATION 6.10, reading (b) of
-              28.10.2026; monotone point estimates are reported as reading (a)); "open" when the
-              interval neither establishes nor excludes the minimum effect.  Every
+              28.10.2026; a CI below 0 refutes it, otherwise it is open; monotone point estimates are
+              reported as reading (a)); "open" when a component is neither shown nor refuted.  Every
               pre-registered dose present is evaluated (``P@<eps>``); the main dose (``P``) is
               the DEV-frozen dose when one is recorded (``--frozen-dose`` or ``frozen_dose`` in
               the stage-D manifest).  C2 / C3 / seg rows are deviation rows
@@ -175,7 +175,8 @@ CAVEATS: dict[str, str] = {
             "not dose-matched to lang_dom; the verdict here follows the interval (ci_low >= 0.05); stage-I tables "
             "written before the CI rule (no verdict / p_boot column) judge min_effect_met by the point estimate and "
             "flag every eps as pre-registered, later ones flag one dose (contrast_13_eps) and use the interval"),
-    "S14": ("the head arm writes a much smaller absolute RMS than the residual arm, so the difference is mostly "
+    "S14": ("see the S14abs rows (same absolute norm) for the dose-matched comparison; "
+            "the head arm writes a much smaller absolute RMS than the residual arm, so the difference is mostly "
             "residual-arm damage; no Soll/Ist audit is stored for either arm; several direction x dose cells "
             "without a pre-specified primary cell"),
     "S15": ("lenient null (isotropic random bases, explained ~ k/d); 'layers' = the grid sites; the heads basis uses "
@@ -736,11 +737,12 @@ PRIMARY_RULE = ("supported iff the 95% CI of dlam(lang_dom, K=8, C1) lies at or 
                 "the interval decides, never the point estimate, as in damage_boot) AND the CI of DiD (lang_dom - rand) "
                 "> 0 AND monotone in K (the CI of dlam at the first K and of every increment between successive K lies "
                 "above 0; PREREGISTRATION 6.10); not_supported iff the dlam CI lies below 0.05, the DiD CI lies below 0 "
-                "or includes 0 below 0.05, or the rise in K is not shown; open otherwise (minimum effect neither "
-                "established nor excluded; PREREGISTRATION section 2)")
-PRIMARY_MONO_RULE = ("monotone in K (PREREGISTRATION 6.10, reading (b)): the 95% CI of dlam at the first K > 0 and of every "
-                     "increment dlam(K_i) - dlam(K_i-1) lies above 0; monotone point estimates (reading (a)) and the "
-                     "bootstrap P(monotone) are reported in the note")
+                "or includes 0 below 0.05, or a step in K has a CI below 0 (monotonicity refuted); open otherwise "
+                "(a component neither established nor excluded; PREREGISTRATION section 2)")
+PRIMARY_MONO_RULE = ("monotone in K (PREREGISTRATION 6.10, reading (b)): supported iff the 95% CI of dlam at the first K > 0 "
+                     "and of every increment dlam(K_i) - dlam(K_i-1) lies above 0; not_supported iff one of these CIs lies "
+                     "below 0; open otherwise; monotone point estimates (reading (a)) and the bootstrap P(monotone) are "
+                     "reported in the note")
 
 
 def _variant_lam(d: pd.DataFrame, fam: str) -> pd.DataFrame:
@@ -777,19 +779,22 @@ def _did_status(b: dict) -> str:
     return "open" if b["ci_low"] <= 0 <= b["ci_high"] and b["ci_high"] >= PRIMARY_MIN_EFFECT else "fail"
 
 
-def primary_verdict(lang_status: str, did_status: str, monotone: bool) -> str:
-    """Section 2: supported iff the lang_dom contrast and the DiD pass and the rise in K is
-    shown (``monotone``, PREREGISTRATION 6.10); open iff no component fails and one is open; not_tested
-    when the lang_dom contrast (or, with it passing, the rand contrast) is missing."""
+def primary_verdict(lang_status: str, did_status: str, mono_status) -> str:
+    """Section 2: supported iff the lang_dom contrast, the DiD and the rise in K pass
+    (``mono_status``: ``pass`` / ``open`` / ``fail``, PREREGISTRATION 6.10; a bool is read as
+    pass / fail); not_supported iff a component fails; open iff none fails and one is open;
+    not_tested when the lang_dom contrast (or, with it passing, the rand contrast) is missing."""
+    if isinstance(mono_status, (bool, np.bool_)):
+        mono_status = "pass" if mono_status else "fail"
     if lang_status == "nan":
         return "not_tested"
-    if lang_status == "fail" or did_status == "fail":
+    if "fail" in (lang_status, did_status, mono_status):
         return "not_supported"
     if did_status == "nan":
         return "not_tested"
-    if "open" in (lang_status, did_status):
+    if "open" in (lang_status, did_status, mono_status):
         return "open"
-    return "supported" if monotone else "not_supported"
+    return "supported"
 
 
 def _boot_fam(fam: pd.DataFrame, ctx: EvalContext, direction: int = 1) -> dict:
@@ -912,15 +917,22 @@ def _primary_dose(ctx: EvalContext, lang: pd.DataFrame, rand: pd.DataFrame, eps:
     if same and ctx.n_boot > 0:
         arr = np.vstack([np.zeros(len(bl[ks[0]]["boot"]))] + [bl[K]["boot"] for K in ks])
         p_mono = float(np.mean(np.all(np.diff(arr, axis=0) > 0, axis=0)))
-    inc_notes, inc_lows = [], [bl[ks[0]]["ci_low"]]
+    inc_notes, inc_lows, inc_highs = [], [bl[ks[0]]["ci_low"]], [bl[ks[0]]["ci_high"]]
     for k0, k1 in zip(ks[:-1], ks[1:]):
         m = fls[k1].merge(fls[k0], on="family", suffixes=("_1", "_0"))
         inc = pd.DataFrame({"family": m["family"], "value": m["value_1"] - m["value_0"], "n_rows": m["n_rows_1"]})
         b = _boot_fam(inc, ctx, 1)
         inc_lows.append(b["ci_low"])
+        inc_highs.append(b["ci_high"])
         inc_notes.append(f"K{k0}->K{k1} {_g(b['estimate'])} [{_g(b['ci_low'])}, {_g(b['ci_high'])}]")
     # reading (b) of PREREGISTRATION 6.10: the rise from K=0 to the first K and every later step has a CI above 0
-    mono = bool(all(np.isfinite(lo) and lo > 0 for lo in inc_lows))
+    # (pass); a step with a CI below 0 refutes it (fail); otherwise neither shown nor refuted (open, section 2)
+    if all(np.isfinite(lo) and lo > 0 for lo in inc_lows):
+        mono = "pass"
+    elif any(np.isfinite(hi) and hi < 0 for hi in inc_highs):
+        mono = "fail"
+    else:
+        mono = "open"
     lang_status = min_effect_status(bl[kmain]["estimate"], bl[kmain]["ci_low"], bl[kmain]["ci_high"], PRIMARY_MIN_EFFECT, 1)
     did_status = _did_status(bd[kmain]) if kmain in bd else "nan"
     verdict = primary_verdict(lang_status, did_status, mono)
@@ -930,7 +942,7 @@ def _primary_dose(ctx: EvalContext, lang: pd.DataFrame, rand: pd.DataFrame, eps:
                       f"rule outcome ignoring the audit: {verdict}")
         verdict = "not_interpretable"
     did_main = bd.get(kmain)
-    k_note = (f"dlam(lang_dom, K={kmain}) {lang_status}, DiD {did_status}, monotone {mono} (increments' CIs above 0, "
+    k_note = (f"dlam(lang_dom, K={kmain}) {lang_status}, DiD {did_status}, monotone {mono} (increments' CIs vs 0, "
               f"PREREGISTRATION 6.10); point estimates monotone {mono_point}"
               + (f" (bootstrap P(monotone) {_g(p_mono, 3)})" if np.isfinite(p_mono) else ""))
     did_txt = (f"DiD(K={kmain}) {_g(did_main['estimate'])} [{_g(did_main['ci_low'])}, {_g(did_main['ci_high'])}]"
@@ -965,7 +977,8 @@ def _primary_dose(ctx: EvalContext, lang: pd.DataFrame, rand: pd.DataFrame, eps:
                                  note=_join(f"dlam(rand) {_g(r['estimate'])} [{_g(r['ci_low'])}, {_g(r['ci_high'])}]", rand_note),
                                  **_stat_fields(b)))
     rows.append(make_row(f"P.mono{sfx}", f"monotonicity of lam(lang_dom) in K (C1), eps={_eps_key(eps)}",
-                         role="primary_component", stage="D", estimate=float(mono), verdict=comp or ("supported" if mono else "not_supported"),
+                         role="primary_component", stage="D", estimate=float(mono == "pass"),
+                         verdict=comp or {"pass": "supported", "fail": "not_supported", "open": "open"}[mono],
                          rule=PRIMARY_MONO_RULE, source=src,
                          n_families=bl[kmain]["n_families"], n_rows=sum(bl[K]["n_rows"] for K in ks),
                          note=_join("dlam by K: " + ", ".join(f"K{K} {_g(bl[K]['estimate'])}" for K in ks),
@@ -1535,12 +1548,29 @@ def i_rows(ctx: EvalContext) -> list[dict]:
             has_p = bool(np.isfinite(p2))
             lit = _ci_verdict(r["mean"], r["ci_low"], r["ci_high"], 0)
             lit = lit if has_p else _cap_open(lit)
+            # PREREGISTRATION 1: steering doses above 0.1 (0.2 / 0.5 / 1.0) are exploratory -> outside the BH group
+            prereg_dose = any(np.isclose(float(r["eps"]), d) for d in PREREG_DOSES)
             rows.append(make_row(f"S14.{r['direction']}.eps{_eps_key(r['eps'])}", f"{n14}, {r['direction']}, eps={_eps_key(r['eps'])}",
-                                 role="copied", stage="I", rule=rule14, verdict=lit, estimate=r["mean"],
-                                 ci_low=r["ci_low"], ci_high=r["ci_high"], p_two_sided=p2, p_one_sided=p1,
-                                 bh_group=bool(has_p and lit != "not_tested"), n_families=int(_f(r.get("n_clusters")) or 0),
-                                 n_rows=int(_f(r.get("n_rows")) or 0),
-                                 note=_join("" if has_p else NO_P_NOTE, hn, _nboot_note(run), caveat_for("S14")),
+                                 role="copied" if prereg_dose else "exploratory", stage="I", rule=rule14, verdict=lit,
+                                 estimate=r["mean"], ci_low=r["ci_low"], ci_high=r["ci_high"], p_two_sided=p2, p_one_sided=p1,
+                                 bh_group=bool(prereg_dose and has_p and lit != "not_tested"),
+                                 n_families=int(_f(r.get("n_clusters")) or 0), n_rows=int(_f(r.get("n_rows")) or 0),
+                                 note=_join("" if prereg_dose else "exploratory dose (PREREGISTRATION 1: steering doses "
+                                                                   "0.2 / 0.5 / 1.0 are exploratory; not in the BH group)",
+                                            "" if has_p else NO_P_NOTE, hn, _nboot_note(run), caveat_for("S14")),
+                                 source=ctx.tables.source("I", "head_steering_boot")))
+        # sensitivity: the residual arm at the head's absolute written norm (dose_match "absolute")
+        for _, r in hb[hb["quantity"].astype(str) == "B_head_minus_residual_abs"].iterrows():
+            p2, p1 = table_p(r, 0)
+            lit = _ci_verdict(r["mean"], r["ci_low"], r["ci_high"], 0)
+            rows.append(make_row(f"S14abs.{r['direction']}.eps{_eps_key(r['eps'])}",
+                                 f"S14 head arm: B(worst head) - B(residual), same absolute norm, {r['direction']}, "
+                                 f"eps={_eps_key(r['eps'])}", role="sensitivity", stage="I", rule=rule14,
+                                 verdict=lit if np.isfinite(p2) else _cap_open(lit), estimate=r["mean"], ci_low=r["ci_low"],
+                                 ci_high=r["ci_high"], p_two_sided=p2, p_one_sided=p1, bh_group=False,
+                                 n_families=int(_f(r.get("n_clusters")) or 0), n_rows=int(_f(r.get("n_rows")) or 0),
+                                 note=_join("sensitivity: residual arm scaled to the head arm's absolute written norm "
+                                            "(uncorrected)", hn, _nboot_note(run)),
                                  source=ctx.tables.source("I", "head_steering_boot")))
         if s.empty:
             rows.append(not_tested("S14", n14, "I", "head_steering_boot has no rows (no head selected?)", role="copied",
