@@ -72,6 +72,7 @@ and a real source model for stage L (`--transplant-source model@revision`, or a 
 | # | Endpoint (PREREGISTRATION §2–3) | Stage | Table | Row / columns that carry the statistic |
 |---|---|---|---|---|
 | 1° | λ(K, ε, dir) growth exponent, H1: λ(K>0, lang_dom) − λ(K=0, lang_dom) > 0, > rand | D | `damage`, `damage_phase`, `damage_contrasts`, `damage_boot` | `inject="depth"`, `dir_family`, `eps`, `lam`; phase means per (K, C, dir_family, eps); per formulation `dlam_lang_dom`, `dlam_rand` (mean over the random directions), `did_lang_dom_minus_rand` vs the K=0 variant; boot (family means) per (K, C, eps, split), `confirmatory` = C1 on `split="test"` (the other C levels inject at the last German token: `position_deviation`), `min_effect_met` / `verdict` (Δλ ≥ 0.05, CI rule), `monotone_in_K` |
+| 1° ctl | Language at the injection site (PREREGISTRATION 6.11): does Δλ(lang_dom) for K > 0 vs K = 0 survive at "." sites that close an English clause? | D, control run (`--d-control token_language`, own root `runs_ctl`, notebook 14) | `damage_ctl`, `damage_ctl_checks`, `damage_ctl_contrasts` | `inject="u9"` (last token of unit 9) at K = 0, C1, C2, C3 and `u9D`; `inject="u10"` (last token of unit 10) at K = 0 and C1; `lam` per (tag, direction, eps) as in `damage`, plus `inject_token_id`, `site_gap`; judged only by `lsne.prereg_eval` (rows `P.ctl*`, role `primary_control`): control 1 = C2 and C3 pooled at `u9`, control 2 = C1 at `u10`, each against K = 0 at the same site; control 3 = `u9D` at `u9` (reported only); `u9` at K = 0 / C1 is the pre-registered site and replicates the main run's `depth` rows (`audit.D1ctl.rep`) |
 | 1 | T(K): K=8 vs K=0 at C1 | C | `contrasts`, `contrasts_boot` | `quantity="T"`, `K=8`, `C="C1"`; confirmatory row `split="test"` (family means, `stat_level="cluster"`) |
 | 2 | K × C: T(8, C3) − T(8, C1) | C | `contrasts_boot` | paired row `quantity="T_C3_minus_C1"`, `K=8`, `C="C3-C1"` (per formulation, family means), `split="test"` |
 | 3 | R_ws+punct+boundary − R_random | C | `attribution_contrasts`, `contrasts_boot` | `class="delim"`, `quantity="R_excess"` per layer, `split="test"` |
@@ -265,6 +266,81 @@ directory or its `verdict.csv`; PREREGISTRATION 18). Helpers: `lsne/chain/pairs.
 If `lsne.transplant` is not importable the stage writes a manifest with `stub=True` and no
 tables.
 
+## Stage D control run — language at the injection site (`stage_d_control.py`, notebook 14)
+
+PREREGISTRATION §6, amendment 11 (fixed 28.10.2026 after viewing the evaluation and before the
+control run; commit `2ce9c71`). In C1 the `depth` injection of D1 hits the same token at K = 0 and
+K > 0: the "." that ends unit 9 (its label D at K > 0 only reflects that punctuation joins the
+preceding segment). At K > 0 it closes a German clause and the final D→E switch follows right after
+it, so the primary contrast may measure the language at the injection site instead of the switching
+in the text. The control asks whether the effect on λ survives at "." sites that close an English
+clause.
+
+```
+python -m lsne.cli run --stage D --d-control token_language \
+    --d-main-run <LSNE>/runs/D/pythia-160m@step98000 --out <LSNE>/runs_ctl \
+    --model EleutherAI/pythia-160m --revision step98000 --dtype float32
+```
+
+`stage_d_noneq.run` dispatches to `stage_d_control.run` when `kw["d_control"]` is set (only
+`"token_language"` is valid); the run directory is the usual `<out>/D/<model>@<revision>`, so the
+control lives under its own root `runs_ctl` and never in the main run's `runs/D/…`.
+
+* **Guards** (`ControlRunError`, raised before anything is written; the CLI checks them before it
+  loads the model): the run directory is the main run's (also through a link) or holds a stage-D run
+  without `control == "token_language"` (any status) or a `directions_depth.npz` (an interrupted main
+  run); the main run directory has no ok stage-D manifest, is itself a control run, has another model
+  name / revision / dtype, or lacks `directions_depth.npz` / `directions_depth_meta.json`. A failed (not
+  a refused) control run leaves an error manifest with the control marks, so a restart resumes it.
+* **Inputs from the main run**, never refitted: its manifest's `lattice_directions` and `doses`
+  (order kept; run 1: `lang_dom`, `ent`, `rand_00`…`rand_31` × 0.01, 0.05, 0.1, 0.2, 0.5, 1.0) and
+  `limits.damage_batch_size` (64), and its depth bank `directions_depth.npz`, loaded with the vectors
+  exactly as stored (`load_main_bank`, no re-normalisation). Every (variant, site) runs all (direction,
+  dose) pairs in stage D's order and chunks, so λ at the pre-registered site replicates the main run.
+* **Variants**: the regular builder (`common.get_variants` with the run's `cfg`) restricted to the
+  standard variants of the test split F01–F12 × {A, B} at K = 0 (C1) and K ∈ {2, 4, 8} × {C1, C2, C3}
+  (no `seg`, no original 2143 variants), plus per test formulation `u9D`: unit mask `EEEEEEEEDE`
+  realised at C1 (two switches; `stimuli.segment_masks_from_unit_mask` + `make_variant(…, 2, "u9D", …)`),
+  checked against the formulation's K = 0 variant (PREREGISTRATION §4; an excluded one is recorded in
+  `damage_ctl_checks`, not run). `cfg.families` and the `limit_*` filters apply as in the regular builder.
+* **Sites** (the depth site, block input of block `n_layers // 3`; defined by the unit through
+  `common.unit_last_position`, never by `stimuli.last_switched_position`):
+
+| `inject` | Position | Cells |
+|---|---|---|
+| `u9` | last token of unit 9 | K = 0 and C1 (the pre-registered site, replication audit); C2 / C3 (control 1: unit 9 is DDE / DEE, the final switch lies before the site); `u9D` (control 3) |
+| `u10` | last token of unit 10, one token before the tail | K = 0 and C1 (control 2) |
+
+The tables come from `stage_d_noneq.damage_tables(…, injections_fn=stage_d_control.control_injections)`;
+stage D's own injections (`dossier`, `depth`) are unchanged.
+
+| Table | Content |
+|---|---|
+| `damage_ctl` | the `damage` table of `damage_tables` at the control sites (all its columns) plus `inject_token_id` (token id at `inject_pos`) and `site_gap` (`tail_start − inject_pos`) |
+| `damage_ctl_profile` | its `damage_profile` table |
+| `damage_ctl_checks` | one row per control variant built or excluded: `tag, family, formulation, K, C, step, problem, excluded` |
+| `damage_ctl_contrasts` | descriptive: `stage_d_noneq.damage_contrasts` at `u9` and at `u10`, concatenated (not used by the evaluation; `position_deviation` there only means C ≠ C1) |
+
+Manifest (`finish_stage(run_dir, "D", …)`): `control = "token_language"`, `amendment = "6.11"`,
+`main_run` (`path, git_sha, timestamp, model, revision`), `bank` (`file, sha256, names`),
+`lattice_directions`, `doses`, `damage_batch_size`, `sites` (the site rules), `cells` (per site the
+(K, C) cells run), `u9D_unit_mask`, `n_variants`, `n_excluded`, `audit` (`audit_summary` of
+`damage_ctl`) and `platform` (torch / CUDA / device next to the main run's torch: the replication is
+exact on the main run's platform, while round-off of another build or GPU can move λ at the smallest
+dose beyond 1e-3). Resume: its own `_resume` in the control run directory with its own signature
+(stage `"D_ctl"`, version, variant tags, model, dtype, depth site, bank sha256, directions, doses,
+batch size, site rules, chunk size); the main run's `_resume` is never shared or wiped. Size of the
+full run: 24 formulations × 11 variants = 264 variants, 360 (variant, site) pairs × 204 (direction,
+dose) pairs = 73 440 rows of `damage_ctl`, ≈ 1 440 batched forwards of 64 rows, about a sixth of D1 in
+the main run (estimate, not measured).
+
+Notebook 14 (`14_token_control`, A100) runs this command in a subprocess against the main run of
+account A (`MyDrive/LSNE/runs/D/…`; the `LSNE_B` shortcut only when account A has none), stops with a
+German message when the main run is missing or not ok, when there is no GPU or when another run sits in
+the control directory, never writes below `MyDrive/LSNE/runs`, and prints a descriptive check (rows per
+site / K / C, replication against the main run's `depth` rows, site checks, write audit, manifest
+marks). The verdicts are made by `lsne.prereg_eval` (notebook 13).
+
 ---
 
 ## Pre-registered evaluation (`lsne/prereg_eval.py`, notebook 13)
@@ -274,14 +350,16 @@ GPU stage is re-run; CPU is enough):
 
 ```
 python -m lsne.prereg_eval --runs /content/drive/MyDrive/LSNE/runs \
-    [--runs /content/drive/MyDrive/LSNE_B/runs] --out DIR [--n-boot 10000] [--seed 0] \
-    [--model pythia-160m] [--revision step98000] [--frozen-dose EPS]
+    [--runs /content/drive/MyDrive/LSNE/runs_ctl] [--runs /content/drive/MyDrive/LSNE_B/runs] --out DIR \
+    [--n-boot 10000] [--seed 0] [--model pythia-160m] [--revision step98000] [--frozen-dose EPS]
 ```
 
 Every root is searched for `<stage>/<model>@<revision>/manifest.json` with `status: ok` (a
-parent folder contributes its `runs` / `runs_trace`; with several ok runs of a stage the newest
-manifest wins; stage L is split into the stand-in run and the trace-source run by
-`manifest.source.kind`; stage F and its sub-runs are never opened). Confirmation set F01–F12 ×
+parent folder contributes its `runs` / `runs_trace` / `runs_ctl`; with several ok runs of a stage the
+newest manifest wins; stage L is split into the stand-in run and the trace-source run by
+`manifest.source.kind`; stage D is split into the main run (key `D`) and the token-language control
+run (key `D_ctl`, `manifest.control == "token_language"`), so a control run never replaces the main
+run; stage F and its sub-runs are never opened). Confirmation set F01–F12 ×
 {A, B}, statistic = mean of family means, family cluster bootstrap (`stat_level="cluster"`),
 BH over the secondary group 1–6, 8 and 9 (when G0 passes), 10, 13 and 14 (one test per sub-row;
 the copied rows of 8, 9, 13, 14 take the table's `p_boot`, one-sided `p_boot / 2` on the H1 side
@@ -294,8 +372,10 @@ the point estimate.
 
 | Row id | Source | What is computed |
 |---|---|---|
-| `P` / `P@<eps>` | D `damage` | primary: depth injection, C1 only for K > 0, K = 0 reference; per family dlam(K) of `lang_dom`, the same for `rand` (mean over the directions present), DiD; components `P.lang.K*`, `P.did.K*`, `P.mono`; every pre-registered dose present (`P` = the DEV-frozen dose if one is recorded); deviation rows `P.dev.{C2,C3,seg}.*` (`not_interpretable`) |
+| `P` / `P@<eps>` | D `damage` | primary: depth injection, C1 only for K > 0, K = 0 reference; per family dlam(K) of `lang_dom`, the same for `rand` (mean over the directions present), DiD; components `P.lang.K*`, `P.did.K*`, `P.mono`; every pre-registered dose present (`P` = the DEV-frozen dose if one is recorded); deviation rows `P.dev.{C2,C3,seg}.*` (`not_interpretable`); gated by `P.ctl` of the same dose (below): without a valid control run at most `open` |
+| `P.ctl` / `P.ctl@<eps>` (+ `P.ctl1`, `P.ctl2`, `P.ctl3`, components) | D control run (key `D_ctl`) `damage_ctl` | PREREGISTRATION 6.11, role `primary_control`, outside the BH group (m stays 26). Same confirmation set, bootstrap and rules as P (interval rule with 0.05, DiD against `rand` at the same site, `primary_verdict(lang, did, "pass")` at K = 8, per pre-registered dose with P's suffix). `P.ctl1`: inject `u9`, C2 and C3 pooled in one family mean, K = 2 / 4 / 8 vs K = 0 at `u9`; `P.ctl2`: inject `u10`, C1 vs K = 0 at `u10`; components `P.ctl{1,2}.lang.K*`, `P.ctl{1,2}.did.K*`; `P.ctl3` (+ `.lang`, `.did`): `u9D` (K = 2) vs K = 0 at `u9`, reported only. `P.ctl`: the outcome "Wechsel" (`supported`: `P.ctl1` and `P.ctl2` supported), "lokal" (`not_supported`: dlam(lang_dom, K = 8) fails, `ci_high` < 0.05, in both) or "offen" (`open`); without a control run one row `P.ctl`, `not_tested` |
 | `audit.D1`, `audit.C` | D `damage`, C `grid` | max / quantiles of `audit_rel_err`, rows > 1e-4 (PREREGISTRATION §4; a failed D1 audit makes the primary rows `not_interpretable`) |
+| `audit.D1ctl`, `.rep`, `.site`, `.run` | D control run `damage_ctl` (+ D `damage`, the control manifest) | write audit of `damage_ctl` (rule of `audit.D1`); replication: every control row at `u9` with C1 (K 0/2/4/8) has a main-run row (inject `depth`, same tag, direction, eps) at the same `inject_pos` with \|λ_ctl − λ_main\| ≤ 1e-3 (estimate = the largest difference); sites: "." at every row, language E at `u10`, at K = 0 and at C2 / C3, D at `u9` with C1 (K > 0) and at `u9D`, unit 9 / 10, `site_gap` of the `u9` rows as at K = 0 and 1 at `u10`; run: manifest `control = "token_language"`, `amendment = "6.11"`, younger than the amendment commit, no smoke / limited run. A failed audit makes every `P.ctl*` row `not_interpretable` (the rule outcome stays in the note) and counts as no valid control run |
 | `S1`, `S2` | C `contrasts` | T(8, C1); paired T(8, C3) − T(8, C1) |
 | `S3.<pair>.L<layer>`, `S3x.nats.*` | C `attribution_contrasts` (+ `attribution`) | R_excess of class `delim` per pair and layer (one-sided, DESIGN 4.1); exploratory excess in nats |
 | `S4`, `S4.K*` | D `hysteresis` | `area_minus_null` of `lang_dom` (pooled core variants; by K as sensitivity) |
@@ -308,10 +388,19 @@ the point estimate.
 | `S18T.*` | L (trace source) `trace_verdict` | copied when the table has the tightened rule's columns (`lm_corpus_ok`); an older table is re-judged with `stage_l_transplant.rejudge_trace` (CPU, read-only), and `not_interpretable` when that fails — its own claim is never copied |
 | `S11`, `S12`, `S15`–`S18` | H, I, J, K, L tables | copied, with the known caveats in `deviation_note` (placeholder corpora, synthetic SAEs, the replaced RDX counterpole, self-consistency sources) |
 
+**Token-language gate** (PREREGISTRATION 6.11, `apply_token_control`, applied after all rows
+exist and before BH): for every `P` / `P@<eps>`, `P.ctl` of the same dose "Wechsel" leaves P
+unchanged; "lokal" makes a `supported` or `open` P `not_interpretable` (other verdicts stay); `open`,
+a missing row, `not_tested` or `not_interpretable` (no valid control run) cap P at `open`. P's note
+records the control outcome and the rule outcome without the control; the gate never improves a
+verdict.
+
 Verdicts: `supported`, `not_supported`, `open` (an interval that neither establishes nor
 excludes the minimum effect, or a secondary without a minimum effect whose interval includes 0
 or misses BH), `gate_failed`, `not_interpretable`, `not_tested` (missing stage / table, with the
-reason). Outputs: `prereg_results.csv` (`id, name, estimate, ci_low, ci_high, p_two_sided,
+reason). Roles: `primary`, `primary_component`, `primary_deviation`, `primary_control` (the `P.ctl*`
+rows of 6.11), `audit`, `secondary`, `sensitivity`, `exploratory`, `gate`, `conditional`, `copied`.
+Outputs: `prereg_results.csv` (`id, name, estimate, ci_low, ci_high, p_two_sided,
 p_one_sided, n_families, n_rows, rule, verdict, bh_q, deviation_note` + `role, stage, direction,
 bh_group, bh_q_endpoint, source, min_effect`; `min_effect` appended 27.10.2026), `prereg_results.md`, `prereg_runs.csv`, `prereg_meta.json`.
 
@@ -325,6 +414,8 @@ python -m lsne.cli run --stage all --model EleutherAI/pythia-160m --revision ste
     [--transplant-source EleutherAI/pythia-70m@step143000] [--atlas-dir data/atlas]
 python -m lsne.cli run --stage all --model EleutherAI/pythia-14m --revision step98000 --device cpu \
     --families DEV01 --out /tmp/lsne_smoke --smoke        # CPU smoke run, A-L
+python -m lsne.cli run --stage D --d-control token_language --d-main-run runs/D/pythia-160m@step98000 \
+    --out runs_ctl --model EleutherAI/pythia-160m --revision step98000   # control run of PREREGISTRATION 6.11
 ```
 
 `jobs/shards.yaml` gives the A100 plan (shards 1–3 run A–E and G–L; shard 7 runs stage K

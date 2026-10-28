@@ -53,6 +53,9 @@ MyDrive/LSNE/
 │   │   └── shard0of1/B/pythia-1b@step143000/, …/pythia-1.4b@step143000/
 │   └── merged/                             Ausgabe von `lsne.cli merge`
 ├── runs_ttt/K/pythia-160m@step98000/       Shard 7: Stufe K mit --ttt-checkpoints (getrennt vom Kernlauf)
+├── runs_ctl/D/pythia-160m@step98000/       Notebook 14: Kontrolllauf von Stufe D nach Nachtrag 6.11 (damage_ctl*,
+│                                           manifest.json mit control = token_language); getrennt vom Hauptlauf in runs/D/…
+├── runs_ctl/logs/                          Log des CLI-Aufrufs von Notebook 14 (bleibt nach Sitzungsende erhalten)
 ├── inputs/ttt/{dao_fork,neutral,nofork}/   Eingaben des Auftraggebers (optional; nie im Repository)
 ├── inputs/atlas/*.txt, inputs/s4/axes.npz
 ├── cache/state2143/, cache/unigram/, cache/pile_nll/   Anker, Unigramm-Zählungen, Pile-NLL (LSNE_CACHE)
@@ -416,10 +419,11 @@ Notebook 05 wird also nicht gestört.
    `LSNE` freigeben, im eigenen Konto unter „Für mich freigegeben“ → Rechtsklick → „Organisieren“
    → „Verknüpfung hinzufügen“ → „Meine Ablage“ und die Verknüpfung in `LSNE_B` umbenennen.
 2. **Notebook öffnen und alle Zellen ausführen.** Die Konfigurationszelle fragt nach den
-   Laufwurzeln; Enter übernimmt die vorhandenen unter `MyDrive/LSNE/{runs,runs_trace}` und
-   `MyDrive/LSNE_B/{runs,runs_trace}`. Weitere Wurzeln (z. B. `MyDrive/LSNE/runs_ttt`) komma-getrennt
+   Laufwurzeln; Enter übernimmt die vorhandenen unter `MyDrive/LSNE/{runs,runs_trace,runs_ctl}` und
+   `MyDrive/LSNE_B/{runs,runs_trace,runs_ctl}`. Weitere Wurzeln (z. B. `MyDrive/LSNE/runs_ttt`) komma-getrennt
    angeben. Liegt eine Stufe unter mehreren Wurzeln, gilt der neueste Lauf (`prereg_runs.csv`
-   nennt die übrigen).
+   nennt die übrigen). Der Kontrolllauf von Notebook 14 (`runs_ctl`, Abschnitt 12) wird als eigener
+   Schlüssel `D_ctl` geführt und ersetzt nie den Hauptlauf von Stufe D.
 3. **Ergebnis.** `MyDrive/LSNE/prereg_eval/pythia-160m@step98000/prereg_results.{csv,md}`,
    `prereg_runs.csv`, `prereg_meta.json`, eine Übersichtsabbildung und
    `summary_13_prereg_evaluation_*.json`.
@@ -427,7 +431,7 @@ Notebook 05 wird also nicht gestört.
 CLI-Äquivalent (jede Maschine mit Zugriff auf die Laufverzeichnisse):
 
 ```
-python -m lsne.prereg_eval --runs /content/drive/MyDrive/LSNE/runs \
+python -m lsne.prereg_eval --runs /content/drive/MyDrive/LSNE/runs --runs /content/drive/MyDrive/LSNE/runs_ctl \
     --runs /content/drive/MyDrive/LSNE_B/runs --out /content/drive/MyDrive/LSNE/prereg_eval/pythia-160m@step98000
 ```
 
@@ -437,3 +441,82 @@ verfehlt, Lauf durch das Audit ungültig, Platzhalter-Korpus, synthetisches SAE,
 Abweichungszeilen C2/C3/seg des Primärendpunkts). Ohne eine auf DEV01–DEV04 eingefrorene
 Schadensdosis (`FROZEN_DOSE` bzw. `--frozen-dose`) wird der Primärendpunkt für jede
 präregistrierte Dosis einzeln berichtet; die Notiz nennt die Bonferroni-Korrektur über die Dosen.
+Seit Nachtrag 6.11 hängt der Primärendpunkt außerdem an der Kontrolle der Sprache an der
+Injektionsstelle (Zeilen `P.ctl…`, Rolle `primary_control`, nicht in der BH-Gruppe): Ohne gültigen
+Kontrolllauf von Notebook 14 ist er höchstens „offen“; bei „lokal“ wird ein gestütztes oder offenes
+Ergebnis nicht interpretierbar, bei „Wechsel“ bleibt es unverändert. Die Notiz von P nennt den Ausgang
+und das Ergebnis der Regel ohne die Kontrolle.
+
+## 12. Kontrolle der Sprache an der Injektionsstelle (Notebook 14, A100)
+
+`notebooks/14_token_control.ipynb` rechnet den Kontrolllauf aus Nachtrag 6.11 der Präregistrierung
+(`docs/PREREGISTRATION.md` §6, Commit `2ce9c71`; Tabellen und Regeln in `docs/STAGES.md`). Anlass: In
+C1 injiziert der Primärendpunkt bei K = 0 und K > 0 in denselben Punkt „.“ am Ende von Einheit 9; bei
+K > 0 schließt er einen deutschen Satzteil ab, und der letzte Wechsel zurück ins Englische folgt direkt
+danach. Der Kontrolllauf injiziert deshalb auch dort, wo „.“ einen englischen Satzteil abschließt: am
+Ende von Einheit 9 in C2/C3 (Kontrolle 1) und am Ende von Einheit 10 in C1 (Kontrolle 2), je gegen K = 0
+an derselben Stelle; nur Einheit 9 deutsch (`u9D`, Kontrolle 3) wird nur berichtet. An der
+präregistrierten Stelle (Ende von Einheit 9, K = 0 und C1) muss er den Hauptlauf reproduzieren.
+
+**Voraussetzungen.** Der Hauptlauf von Stufe D (Notebook 03) mit `status: ok` und
+`directions_depth.npz` liegt auf Konto A unter `MyDrive/LSNE/runs/D/pythia-160m@step98000/`. Das
+Notebook nimmt ihn von dort; nur wenn er dort fehlt, nimmt es `MyDrive/LSNE_B/runs/D/…` (Verknüpfung
+zum anderen Konto, Abschnitt 11), oder den Pfad in `MAIN_D_RUN`. Der Lauf muss jünger sein als der
+Commit des Nachtrags (das prüft Notebook 13) und sollte wie der Hauptlauf auf einer A100 laufen: Andere
+Hardware oder eine andere Torch-Version runden anders, und die Reproduktion (|Δλ| ≤ 1e-3) kann daran
+scheitern; die Prüfzelle warnt dann.
+
+**Ablauf.**
+
+1. Auf **Konto A** eine **A100-Laufzeit** wählen (Laufzeit → Laufzeittyp ändern → A100) und
+   `notebooks/14_token_control.ipynb` öffnen. Auch eine wiederverwendete Laufzeit ist in Ordnung: Die
+   Setup-Zelle bringt den Checkout auf den Stand des Zweigs, und der Lauf selbst startet als eigener
+   Prozess mit dem aktuellen Code.
+2. **Alle Zellen ausführen.** Die Voreinstellungen passen (`REVISION = "step98000"`, `MAIN_D_RUN = None`,
+   `REUSE = False`). Die Prüfzelle (1) bricht mit einer deutschen Meldung ab, wenn der Hauptlauf fehlt
+   oder nicht ok ist, keine GPU da ist oder im Kontrollordner ein anderer Lauf liegt. Die Laufzelle (2)
+   startet `python -m lsne.cli run --stage D --d-control token_language --d-main-run <Hauptlauf> --out
+   MyDrive/LSNE/runs_ctl` und bricht ab, wenn der Lauf scheitert oder verweigert wird (Log unter
+   `runs_ctl/logs/`).
+3. **Kurze Prüfung** (Zelle 3, deskriptiv): Zeilen je Stelle, K und C; max |Δλ| an der präregistrierten
+   Stelle gegen die Zeilen `depth` des Hauptlaufs (Grenze 1e-3); Stellenprüfungen („.“, Sprachmarke,
+   Einheit, Abstand zum Schlussabschnitt); Schreib-Audit und Manifest-Marken. „ACHTUNG, nicht
+   bestanden: …“ nennt die verfehlten Prüfungen; dann wertet Notebook 13 den Lauf als ungültig.
+4. **Danach Notebook 13** (CPU-Laufzeit genügt, Abschnitt 11). Erst dort fallen die Urteile: je Dosis
+   `P.ctl` mit „Wechsel“, „lokal“ oder „offen“, die Audits `audit.D1ctl…` und die Folge für P.
+
+**Sicherheit.** Das Notebook liest den Hauptlauf nur; in `MyDrive/LSNE/runs/` schreibt es nichts, nicht
+einmal den Ordner. Der Kontrolllauf verweigert vor jedem Schreiben ein Laufverzeichnis, das der Hauptlauf
+ist oder einen anderen Lauf von Stufe D enthält, und einen Hauptlauf mit anderem Modell, anderer
+Revision oder anderem dtype. Er hat sein eigenes `_resume/` mit eigener Signatur; das `_resume/` des
+Hauptlaufs wird nie berührt.
+
+**Laufzeit.** 264 Varianten (24 Formulierungen × 11) an 360 Paaren aus Variante und Stelle, je 204 Paare
+aus Richtung und Dosis: ≈ 1 440 Forwards zu 64 Zeilen, etwa ein Sechstel von D1 im Hauptlauf;
+geschätzt 5–15 min plus Modell-Download (nicht gemessen; die echte Zeit steht in `manifest.json`,
+`runtime_s`).
+
+**Fortsetzen.** Bricht die Sitzung ab, alle Zellen erneut ausführen: Der Lauf setzt bei den gesicherten
+Blöcken unter `runs_ctl/D/pythia-160m@step98000/_resume/` fort (nach `status: ok` wird `_resume/`
+gelöscht). `REUSE = True` prüft einen fertigen Kontrolllauf nur (gleicher Hauptlauf, Nachtrag 6.11),
+statt ihn neu zu rechnen. `SMOKE = True` ist ein Rauchtest mit `pythia-14m` auf F01A gegen den
+Rauchlauf von Notebook 03; Notebook 13 zählt ihn nicht.
+
+**CLI-Äquivalent** (jede GPU-Maschine):
+
+```bash
+python -m lsne.cli run --stage D --d-control token_language \
+    --d-main-run /data/lsne/runs/D/pythia-160m@step98000 --out /data/lsne/runs_ctl \
+    --model EleutherAI/pythia-160m --revision step98000 --dtype float32 --device auto
+```
+
+**Fehlersuche (Notebook 14).**
+
+| Symptom | Ursache / Abhilfe |
+|---|---|
+| `Hauptlauf von Stufe D nicht verwendbar (…): …/manifest.json fehlt` | Auf diesem Konto liegt kein Hauptlauf unter `runs/D/<modell>@<revision>` und auch keiner unter `LSNE_B`: Notebook auf Konto A ausführen, die Verknüpfung `LSNE_B` anlegen (Abschnitt 11) oder `MAIN_D_RUN` setzen. |
+| `… Status 'error' statt 'ok'` / `directions_depth.npz fehlt` | Der Hauptlauf ist nicht fertig: Notebook 03 bis zum Ende laufen lassen (`REUSE = True` lädt einen fertigen Lauf). |
+| `Keine GPU` | Auf eine A100-Laufzeit wechseln und alle Zellen erneut ausführen. |
+| `In …/runs_ctl/D/… liegt ein anderer Lauf als dieser Kontrolllauf` | Dort liegt ein Lauf ohne `control = token_language` (etwa ein kopierter Hauptlauf): Er wird nie überschrieben. Den Ordner prüfen und umbenennen. |
+| `Kontrolllauf fehlgeschlagen oder verweigert (exit 1, …)` | Ursache im Log unter `runs_ctl/logs/` (`control run refused: …`, `REFUSED`, `FAILED`, z. B. `CUDA out of memory`); nach der Korrektur die Laufzelle erneut ausführen, ein abgebrochener Lauf setzt fort. |
+| `Reproduktion … NICHT ok` | λ an der präregistrierten Stelle weicht um mehr als 1e-3 vom Hauptlauf ab, meist wegen anderer Hardware oder Torch-Version (Warnungen der Prüfzelle, `platform` im Manifest). Auf einer A100 wiederholen; weicht auch die Torch-Version ab, kann die Reproduktion trotzdem scheitern. Dann ist der Kontrolllauf ungültig, und P bleibt höchstens „offen“. |

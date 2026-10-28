@@ -541,6 +541,15 @@ wegkontrahieren. Beides wird hier respektiert:
   Soll/Ist-Prüfung des geschriebenen Vektors (`lsne.model.Injector.audit`).
 - Längen: Tokens pro Segment und Gesamtlänge werden immer gespeichert; Analysen mit
   und ohne Längenkovariate.
+- Sprache an der Injektionsstelle (ergänzt 28.10.2026, Nachtrag 6.11 der Präregistrierung, festgelegt
+  nach Sichtung der Auswertung und vor dem Kontrolllauf): In C1 injiziert der Primärendpunkt bei K = 0
+  und K > 0 in denselben Punkt „.“ am Ende von Einheit 9; bei K > 0 schließt er einen deutschen
+  Satzteil ab, und der letzte Wechsel D → E folgt direkt danach. Ein eigener D1-Lauf (Notebook 14,
+  Wurzel `runs_ctl`, Bank, Richtungen und Dosen des Hauptlaufs) injiziert deshalb auch an Punkten, die
+  einen englischen Satzteil abschließen: am Ende von Einheit 9 in C2/C3 und am Ende von Einheit 10 in
+  C1, je gegen K = 0 an derselben Stelle; eine Variante mit nur Einheit 9 deutsch (`u9D`) wird nur
+  berichtet. Die Kontrolle kann den Primärendpunkt nur schwächen, ohne gültigen Kontrolllauf ist er
+  höchstens „offen“ (`docs/STAGES.md`, Zeilen `P.ctl`).
 
 ---
 

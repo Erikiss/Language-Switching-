@@ -120,9 +120,14 @@ p-Werte für Δλ und DiD: ≤ 0,0003 nach Bonferroni über die drei Dosen. Das 
 
 ### 2.2 Vorbehalte
 
-* Bei K > 0 ist das Token an der Injektionsstelle (letztes Token von Einheit 9) deutsch, bei K = 0 englisch.
-  Die Zufallsrichtungen schließen aus, dass allein die Tokensprache λ für beliebige Richtungen hebt. Sie
-  schließen nicht aus, dass die Sprachachse auf einem deutschen Token anders wirkt als auf einem englischen.
+* In C1 ist das Token an der Injektionsstelle bei K = 0 und K > 0 dasselbe: der Punkt „.“ am Ende von
+  Einheit 9. Die Marke D bei K > 0 kommt nur daher, dass Satzzeichen dem vorangehenden Segment zugeordnet
+  werden. Verschieden sind die Sprache des Satzteils, den der Punkt abschließt (bei K > 0 deutsch), und der
+  letzte Wechsel D → E: Er folgt bei K > 0 direkt auf die Stelle und liegt damit zwischen ihr und dem
+  englischen Schlussabschnitt. Die Zufallsrichtungen schließen aus, dass dieser Unterschied λ für beliebige
+  Richtungen hebt. Sie schließen nicht aus, dass die Sprachachse nach einem deutschen Satzteil anders wirkt
+  als nach einem englischen. Die Kontrolle dazu legt Nachtrag 6.11 fest (Notebook 14, Zeilen `P.ctl`; Lauf
+  ausstehend).
 * Die `lang_dom`-Achse an der Tiefen-Injektionsstelle (Layer 4) verfehlt ihren Entrauschungs-Test
   (cos_denoised_plain 0,126 < 0,70). Sie bewahrt dort wenig vom einfachen D-E-Mittelwertunterschied.
 * `lang_dom` ist auf allen Standardvarianten gefittet, die Testfamilien eingeschlossen.
@@ -273,8 +278,9 @@ anderen Endpunkte erscheinen bei 99k als „nicht getestet“, weil es dort nur 
 
 1. ~~Primärendpunkt, Monotonie~~: entschieden am 28.10.2026 (Nachtrag 6.10, §2.3).
 2. **Primärendpunkt, Achse:** ob die `lang_dom`-Achse trotz verfehltem Entrauschungs-Test an Layer 4 gilt.
-3. **Primärendpunkt, Tokensprache:** eine Kontrolle vor einer Bestätigung, z. B. K = 0 mit deutschem Token an
-   der Injektionsstelle.
+3. ~~Primärendpunkt, Tokensprache~~: festgelegt am 28.10.2026 durch Nachtrag 6.11 (Commit `2ce9c71`), vor dem
+   Kontrolllauf: Kontrolle der Sprache an der Injektionsstelle mit einem eigenen D1-Lauf (Notebook 14); ohne
+   gültigen Kontrolllauf ist der Primärendpunkt höchstens „offen“. Der Lauf steht aus.
 4. **Endpunkt 14:** welcher der beiden vorhandenen Kontraste (gleiche relative Dosis oder gleiche absolute
    Norm) konfirmatorisch gilt.
 5. **Endpunkt 15:** `books`-Gegenpol bauen (Neulauf J) oder 15 explorativ lassen.
@@ -296,3 +302,5 @@ anderen Endpunkte erscheinen bei 99k als „nicht getestet“, weil es dort nur 
   `1e346d8`: Die Zelle setzt den Zweig auf `FETCH_HEAD`, bricht bei Fehlern ab und lädt `lsne` neu.
 * Die Vorbehaltstexte zu 18 und 18T beschrieben bis zum Bericht von 06:42 UTC das Design vor den
   Korrekturen; seit dem Bericht von 07:07 UTC sind sie aktuell.
+* Nachtrag 6.11 (Kontrolle der Sprache an der Injektionsstelle) ist seit dem 28.10.2026, 08:05 UTC committet
+  (`2ce9c71`), also vor dem Kontrolllauf mit Notebook 14, der noch aussteht.
