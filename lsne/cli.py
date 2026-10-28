@@ -27,9 +27,10 @@ model/revision only); the per-stage durations are printed at the end.
 injection-site language (PREREGISTRATION section 6, amendment 11;
 :mod:`lsne.experiments.stage_d_control`): stage D alone, with the main stage-D run's directions,
 doses and depth bank, written to ``<out>/D/<model>@<rev>`` under its own root (``runs_ctl``).  The
-run is refused before the model is loaded when that directory is the main run's or holds a stage-D
-run other than this control; a refused control run writes nothing, and the error manifest of a
-failed one carries the control marks, so a restart resumes it.
+run is refused before the model is loaded when that directory is the main run's or lies inside it,
+when ``<out>`` is a ``runs`` folder, lies in the main run's root or holds the main run, or when the
+directory holds a stage-D run other than this control; a refused control run writes nothing, and
+the error manifest of a failed one carries the control marks, so a restart resumes it.
 
 ``merge`` concatenates all same-named csv files below ``--root`` (any depth, including
 the stage-F sub-run directories of all shards) into ``<out>/<name>.csv`` with the
@@ -212,8 +213,9 @@ def duration_summary(report: dict[str, dict]) -> str:
 
 def check_d_control(cfg: RunConfig, stages: Sequence[str], control: Optional[str], main_run: Optional[str]) -> None:
     """``--d-control`` / ``--d-main-run``: both or neither, stage D alone, a run directory
-    ``<out>/D/<model>@<rev>`` that is neither the main run's nor one holding another stage-D run, and
-    an ok main stage-D run of the same model with its depth bank (the guards of
+    ``<out>/D/<model>@<rev>`` that is neither the main run's (nor inside it) nor one holding another
+    stage-D run, an ``<out>`` that is no ``runs`` folder and is separate from the main run's root,
+    and an ok main stage-D run of the same model with its depth bank (the guards of
     :mod:`lsne.experiments.stage_d_control`); SystemExit before the model is loaded."""
     if not (control and main_run):
         raise SystemExit("[lsne] --d-control and --d-main-run go together: a stage-D control run needs the "
@@ -222,7 +224,7 @@ def check_d_control(cfg: RunConfig, stages: Sequence[str], control: Optional[str
         raise SystemExit(f"[lsne] --d-control runs stage D alone (--stage D), got --stage {','.join(stages)}")
     try:
         SDC.check_control(control)
-        SDC.check_run_dir(RunDir(cfg.out_root, "D", cfg.model, mkdir=False).path, main_run)
+        SDC.check_run_dir(RunDir(cfg.out_root, "D", cfg.model, mkdir=False).path, main_run, cfg.out_root)
         SDC.main_run_inputs(cfg, main_run)
     except SDC.ControlRunError as e:
         raise SystemExit(f"[lsne] control run refused: {e}") from e

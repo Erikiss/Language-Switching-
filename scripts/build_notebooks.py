@@ -4662,8 +4662,9 @@ def nb_13() -> list[tuple[str, str]]:
             default_roots = [os.path.join(MYDRIVE, base, child) for base in ("LSNE", "LSNE_B")
                              for child in ("runs", "runs_trace", "runs_ctl")      # runs_ctl: control run of notebook 14 (6.11)
                              if os.path.isdir(os.path.join(MYDRIVE, base, child))]
-            if not default_roots:              # outside Colab: the local runs root of lsne.io.drive_root()
-                default_roots = [RUNS_ROOT]
+            if not default_roots:              # outside Colab: the run roots below OUT_ROOT (lsne.io.drive_root()), as on Drive
+                default_roots = [os.path.join(OUT_ROOT, child) for child in ("runs", "runs_trace", "runs_ctl")
+                                 if os.path.isdir(os.path.join(OUT_ROOT, child))] or [RUNS_ROOT]
             if ASK and not RUN_ROOTS_TEXT.strip():
                 try:
                     RUN_ROOTS_TEXT = input(f"Laufwurzeln, komma-getrennt (Enter = {', '.join(default_roots)}): ")
@@ -4997,9 +4998,11 @@ def _ctl_header() -> tuple[str, str]:
         berührt). Das Notebook lädt das Modell nicht selbst, sondern ruft die Kommandozeile in einem eigenen Prozess
         auf; so rechnet auch eine wiederverwendete Colab-Laufzeit mit dem aktuellen Code (die Setup-Zelle bringt den
         Checkout auf den Stand des Zweigs). `REUSE = False` (Standard) rechnet einen fertigen Kontrolllauf neu,
-        `REUSE = True` prüft ihn nur. `SMOKE = True` rechnet einen Rauchtest mit `pythia-14m` auf der Formulierung
-        F01A gegen den Rauchlauf von Notebook 03 (dort `SMOKE = True`): keine wissenschaftliche Aussage, Notebook 13
-        zählt ihn nicht als Kontrolllauf.
+        `REUSE = True` prüft ihn nur, wenn er zu diesem Hauptlauf gehört (Pfad, Zeitstempel und SHA-256 der Bank).
+        `SMOKE = True` rechnet einen Rauchtest mit `pythia-14m` auf der Formulierung F01A gegen den Rauchlauf von
+        Notebook 03 (dort `SMOKE = True` und `FAMILIES = ["F01A"]`: ohne `FAMILIES` rechnet Notebook 03 nur DEV01,
+        und die Reproduktion findet kein Gegenstück): keine wissenschaftliche Aussage, Notebook 13 zählt ihn nicht als
+        Kontrolllauf.
         """
     )
 
@@ -5015,8 +5018,8 @@ def _ctl_config_cell() -> tuple[str, str]:
         DTYPE = "float32"                  # wie der Hauptlauf (FP32); einen anderen dtype verweigert der Kontrolllauf
         DEVICE = "auto"
         MAIN_D_RUN = None                  # None: MyDrive/LSNE/runs/D/<modell>@<revision> (Konto A); nur wenn dort keiner liegt MyDrive/LSNE_B/runs/D/...
-        REUSE = False                      # True: einen fertigen Kontrolllauf (manifest ok, control = token_language) nur prüfen, nicht neu rechnen
-        SMOKE = False                      # True: Rauchtest mit pythia-14m auf F01A gegen den Rauchlauf von Notebook 03 (kein Befund)
+        REUSE = False                      # True: einen fertigen Kontrolllauf dieses Hauptlaufs (manifest ok, control = token_language) nur prüfen
+        SMOKE = False                      # True: Rauchtest mit pythia-14m auf F01A gegen den Rauchlauf von Notebook 03 (dort FAMILIES = ["F01A"]; kein Befund)
 
         # ---------------------------------------------------------------------------------------
         import datetime
@@ -5223,15 +5226,21 @@ def _ctl_check_cell() -> tuple[str, str]:
             raise ControlStop(f"In {CTL_DIR} liegt ein anderer Lauf als dieser Kontrolllauf (Stufe {CTL_MANIFEST.get('stage')!r}, "
                               f"control {CTL_MANIFEST.get('control')!r}, oder eine Richtungsbank des Hauptlaufs): er wird nie "
                               "überschrieben. Den Ordner prüfen und umbenennen, dann erneut ausführen.")
-        _main_path = str((CTL_MANIFEST.get("main_run") or {}).get("path") or "")
-        _same_main = bool(_main_path) and Path(_main_path).resolve() == Path(MAIN_D_RUN).resolve()
+        # reused only for this very main run: its path, its timestamp (a main run recomputed at the same path is another
+        # run) and the SHA-256 of its depth bank
+        _ctl_main = CTL_MANIFEST.get("main_run") or {}
+        _same_main = (bool(_ctl_main.get("path")) and Path(str(_ctl_main["path"])).resolve() == Path(MAIN_D_RUN).resolve()
+                      and _ctl_main.get("timestamp") == MAIN_MANIFEST.get("timestamp")
+                      and (CTL_MANIFEST.get("bank") or {}).get("sha256") == MAIN_BANK_SHA256)
         REUSE_RUN = bool(REUSE and CTL_MANIFEST.get("status") == "ok" and CTL_MANIFEST.get("amendment") == "6.11" and _same_main)
         if REUSE_RUN:
             print(f"Fertiger Kontrolllauf vom {CTL_MANIFEST.get('timestamp')} (Git {str(CTL_MANIFEST.get('git_sha') or '?')[:7]}) "
                   "wird nur geprüft, nicht neu gerechnet (REUSE = False rechnet ihn neu).")
         elif CTL_MANIFEST.get("status") == "ok":
             print(f"Der fertige Kontrolllauf vom {CTL_MANIFEST.get('timestamp')} wird neu gerechnet und überschrieben"
-                  + (" (REUSE = False)." if not REUSE else " (er gehört zu einem anderen Hauptlauf oder Nachtrag)."))
+                  + (" (REUSE = False)." if not REUSE else
+                     " (er gehört zu einem früheren oder anderen Hauptlauf: Pfad, Zeitstempel oder SHA-256 der Bank weichen ab, "
+                     "oder zu einem anderen Nachtrag)."))
         elif CTL_MANIFEST:
             print(f"Abgebrochener Kontrolllauf (Status {CTL_MANIFEST.get('status')!r}): der neue Start setzt bei den gesicherten "
                   f"Blöcken fort ({'_resume vorhanden' if (CTL_DIR / '_resume').exists() else 'kein _resume: Neustart'}).")
@@ -5286,7 +5295,10 @@ def _ctl_run_cell() -> tuple[str, str]:
               + f", fortgesetzte Blöcke {CTL_MANIFEST.get('resumed_checkpoints')}, Tabellen {CTL_MANIFEST.get('tables')}")
         print(f"  Marken: control = {CTL_MANIFEST.get('control')!r}, amendment = {CTL_MANIFEST.get('amendment')!r}, "
               f"Zeitstempel {CTL_MANIFEST.get('timestamp')}, Git {str(CTL_MANIFEST.get('git_sha') or '?')[:7]}")
-        print(f"  Plattform: {CTL_MANIFEST.get('platform')}")
+        print(f"  Plattform: {CTL_MANIFEST.get('platform')}; Reproduktion: {CTL_MANIFEST.get('replication_platform')}")
+        if CTL_MANIFEST.get("design_filters"):
+            print(f"  Eingeschränkt durch {CTL_MANIFEST.get('design_filters')}: Notebook 13 nimmt einen Lauf des ganzen "
+                  "Designs vor diesem und wertet diesen Lauf nur, wenn er alle Zeilen von P und alle Zellen des Designs abdeckt.")
         """
     )
 
@@ -5335,6 +5347,11 @@ def _ctl_inspect_cell() -> tuple[str, str]:
             print(f"Reproduktion der präregistrierten Stelle (u9 bei K = 0 und C1) gegen den Hauptlauf (inject 'depth'): "
                   f"{len(rep)} Zeilen, max |Δλ| = {max_dlam:.2e} (Grenze 1e-3), ohne Gegenstück {n_missing}, andere "
                   f"Position {n_pos}, λ nur einseitig NaN {n_nan} -> {'ok' if rep_ok else 'NICHT ok'}")
+            if len(rep) and n_missing == len(rep):          # not one of these variants in the main run
+                print(f"  Der Hauptlauf enthält keine dieser Varianten ({', '.join(sorted(set(prim['tag']))[:3])} …): "
+                      + ('beim Rauchtest Notebook 03 mit SMOKE = True und FAMILIES = ["F01A"] rechnen (ohne FAMILIES '
+                         'rechnet es nur DEV01), dann dieses Notebook erneut ausführen.' if SMOKE else
+                         "ist MAIN_D_RUN der richtige Hauptlauf?"))
             if both.any():
                 show(rep[both].groupby("eps")["dlam"].max().rename("max |Δλ| je Dosis").to_frame())
 
@@ -5410,8 +5427,9 @@ def _ctl_summary_cell() -> tuple[str, str]:
                               torch_version=_mm.get("torch_version"), bank_sha256=globals().get("MAIN_BANK_SHA256")),
                 run=RESULT.get("run"),
                 manifest={k: _m.get(k) for k in ("status", "timestamp", "git_sha", "control", "amendment", "main_run", "bank",
-                                                 "n_variants", "n_excluded", "cells", "audit", "platform", "tables",
-                                                 "runtime_s", "resumed_checkpoints")},
+                                                 "n_variants", "n_formulations", "design_filters", "n_excluded", "cells",
+                                                 "audit", "platform", "replication_platform", "tables", "runtime_s",
+                                                 "resumed_checkpoints")},
                 checks=RESULT.get("checks"), cli_command=CLI_COMMAND, cli_commands=CLI_LOG,
                 next_step="Notebook 13 (13_prereg_evaluation): Zeilen P.ctl… und audit.D1ctl…",
             )

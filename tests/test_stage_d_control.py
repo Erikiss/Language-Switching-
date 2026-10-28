@@ -161,6 +161,28 @@ def test_u9d_variant_and_control_variants(mb, tok, monkeypatch):
     assert bool(row["excluded"]) and row["step"] == "build" and row["problem"] == "no 10 units"
 
 
+def test_variant_limits_act_on_the_test_formulations(mb):
+    """The regular builder runs on the test formulations only, so --limit-variants without --families
+    keeps control variants (DEV01-DEV04 come first in the stimulus bank: a limit applied before the
+    split left none) and selects the C1 variants of a main run limited alike; a run without a test
+    formulation or without a variant is refused before it writes anything.  The manifest's
+    design_filters name what narrows the design below the main run's selection."""
+    assert SDC.control_formulations(RunConfig(model=mb.spec))[:3] == ["F01A", "F01B", "F02A"]
+    variants, _ = SDC.control_variants(RunConfig(model=mb.spec, limit_variants=3), mb, {})
+    assert [v.tag for v in variants] == ["F01A:K0:C1", "F01A:K8:C1", "F01A:K2:u9D"]
+    with pytest.raises(SDC.ControlRunError, match="no test formulation"):
+        SDC.control_variants(RunConfig(model=mb.spec, families=["DEV01", "F13A", "F01C"]), mb, {})
+    with pytest.raises(SDC.ControlRunError, match="no control variant left"):
+        SDC.control_variants(RunConfig(model=mb.spec, families=["F01A"], k_levels=(16,)), mb, {})
+    tags = ["F01A", "F01B", "F02A", "F02B"]
+    for kw, main_cfg, want in (({}, None, []), ({"families": [f"F{i:02d}" for i in range(1, 13)]}, {}, []),
+                               ({"families": tags}, {"families": tags}, []), ({"families": ["F01"]}, {}, ["families"]),
+                               ({"limit_families": 2}, {}, ["families"]), ({"limit_variants": 3}, {"families": tags},
+                                                                            ["limit_variants"]),
+                               ({"k_levels": (0, 8), "c_levels": ("C1", "C2")}, {}, ["k_levels", "c_levels"])):
+        assert SDC.design_filters(RunConfig(model=mb.spec, **kw), main_cfg) == want, kw
+
+
 # --------------------------------------------------------------------------------------
 # the control run
 # --------------------------------------------------------------------------------------
@@ -212,10 +234,14 @@ def test_control_run_tables_sites_and_manifest(ctl_run, mb, tok, depth_bank):
     assert m["damage_batch_size"] == m["limits"]["damage_batch_size"] == BATCH
     assert m["sites"] == SDC.SITE_RULES and m["u9D_unit_mask"] == "EEEEEEEEDE"
     assert m["cells"] == {k: [list(c) for c in v] for k, v in cells.items()}
-    assert m["n_variants"] == 2 * len(CONTROL_CELLS) and m["n_excluded"] == 0
+    assert m["n_variants"] == 2 * len(CONTROL_CELLS) and m["n_excluded"] == 0 and m["n_formulations"] == 2
+    assert m["design_filters"] == ["families"]                     # F01 only: never preferred over the whole design
     assert m["audit"]["valid"] and m["audit"]["n_rows"] == len(d) and m["tables"]["damage_ctl"] == len(d)
     assert m["depth_site"] == dict(layer=C.depth_site(mb).layer, site="block_input")
-    assert m["platform"]["device"] == "cpu" and m["platform"]["main_torch"] == mm["torch_version"]
+    # the replication platform next to the environment's own OS string (which it must not replace)
+    rp = m["replication_platform"]
+    assert rp["device"] == "cpu" and rp["main_torch"] == mm["torch_version"] and rp["main_platform"] == mm["platform"]
+    assert isinstance(m["platform"], str) and m["platform"] and m["platform"] == mm["platform"]
 
     # its own checkpoints are gone; the main run (manifest, bank, its checkpoints) is untouched
     assert not (rd / "_resume").exists() and not (rd / "directions_depth.npz").exists()
@@ -263,6 +289,12 @@ def test_guards_refuse_before_writing(mb, depth_bank, tmp_path):
     link = tmp_path / "link"
     link.symlink_to(main, target_is_directory=True)
     refused(link, "is the main stage-D run directory")
+    refused(RunDir(main, "D", mb.spec, mkdir=False).path, "lies inside the main stage-D run directory")     # --out <main>
+    # the root (--out): a runs folder (here of another account), or one that holds the main run
+    for root in (tmp_path / "LSNE_B" / "runs", tmp_path):
+        with pytest.raises(SDC.ControlRunError, match="is a runs folder, lies inside the root of the main"):
+            SD.run(replace(cfg, out_root=str(root)), mb, RunDir(root, "D", mb.spec, mkdir=False).path, **kw)
+        assert not (root / "D").exists()
     for status in ("ok", "error"):
         other = tmp_path / f"other_{status}"
         write_manifest(other, stage="D", status=status)
@@ -318,7 +350,10 @@ def test_cli_control_run_and_refusals(mb, depth_bank, tmp_path):
     for argv, match in ((["--stage", "D", "--out", str(ctl_root), "--d-control", "token_language"], "go together"),
                         (["--stage", "D", "--out", str(ctl_root), "--d-main-run", str(main)], "go together"),
                         (["--stage", "D,E", "--out", str(ctl_root)] + ctl, "stage D alone"),
-                        (["--stage", "D", "--out", str(tmp_path / "LSNE" / "runs")] + ctl, "main stage-D run directory")):
+                        (["--stage", "D", "--out", str(tmp_path / "LSNE" / "runs")] + ctl, "main stage-D run directory"),
+                        (["--stage", "D", "--out", str(main)] + ctl, "lies inside the main stage-D run directory"),
+                        (["--stage", "D", "--out", str(tmp_path / "LSNE")] + ctl, "holds it"),
+                        (["--stage", "D", "--out", str(tmp_path / "LSNE_B" / "runs")] + ctl, "is a runs folder")):
         with pytest.raises(SystemExit, match=match):
             cli_main(base + argv)
     with pytest.raises(SystemExit):                                          # argparse: not a known control

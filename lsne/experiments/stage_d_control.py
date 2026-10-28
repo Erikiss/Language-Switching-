@@ -21,12 +21,16 @@ Inputs taken from the main stage-D run (``kw['d_main_run']``), never refitted:
 * its depth bank ``directions_depth.npz`` (:func:`~lsne.experiments.common.load_bank`) with the
   vectors exactly as stored (:func:`load_main_bank`).
 
-Variants: the regular builder (:func:`~lsne.experiments.common.get_variants`, the run's ``cfg``)
-restricted to the standard variants of the test split (F01-F12 x {A, B}) at K = 0 and K = 2 / 4 / 8
-x C1 / C2 / C3 (no ``seg``, no original-context variants), plus per test formulation the variant
-``u9D``: only unit 9 German (unit mask :data:`U9D_UNIT_MASK` realised at C1, two switches), checked
-against the formulation's K = 0 variant like every variant (PREREGISTRATION section 4; an excluded
-one is recorded in ``damage_ctl_checks``, not run).
+Variants: the regular builder (:func:`~lsne.experiments.common.get_variants`, the run's ``cfg``
+on its test formulations) restricted to the standard variants of the test split (F01-F12 x {A, B})
+at K = 0 and K = 2 / 4 / 8 x C1 / C2 / C3 (no ``seg``, no original-context variants), plus per test
+formulation the variant ``u9D``: only unit 9 German (unit mask :data:`U9D_UNIT_MASK` realised at C1,
+two switches), checked against the formulation's K = 0 variant like every variant
+(PREREGISTRATION section 4; an excluded one is recorded in ``damage_ctl_checks``, not run).  A run
+narrowed by cfg filters (``--families`` / ``--limit-families`` below the main run's selection,
+``--limit-variants``, K / C levels) records them in the manifest (``design_filters``,
+:func:`design_filters`); the evaluation never prefers it over a run of the whole design and judges
+by its audits whether it covers the rows of the primary endpoint.
 
 Sites (all at the depth site, block input of block ``n_layers // 3``; defined by the unit, never
 by the language as :func:`lsne.stimuli.last_switched_position` is):
@@ -52,9 +56,11 @@ Tables:
                           rows ``P.ctl*``)
 
 Safety: the run refuses (:class:`ControlRunError`, raised before anything is written) to work in
-the main run's directory or in any directory that holds a stage-D run other than this control,
-and to start without an ok main stage-D run of the same model, revision and dtype with its depth
-bank.  Its checkpoints (``_resume``, own signature) stay in its own directory.
+the main run's directory or inside it, under a root that is a ``runs`` folder, lies in the main
+run's root or holds the main run, or in any directory that holds a stage-D run other than this
+control; to start without an ok main stage-D run of the same model, revision and dtype with its
+depth bank; and to start without a control variant.  Its checkpoints (``_resume``, own signature)
+stay in its own directory.
 """
 from __future__ import annotations
 
@@ -135,16 +141,33 @@ def _same_dir(a: Path, b: Path) -> bool:
     return a.resolve() == b.resolve()
 
 
-def check_run_dir(run_dir, main_dir) -> None:
-    """Refuse (:class:`ControlRunError`) a control-run directory that is the main run's directory
-    or holds a stage-D run other than this control: a ``manifest.json`` without
+def _inside(path: Path, root: Path) -> bool:
+    """``path`` is ``root`` or lies below it (resolved paths)."""
+    p, r = path.resolve(), root.resolve()
+    return p == r or r in p.parents
+
+
+def check_run_dir(run_dir, main_dir, out_root=None) -> None:
+    """Refuse (:class:`ControlRunError`) a control-run directory that is the main run's directory,
+    lies inside it or holds a stage-D run other than this control: a ``manifest.json`` without
     ``control == "token_language"`` (any status; never overwrite a main run), or the depth bank
     ``directions_depth.npz`` (a main stage-D run writes it before its checkpoints and its manifest,
-    so an interrupted main run is recognised too).  Reads only."""
+    so an interrupted main run is recognised too).  With ``out_root`` (``--out``, the root of
+    ``run_dir``) also a root that is a ``runs`` folder (a main-run root, of this account or
+    another), lies inside the main run's root or holds the main run.  Reads only."""
     rd, md = Path(os.fspath(run_dir)), Path(os.fspath(main_dir))
     if _same_dir(rd, md):
         raise ControlRunError(f"the control run directory {rd} is the main stage-D run directory; "
                               f"give the control run its own root (--out .../runs_ctl)")
+    if _inside(rd, md):
+        raise ControlRunError(f"the control run directory {rd} lies inside the main stage-D run directory {md}; "
+                              f"give the control run its own root (--out .../runs_ctl)")
+    if out_root is not None:
+        root = Path(os.fspath(out_root))
+        main_root = md.parent.parent if md.parent.name == "D" else md          # <main root>/D/<model>@<revision>
+        if root.name == "runs" or _inside(root, main_root) or _inside(md, root):
+            raise ControlRunError(f"the control run root {root} is a runs folder, lies inside the root of the main stage-D "
+                                  f"run {md} or holds it; give the control run its own root (--out .../runs_ctl)")
     if (rd / MANIFEST_NAME).exists():
         try:
             m = read_manifest(rd)
@@ -252,6 +275,35 @@ def in_control_set(family, formulation, K, Cc) -> bool:
     return cell and C.prereg_split(family, formulation) == "test"
 
 
+def control_formulations(cfg: RunConfig) -> list[str]:
+    """Tags (``F01A``) of the test formulations (F01-F12 x {A, B}, kind standard) among the
+    families that ``cfg.families`` selects, before ``cfg.limit_families``."""
+    return [f.tag for f in C.select_families(replace(cfg, limit_families=None))
+            if f.kind == "standard" and C.prereg_split(f.family_id, f.formulation) == "test"]
+
+
+def design_filters(cfg: RunConfig, main_cfg: Optional[dict] = None) -> list[str]:
+    """The settings of ``cfg`` that narrow the control design, every test formulation the main run
+    selects x every cell (``main_cfg``: the ``cfg`` of the main run's manifest; None: the whole
+    stimulus bank) - manifest ``design_filters``, [] for the whole design: ``families`` when
+    ``cfg.families`` / ``cfg.limit_families`` drop a test formulation the main run has,
+    ``limit_variants``, and ``k_levels`` / ``c_levels`` without a level of the design.  The
+    evaluation never prefers such a run over one of the whole design
+    (``lsne.prereg_eval.select_runs``); whether it covers the rows of the primary endpoint is
+    decided by its audits there."""
+    mc = main_cfg if isinstance(main_cfg, dict) else {}
+
+    def formulations(c: RunConfig) -> set:          # the test formulations after cfg.families and cfg.limit_families
+        sel = control_formulations(c)
+        return {f.tag for f in C.select_families(replace(c, families=sel))} if sel else set()
+
+    main = replace(cfg, families=mc.get("families") or None, limit_families=mc.get("limit_families") or None)
+    on = dict(families=bool(formulations(main) - formulations(cfg)), limit_variants=bool(cfg.limit_variants),
+              k_levels=not set(CTL_K) <= {int(k) for k in cfg.k_levels},
+              c_levels=not set(CTL_C) <= {str(c) for c in cfg.c_levels})
+    return [name for name, narrowed in on.items() if narrowed]
+
+
 def u9d_variant(fam: stimuli.Family, tokenizer) -> stimuli.Variant:
     """Control 3: the variant of ``fam`` with only unit 9 German (:data:`U9D_UNIT_MASK` realised at
     C1, :data:`U9D_K` switches), tagged ``<family><formulation>:K2:u9D``."""
@@ -264,13 +316,23 @@ def u9d_variant(fam: stimuli.Family, tokenizer) -> stimuli.Variant:
 def control_variants(cfg: RunConfig, mb: ModelBundle, ctx: Optional[dict] = None) -> tuple[list, pd.DataFrame]:
     """``(variants, checks)`` of the control run.
 
-    ``variants``: the regular variants (:func:`~lsne.experiments.common.get_variants`; ``cfg.families``,
-    the ``cfg.limit_*`` filters and the K = 0 checks apply as in every stage) of the control set
-    (:func:`in_control_set`), each test formulation followed by its ``u9D`` variant
-    (:func:`u9d_variant`, kept only when it passes :func:`lsne.stimuli.check_variant` against the
-    formulation's K = 0 variant), then ``cfg.limit_variants`` as in the regular builder.
-    ``checks`` (``damage_ctl_checks``, :data:`CHECK_COLS`): the regular check rows of the control
-    set and one row per ``u9D`` variant built or excluded."""
+    ``variants``: the regular variants (:func:`~lsne.experiments.common.get_variants`; the K = 0
+    checks apply as in every stage) of the control set (:func:`in_control_set`), each test
+    formulation followed by its ``u9D`` variant (:func:`u9d_variant`, kept only when it passes
+    :func:`lsne.stimuli.check_variant` against the formulation's K = 0 variant), then
+    ``cfg.limit_variants`` as in the regular builder.  The regular builder runs on the test
+    formulations of ``cfg.families`` only (:func:`control_formulations`), so that its
+    ``cfg.limit_families`` / ``cfg.limit_variants`` act on them (in the stimulus bank DEV01-DEV04
+    come first: a limit applied before the split would leave nothing) and select the same C1
+    variants as a main run limited alike.  ``checks`` (``damage_ctl_checks``,
+    :data:`CHECK_COLS`): the regular check rows of the control set (as the regular builder's,
+    also of variants its limit drops) and one row per ``u9D`` variant built or excluded.
+    :class:`ControlRunError` when no test formulation is selected or no variant is left."""
+    tags = control_formulations(cfg)
+    if not tags:
+        raise ControlRunError(f"no test formulation (F01-F12 x A, B) among the selected families "
+                              f"({', '.join(map(str, cfg.families)) if cfg.families else 'all'}): no control variant")
+    cfg = replace(cfg, families=tags)
     variants, checks = C.get_variants(cfg, mb, ctx)
     keep = [v for v in variants if not C.is_original(v) and in_control_set(v.family_id, v.formulation, v.K, v.C)]
     rows: list[dict] = []
@@ -301,8 +363,12 @@ def control_variants(cfg: RunConfig, mb: ModelBundle, ctx: Optional[dict] = None
         rows.append(dict(ident, step="check", problem="; ".join(probs), excluded=bool(probs)))
         if not probs:
             groups[key].append(v)
-    out = [v for vs in groups.values() for v in vs]
-    return C.apply_variant_limit(out, cfg.limit_variants), pd.DataFrame(rows, columns=list(CHECK_COLS))
+    out = C.apply_variant_limit([v for vs in groups.values() for v in vs], cfg.limit_variants)
+    if not out:
+        raise ControlRunError(f"no control variant left for the test formulations {', '.join(tags[:4])}"
+                              f"{' ...' if len(tags) > 4 else ''} (K levels {cfg.k_levels}, C levels {cfg.c_levels}, "
+                              f"limits {cfg.limit_families} families / {cfg.limit_variants} variants, section-4 exclusions)")
+    return out, pd.DataFrame(rows, columns=list(CHECK_COLS))
 
 
 def site_names(v) -> tuple[str, ...]:
@@ -344,15 +410,16 @@ def control_damage_tables(mb: ModelBundle, variants, bank: C.DirectionBank, dir_
 
 
 def platform_info(mb: ModelBundle, main_manifest: dict) -> dict:
-    """Manifest ``platform``: torch / CUDA build and device of this run next to the main run's torch
-    version.  The replication of the primary site is exact on the same platform; another build
-    changes round-off, and lambda at the smallest dose moves by up to ~5e-3 under round-off-level
-    input changes (pythia-160m, measured on CPU), which is above the 1e-3 bound of the audit."""
+    """Manifest ``replication_platform``: torch / CUDA build and device of this run next to the main
+    run's torch version and OS (``main_platform``; this run's OS is the manifest's own ``platform``).
+    The replication of the primary site is exact on the same platform; another build changes
+    round-off, and lambda at the smallest dose moves by up to ~5e-3 under round-off-level input
+    changes (pythia-160m, measured on CPU), which is above the 1e-3 bound of the audit."""
     gpu = ""
     if mb.device.type == "cuda" and torch.cuda.is_available():
         gpu = torch.cuda.get_device_name(mb.device)
     return dict(torch=str(torch.__version__), cuda=str(torch.version.cuda or ""), device=str(mb.device), gpu=gpu,
-                main_torch=str(main_manifest.get("torch_version", "")))
+                main_torch=str(main_manifest.get("torch_version", "")), main_platform=str(main_manifest.get("platform", "")))
 
 
 def control_contrasts(damage: pd.DataFrame) -> pd.DataFrame:
@@ -377,7 +444,7 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     main_dir = kw.get("d_main_run")
     if not main_dir:
         raise ControlRunError("the control run needs the main stage-D run directory (kw['d_main_run'], --d-main-run)")
-    check_run_dir(run_dir, main_dir)
+    check_run_dir(run_dir, main_dir, cfg.out_root)
     main = main_run_inputs(cfg, main_dir)
     dsite = C.depth_site(mb)
     dbank = main["bank"]
@@ -405,9 +472,10 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
                          bank=dict(file=f"{BANK_NAME}.npz", sha256=main["bank_sha256"], names=list(dbank.dirs)),
                          depth_site=dsite, lattice_directions=lattice_dirs, doses=doses, damage_batch_size=batch,
                          sites=SITE_RULES, cells=control_cells(variants), u9D_unit_mask=U9D_UNIT_MASK,
-                         n_variants=len(variants),
+                         n_variants=len(variants), n_formulations=len({C.group_key(v) for v in variants}),
+                         design_filters=design_filters(cfg, mm.get("cfg")),
                          n_excluded=int(checks["excluded"].astype(bool).sum()) if len(checks) else 0,
                          resumed_checkpoints=len(res.loaded), audit=C.audit_summary(damage),
-                         platform=platform_info(mb, mm))
+                         replication_platform=platform_info(mb, mm))
     res.clear()
     return out

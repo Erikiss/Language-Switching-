@@ -110,13 +110,16 @@ CTL_WORLDS = {"wechsel": ((0.10, 0.12, 0.14), (0.09, 0.11, 0.13)),
 CTL_TIME = "2026-10-28T09:30:00+00:00"            # after the commit of amendment 6.11 (08:05:51 UTC)
 
 
-def damage_ctl_table(main: pd.DataFrame, world: str = "wechsel", u9d: float = 0.08, audit: float = 1e-7) -> pd.DataFrame:
+def damage_ctl_table(main: pd.DataFrame, world: str = "wechsel", u9d: float = 0.08, audit: float = 1e-7,
+                     rand_u10: bool = False) -> pd.DataFrame:
     """``damage_ctl`` of the control run (stage_d_control) for every formulation of the main run's
     ``main``: u9 at C1 (K 0/2/4/8) = the main depth rows (same lam and inject_pos, so the
     replication holds); control 1 (C2, C3 at u9) and control 2 (C1 at u10) add the world's
-    dlam(lang_dom) (+ family noise) to the K=0 row at the same site, rand / ent stay at it;
-    control 3 (u9D, K=2) adds ``u9d``.  Every site is "."; the K>0 rows outside the
-    confirmation set (DEV01 / F13, formulation C) carry +5 (must never leak in)."""
+    dlam(lang_dom) (+ family noise) to the K=0 row at the same site, rand / ent stay at it
+    (``rand_u10``: at u10 rand rises with lang_dom, a direction-unspecific site effect, plus a
+    per-family scatter of mean 0, so the DiD scatters around 0); control 3 (u9D, K=2) adds
+    ``u9d``.  Every site is "."; the K>0 rows outside the confirmation set (DEV01 / F13,
+    formulation C) carry +5 (must never leak in)."""
     eff1, eff2 = (dict(zip((2, 4, 8), e)) for e in CTL_WORLDS[world])
     dep = main[(main["inject"] == "depth") & (main["C"] == "C1")]
     site = dict(inject_token=".", inject_token_id=15, inject_klass="punct", audit_rel_err=audit)
@@ -128,6 +131,7 @@ def damage_ctl_table(main: pd.DataFrame, world: str = "wechsel", u9d: float = 0.
             rows.append(dict(r, inject="u9", inject_lang="D" if r["K"] else "E", inject_unit=9, site_gap=gap, **site))
         for r in g[g["K"] == 0].to_dict("records"):
             ld = r["dir_family"] == "lang_dom"
+            rd = rand_u10 and r["dir_family"] == "rand"
             u9 = dict(r, inject="u9", inject_lang="E", inject_unit=9, site_gap=gap, **site)
             for K in (2, 4, 8):
                 for Cc in ("C2", "C3"):                                  # control 1: the "." closes an English clause
@@ -136,7 +140,8 @@ def damage_ctl_table(main: pd.DataFrame, world: str = "wechsel", u9d: float = 0.
             rows.append(dict(u9, tag=f"{fam}{form}:K2:u9D", K=2, C="u9D", inject_lang="D",      # control 3
                              lam=r["lam"] + leak + (u9d + _noise(fam + "u9D", 2) if ld else 0.0)))
             for K in (0, 2, 4, 8):                                       # control 2: the "." ending unit 10
-                shift = 0.0 if K == 0 else leak + (eff2[K] + _noise(fam + "u10", K) if ld else 0.0)
+                off = SPREAD[TEST.index(fam)] / 4 if rd and fam in TEST else 0.0
+                shift = 0.0 if K == 0 else leak + (eff2[K] + _noise(fam + "u10", K) + off if ld or rd else 0.0)
                 rows.append(dict(u9, tag=f"{fam}{form}:K{K}:C1", K=K, C="C1", inject="u10", inject_unit=10, site_gap=1,
                                  inject_pos=int(r["inject_pos"]) + gap - 1, lam=r["lam"] + 0.02 + shift))
     return pd.DataFrame(rows)
@@ -457,10 +462,16 @@ def test_control_constants_mirror_the_control_run():
     the manifest marks, the sites, the u9D label and the columns damage_ctl adds."""
     from lsne.experiments import stage_d_control as SDC
 
+    from types import SimpleNamespace
+
     assert PE.CTL_CONTROL == SDC.CONTROL and PE.AMENDMENT_611["id"] == SDC.AMENDMENT
     assert PE.CTL_SITES == SDC.SITE_UNITS and PE.CTL3_C == SDC.U9D_C
     assert set(SDC.EXTRA_COLS) <= set(PE.DAMAGE_CTL_COLS)
-    assert {"family", "formulation", "C", "excluded"} <= set(SDC.CHECK_COLS)
+    assert {"family", "formulation", "K", "C", "excluded"} <= set(SDC.CHECK_COLS)
+    # the design the site audit requires: every control variant of a formulation at the sites the run injects it at
+    cells = [(0, "C1")] + [(K, c) for K in SDC.CTL_K[1:] for c in SDC.CTL_C] + [(SDC.U9D_K, SDC.U9D_C)]
+    assert {s: set(v) for s, v in PE.CTL_DESIGN.items()} == {
+        s: {(K, c) for K, c in cells if s in SDC.site_names(SimpleNamespace(K=K, C=c))} for s in SDC.INJECT_NAMES}
 
 
 def test_family_delta_pools_a_tuple_of_c_levels():
@@ -598,6 +609,28 @@ def test_token_control_offen_or_no_control_run_caps_p_at_open(tmp_path):
     assert "token-language control (PREREGISTRATION 6.11): offen; rule outcome without the control: supported" in p["deviation_note"]
 
 
+def test_a_control_shows_the_effect_only_with_its_did_against_rand(tmp_path):
+    """6.11: a control shows the effect only if ci_low of dlam(lang_dom, K=8) >= 0.05 AND the CI of
+    the DiD against rand at the same site lies above 0.  Here rand rises with lang_dom at the end of
+    unit 10 (a direction-unspecific site effect): control 2's dlam(lang_dom) passes the minimum
+    effect, its DiD does not, so control 2 does not show the effect, the outcome is "offen" (not
+    "Wechsel") and a supported P is capped at open."""
+    dmg = damage_table()
+    write_run(tmp_path / "runs", "D", {"damage": dmg})
+    write_ctl_run(tmp_path / "runs_ctl", damage_ctl_table(dmg, "wechsel", rand_u10=True))
+    df = PE.evaluate([tmp_path / "runs", tmp_path / "runs_ctl"], n_boot=500, seed=1)["results"].set_index("id")
+    assert df.loc["P.ctl1@0.05", "verdict"] == "supported"
+    lang, did = df.loc["P.ctl2.lang.K8@0.05"], df.loc["P.ctl2.did.K8@0.05"]
+    assert lang["verdict"] == "supported" and lang["ci_low"] >= 0.05
+    assert did["ci_low"] <= 0 <= did["ci_high"] and did["verdict"] != "supported"
+    assert df.loc["P.ctl2@0.05", "verdict"] == "not_supported"
+    s = df.loc["P.ctl@0.05"]
+    assert s["verdict"] == "open" and s["deviation_note"].startswith("outcome offen")
+    p = df.loc["P@0.05"]
+    assert p["verdict"] == "open"
+    assert "token-language control (PREREGISTRATION 6.11): offen; rule outcome without the control: supported" in p["deviation_note"]
+
+
 def test_the_control_gate_never_improves_the_primary_verdict():
     """apply_token_control per (P verdict, P.ctl verdict of the same dose): Wechsel keeps P, lokal
     makes a supported or open P not_interpretable, anything else (offen, not tested, not
@@ -667,6 +700,16 @@ def _edit_first(x: pd.DataFrame, mask: pd.Series, col: str, value=None, add=None
     return x
 
 
+def _drop_first(x: pd.DataFrame, mask: pd.Series) -> pd.DataFrame:
+    """A copy of ``x`` without the first row in ``mask``."""
+    return x.drop(index=x.index[mask.to_numpy()][0])
+
+
+def _f05_u9_c1(x: pd.DataFrame) -> pd.Series:
+    """The pre-registered site (u9, C1) of family F05 at the exploratory dose 0.5 (no P.ctl row reads it)."""
+    return (x["inject"] == "u9") & (x["C"] == "C1") & (x["family"] == "F05") & (x["eps"] == 0.5)
+
+
 #: One broken validity condition of 6.11 per case: (audit row, change of damage_ctl, manifest fields,
 #: text of the audit note).
 CTL_BREAKS = {
@@ -676,6 +719,16 @@ CTL_BREAKS = {
                                                                  "lam", add=0.002), {}, "|difference| > 1e-3 or not finite: 1"),
     "replication_pos": ("audit.D1ctl.rep", lambda x: _edit_first(x, (x["inject"] == "u9") & (x["K"] == 0), "inject_pos", add=1),
                         {}, "different inject_pos: 1"),
+    # a control row whose tag the main run does not have / a row of P without its control row
+    "replication_missing": ("audit.D1ctl.rep", lambda x: _edit_first(x, _f05_u9_c1(x), "tag", "F05A:K0:C1x"), {},
+                            "missing in the main run: 1"),
+    "replication_uncovered": ("audit.D1ctl.rep", lambda x: _drop_first(x, _f05_u9_c1(x)), {},
+                              "in the confirmation set without a control row: 1 of"),
+    # a row outside the cells of the design / a cell of the design without rows
+    "site_cell": ("audit.D1ctl.site", lambda x: _edit_first(x, (x["inject"] == "u9") & (x["C"] == "C2"), "C", "seg"), {},
+                  "outside the control cells: 1)"),
+    "site_design_cell": ("audit.D1ctl.site", lambda x: x[x["tag"] != "F03B:K4:C3"], {},
+                         "cells of the design missing: 1 of 360 (24 formulations of the confirmation set, e.g. F03B K=4 C3 at u9)"),
     "site_token": ("audit.D1ctl.site", lambda x: _edit_first(x, x["inject"] == "u10", "inject_token", ","), {},
                    "token != '.': 1,"),
     "site_language": ("audit.D1ctl.site", lambda x: _edit_first(x, (x["inject"] == "u9") & (x["C"] == "C3"), "inject_lang", "D"),
@@ -713,6 +766,59 @@ def test_a_failed_control_audit_invalidates_the_control_and_caps_p(tmp_path, cas
     assert p["verdict"] == "open"
     assert ("token-language control (PREREGISTRATION 6.11): no valid control run; rule outcome without the control: supported"
             in p["deviation_note"])
+
+
+def test_a_narrowed_control_run_is_no_valid_control(tmp_path):
+    """6.11 fixes the control run on F01-F12 x {A, B} with every cell.  A run narrowed to F01-F04
+    without C3 passes every check row by row, but covers neither the rows of P (audit.D1ctl.rep)
+    nor the cells of control 1 (audit.D1ctl.site): its "lokal" outcome against a main run whose P
+    is open at the frozen dose does not make P not interpretable; without a valid control P stays
+    open, and the rule outcome stays in the notes."""
+    dmg = _primary_damage(np.array([0.0987 + 1.6 * x for x in SPREAD]))
+    write_run(tmp_path / "runs", "D", {"damage": dmg}, frozen_dose=0.05)
+    ctl = damage_ctl_table(dmg, "lokal")
+    write_ctl_run(tmp_path / "runs_ctl", ctl[ctl["family"].isin(TEST[:4]) & (ctl["C"] != "C3")],
+                  design_filters=["families", "c_levels"])
+    df = PE.evaluate([tmp_path / "runs", tmp_path / "runs_ctl"], n_boot=500, seed=0)["results"].set_index("id")
+    rep, site, run = (df.loc[a] for a in ("audit.D1ctl.rep", "audit.D1ctl.site", "audit.D1ctl.run"))
+    assert rep["verdict"] == "not_supported" and "without a control row: 320 of 480" in rep["deviation_note"]
+    assert site["verdict"] == "not_supported" and "cells of the design missing: 24 of 120" in site["deviation_note"]
+    assert run["verdict"] == "supported" and "design narrowed by cfg (families, c_levels)" in run["deviation_note"]
+    rows = df[df.index.str.startswith("P.ctl")]
+    assert (rows["verdict"] == "not_interpretable").all() and rows.loc["P.ctl", "n_families"] == 4
+    assert "rule outcome ignoring the audits: lokal (not_supported)" in rows.loc["P.ctl", "deviation_note"]
+    assert df.loc["P", "verdict"] == "open"
+    assert ("token-language control (PREREGISTRATION 6.11): no valid control run; rule outcome without the control: open"
+            in df.loc["P", "deviation_note"])
+
+
+def test_a_control_run_of_the_whole_design_is_preferred_over_a_narrowed_one(tmp_path):
+    """A newer control run narrowed by a variant limit (manifest design_filters, account B) never
+    replaces account A's run of the whole design: A's run is used, B's is superseded.  Used alone,
+    the narrowed run is no valid control (it does not cover the rows of P)."""
+    a, b = tmp_path / "LSNE", tmp_path / "LSNE_B"
+    dmg = damage_table()
+    write_run(a / "runs", "D", {"damage": dmg})
+    ctl = damage_ctl_table(dmg)
+    write_ctl_run(a / "runs_ctl", ctl, design_filters=[])
+    write_ctl_run(b / "runs_ctl", ctl[ctl["tag"].str.startswith("F01A:")], timestamp="2026-10-28T12:00:00+00:00",
+                  design_filters=["limit_variants"])
+    res = PE.evaluate([a, b], n_boot=300, seed=1)
+    runs = res["runs"]
+    used = runs[runs["used"].astype(bool)].set_index("key")
+    assert str(used.loc["D_ctl", "path"]).startswith(str(a / "runs_ctl" / "D"))
+    assert f"superseded by a control run of the whole design {a / 'runs_ctl' / 'D'}" in " ".join(runs["note"].astype(str))
+    df = res["results"].set_index("id")
+    assert (df.loc[[i for i in df.index if i.startswith("audit.D1ctl")], "verdict"] == "supported").all()
+    assert df.loc["P.ctl@0.05", "verdict"] == "supported" and df.loc["P@0.05", "verdict"] == "supported"
+    alone = PE.evaluate([a / "runs", b], n_boot=300, seed=1)["results"].set_index("id")
+    assert alone.loc["audit.D1ctl.rep", "verdict"] == "not_supported" and alone.loc["audit.D1ctl.site", "verdict"] == "supported"
+    assert alone.loc["P.ctl@0.05", "verdict"] == "not_interpretable" and alone.loc["P@0.05", "verdict"] == "open"
+    # the mark counts for the control run only (key D_ctl); an empty list is the whole design
+    mark = dict(control="token_language", design_filters=["families"])
+    assert PE.StageRun(stage="D", path=a, root=a, manifest=mark).partial
+    assert not PE.StageRun(stage="D", path=a, root=a, manifest=dict(mark, design_filters=[])).partial
+    assert not PE.StageRun(stage="D", path=a, root=a, manifest=dict(design_filters=["families"])).partial
 
 
 def test_a_control_run_older_than_amendment_611_fails_the_run_audit(tmp_path):

@@ -14,7 +14,8 @@ one root the newest manifest is used and the others are listed as superseded; st
 into the stand-in run and the trace-source run (``manifest.source.kind == "trace"``), stage D
 into the main run and the token-language control run (``manifest.control ==
 "token_language"``, key ``D_ctl``, PREREGISTRATION 6.11), so a control run never replaces the
-main run.  Only the stages in :data:`EVAL_STAGES` are opened: the scale sweep (stage F and its sub-runs
+main run (and a control run narrowed by cfg filters never one of the whole design).  Only the
+stages in :data:`EVAL_STAGES` are opened: the scale sweep (stage F and its sub-runs
 ``F/<model>@<rev>/shard*/...``) is never touched, so a sweep that is still running is not
 disturbed.
 
@@ -61,8 +62,9 @@ Endpoints (``id`` column)
               K=8) < 0.05) or "offen".  The control can only weaken P (:func:`apply_token_control`):
               "lokal" makes a supported or open P ``not_interpretable``, "offen" or no valid
               control run caps it at "open".  Validity: ``audit.D1ctl`` (write audit),
-              ``audit.D1ctl.rep`` (lam at the pre-registered site within 1e-3 of the main run),
-              ``audit.D1ctl.site`` and ``audit.D1ctl.run`` (manifest marks, run newer than the
+              ``audit.D1ctl.rep`` (lam at the pre-registered site within 1e-3 of the main run,
+              and a control row for every row of P), ``audit.D1ctl.site`` (sites and every cell
+              of the design) and ``audit.D1ctl.run`` (manifest marks, run newer than the
               amendment); a failed audit makes every ``P.ctl*`` row ``not_interpretable``.
 ``audit.*``   section 4 run validity: max / quantiles of ``audit_rel_err`` and the number of
               rows > 1e-4 in stage D ``damage`` (``audit.D1``) and stage C ``grid``
@@ -274,6 +276,14 @@ class StageRun:
         lim = self.manifest.get("limits") or {}
         return bool(isinstance(lim, dict) and (lim.get("is_smoke") or lim.get("limited")))
 
+    @property
+    def partial(self) -> bool:
+        """A token-language control run whose design was narrowed by cfg filters or limits (manifest
+        ``design_filters``, e.g. ``["limit_variants"]``: fewer test formulations than its main run,
+        a variant limit, K / C levels missing): never preferred over one of the whole design
+        (:func:`select_runs`); whether it covers P is judged by its audits."""
+        return self.key == "D_ctl" and bool(self.manifest.get("design_filters"))
+
     def label(self) -> str:
         return f"{self.stage}/{self.path.name}"
 
@@ -350,18 +360,21 @@ def discover_runs(roots: Sequence, model: str = DEFAULT_MODEL, revision: str = D
 
 
 def select_runs(runs: Sequence[StageRun]) -> dict[str, StageRun]:
-    """The run used per key (stage letter, ``L_trace``): the newest ok manifest, a full run
-    before a smoke / limited one; the other runs get a note (superseded / not ok)."""
+    """The run used per key (stage letter, ``L_trace``, ``D_ctl``): the newest ok manifest, a
+    full run before a smoke / limited one, a control run of the whole design before a narrowed
+    one (:attr:`StageRun.partial`); the other runs get a note (superseded / not ok)."""
     chosen: dict[str, StageRun] = {}
     by_key: dict[str, list[StageRun]] = {}
     for r in runs:
         by_key.setdefault(r.key, []).append(r)
     for key, rs in by_key.items():
-        ok = sorted((r for r in rs if r.status == "ok"), key=lambda r: (not r.reduced, r.timestamp), reverse=True)
+        ok = sorted((r for r in rs if r.status == "ok"), key=lambda r: (not r.reduced, not r.partial, r.timestamp),
+                    reverse=True)
         if ok:
             chosen[key] = ok[0]
             for r in ok[1:]:
-                why = "a full run" if r.reduced and not ok[0].reduced else "the newer run"
+                why = ("a full run" if r.reduced and not ok[0].reduced else
+                       "a control run of the whole design" if r.partial and not ok[0].partial else "the newer run")
                 r.note = (r.note + "; " if r.note else "") + f"superseded by {why} {ok[0].path}"
         for r in rs:
             if r.status != "ok":
@@ -1075,6 +1088,9 @@ CTL1_C = ("C2", "C3")       # control 1: C2 and C3 pooled (unit 9 is DDE / DEE: 
 CTL3_C = "u9D"              # control 3: only unit 9 German (unit mask EEEEEEEEDE, K = 2)
 CTL_KS = (2, 4, 8)
 CTL_REP_TOL = 1e-3          # replication of the pre-registered site: |lam_ctl - lam_main| <= 1e-3
+#: The design of the control run (stage_d_control): per site the (K, C) cells every test formulation runs there.
+CTL_DESIGN = {"u9": ((0, PRIMARY_C),) + tuple((K, c) for K in CTL_KS for c in (PRIMARY_C,) + CTL1_C) + ((2, CTL3_C),),
+              "u10": ((0, PRIMARY_C),) + tuple((K, PRIMARY_C) for K in CTL_KS)}
 #: The three controls: (site, C level(s), K levels, label); controls 1 and 2 decide, 3 is reported.
 CTL_ARMS = {1: ("u9", CTL1_C, CTL_KS, "C2 + C3 pooled at u9 (end of unit 9)"),
             2: ("u10", PRIMARY_C, CTL_KS, "C1 at u10 (end of unit 10)"),
@@ -1120,8 +1136,9 @@ def token_control_rows(ctx: EvalContext) -> list[dict]:
     control 2 = C1 at u10 (K = 8 main, 2 and 4 reported), control 3 = ``u9D`` at u9 (reported
     only).  Per pre-registered dose (suffix as P's) ``P.ctl`` holds the outcome "Wechsel" /
     "lokal" / "offen".  ``audit.D1ctl`` (write audit), ``.rep`` (replication of the main run at
-    the pre-registered site), ``.site`` and ``.run`` decide the run's validity: an audit that
-    does not pass makes every ``P.ctl*`` row ``not_interpretable``.  No row enters the BH group;
+    the pre-registered site and a control row for every row of P), ``.site`` (sites and the
+    cells of the design) and ``.run`` decide the run's validity: an audit that does not pass
+    makes every ``P.ctl*`` row ``not_interpretable``.  No row enters the BH group;
     :func:`apply_token_control` applies the outcome to P."""
     run = ctx.tables.run("D_ctl")
     if run is None:
@@ -1139,7 +1156,7 @@ def token_control_rows(ctx: EvalContext) -> list[dict]:
     by_inj = "; ".join(f"{inj}: max {_g(audit_summary(g['audit_rel_err'])['max'], 3)}"
                        for inj, g in dmg.groupby("inject", sort=True))
     audits = [audit_row("audit.D1ctl", CTL_AUDIT_NAME, "D", a_all, src, by_inj), _ctl_replication_audit(ctx, dmg, src),
-              _ctl_site_audit(dmg, src), run_audit]
+              _ctl_site_audit(ctx, dmg, src), run_audit]
     # ---- confirmation set, per site
     d = ctx.split(_standard(dmg)).copy()
     d = d[np.isfinite(pd.to_numeric(d["lam"], errors="coerce"))]
@@ -1275,11 +1292,15 @@ def _u9d_note(ctx: EvalContext) -> str:
 def _ctl_replication_audit(ctx: EvalContext, dmg: pd.DataFrame, src: str) -> dict:
     """``audit.D1ctl.rep`` (PREREGISTRATION 6.11 (b)): every control row at the pre-registered
     site (u9, C1, K 0/2/4/8) has the main run's ``depth`` row of the same tag, direction and eps
-    at the same position, and its lam lies within :data:`CTL_REP_TOL` of it; the estimate is
-    the largest absolute difference."""
+    at the same position, and its lam lies within :data:`CTL_REP_TOL` of it; and every ``depth``
+    row of the main run at that site in the confirmation set (C1, K 0/2/4/8: the rows of P) has
+    its control row, so the control covers the families, formulations, directions and doses of
+    P (a control run narrowed by cfg filters or limits does not).  The estimate is the largest
+    absolute difference."""
     name = "D1 control run: replication of the pre-registered site (u9, C1) against the main stage-D run"
     rule = ("control run valid iff every control row at u9 / C1 (K 0/2/4/8) has the main run's depth row (same tag, direction, "
-            "eps) at the same inject_pos and |lam_ctl - lam_main| <= 1e-3 (PREREGISTRATION 6.11 (b))")
+            "eps) at the same inject_pos with |lam_ctl - lam_main| <= 1e-3, and every depth row of the main run at C1 (K 0/2/4/8) "
+            "in the confirmation set has its control row (PREREGISTRATION 6.11 (b))")
 
     def row(verdict: str, note: str, **kw) -> dict:
         invalid = "" if verdict == "supported" else "control run not validated (PREREGISTRATION 6.11 (b))"
@@ -1294,20 +1315,24 @@ def _ctl_replication_audit(ctx: EvalContext, dmg: pd.DataFrame, src: str) -> dic
     drun = ctx.tables.run("D")
     if drun is None:
         return row("not_tested", "no main stage-D run under the given roots")
-    need = ["tag", "inject", "direction", "eps", "lam", "inject_pos"]
+    need = ["tag", "family", "formulation", "K", "C", "inject", "direction", "eps", "lam", "inject_pos"]
     m = ctx.tables.get("D", "damage", DAMAGE_READ_COLS)
     miss = _missing_cols(m, need)
     if miss:
         return row("not_tested", f"main run {drun.path}: "
                                  + ("damage table missing" if m is None else f"columns {miss} missing in damage"))
     key = ["tag", "direction", "eps"]
-    c = c[key + ["K", "lam", "inject_pos"]].copy()
-    m = m[(m["inject"].astype(str) == "depth") & m["tag"].astype(str).isin(set(c["tag"].astype(str)))]
-    m = m[key + ["lam", "inject_pos"]].copy()
-    for x in (c, m):
+
+    def keyed(x: pd.DataFrame, cols: list) -> pd.DataFrame:
+        x = x[key + cols].copy()
         x["tag"], x["direction"] = x["tag"].astype(str), x["direction"].astype(str)
         x["eps"] = x["eps"].astype(float).round(10)
-    j = c.merge(m, on=key, how="left", suffixes=("_ctl", "_main"), indicator=True)
+        return x
+
+    c = keyed(c, ["K", "lam", "inject_pos"])
+    dep = m[m["inject"].astype(str) == "depth"]
+    j = c.merge(keyed(dep[dep["tag"].astype(str).isin(set(c["tag"]))], ["lam", "inject_pos"]), on=key, how="left",
+                suffixes=("_ctl", "_main"), indicator=True)
     num = lambda col: pd.to_numeric(j[col], errors="coerce").to_numpy(dtype=float)  # noqa: E731
     found = (j["_merge"] == "both").to_numpy()
     diff = np.abs(num("lam_ctl") - num("lam_main"))
@@ -1315,28 +1340,41 @@ def _ctl_replication_audit(ctx: EvalContext, dmg: pd.DataFrame, src: str) -> dic
     n_missing = int((~found).sum())
     n_pos = int((found & ~same_pos).sum())
     n_over = int((found & ~(diff <= CTL_REP_TOL)).sum())          # a NaN difference is a mismatch
+    # the other way round: P's rows (the main run's depth rows at C1, K 0/2/4/8, in the confirmation set) need a control row
+    prim = ctx.split(_standard(dep))
+    prim = prim[(prim["C"].astype(str) == PRIMARY_C) & pd.to_numeric(prim["K"], errors="coerce").isin((0,) + CTL_KS)]
+    back = keyed(prim, []).merge(c[key].drop_duplicates(), on=key, how="left", indicator=True)
+    n_uncovered = int((back["_merge"] != "both").sum())
     fin = diff[found & np.isfinite(diff)]
     est = float(fin.max()) if fin.size else np.nan
-    ok = n_missing == n_pos == n_over == 0
+    ok = n_missing == n_pos == n_over == n_uncovered == 0
     ks = ", ".join(str(k) for k in sorted(set(c["K"].astype(int))))
     note = _join(f"{len(c)} control rows at u9 / C1 (K {ks}) vs the main run's depth rows: max |lam_ctl - lam_main| "
                  f"{_g(est, 3)} (tolerance 1e-3)",
                  f"missing in the main run: {n_missing}" if n_missing else "",
                  f"different inject_pos: {n_pos}" if n_pos else "",
                  f"|difference| > 1e-3 or not finite: {n_over}" if n_over else "",
+                 f"main-run depth rows at C1 (K 0/2/4/8) in the confirmation set without a control row: {n_uncovered} of "
+                 f"{len(back)}" + (" (the control run does not cover the families, formulations, directions or doses of P)"
+                                   if n_uncovered else ""),
                  f"main run {drun.path}")
     return row("supported" if ok else "not_supported", note, estimate=est, n_rows=len(c))
 
 
-def _ctl_site_audit(dmg: pd.DataFrame, src: str) -> dict:
-    """``audit.D1ctl.site`` (PREREGISTRATION 6.11 (c)): every row injects at ".", its language
-    mark is E at u10 and at u9 for K = 0 and C2 / C3, D at u9 for C1 (K > 0) and u9D, its unit
-    is 9 at u9 and 10 at u10, and ``site_gap`` (tail_start - inject_pos) is the formulation's
-    K = 0 gap at u9 and 1 at u10.  The estimate is the number of rows that break a rule."""
-    name = "D1 control run: injection sites ('.' token, language mark, unit, distance to the tail)"
+def _ctl_site_audit(ctx: EvalContext, dmg: pd.DataFrame, src: str) -> dict:
+    """``audit.D1ctl.site`` (PREREGISTRATION 6.11 (c) and the design of controls 1-3): every row
+    injects at ".", its language mark is E at u10 and at u9 for K = 0 and C2 / C3, D at u9 for
+    C1 (K > 0) and u9D, its unit is 9 at u9 and 10 at u10, and ``site_gap`` (tail_start -
+    inject_pos) is the formulation's K = 0 gap at u9 and 1 at u10; and every formulation of the
+    confirmation set in the run has every cell of :data:`CTL_DESIGN` at its site (a variant
+    excluded by section 4 in ``damage_ctl_checks`` excused), so no control lacks a C level or a
+    K.  The estimate is the number of rows that break a rule plus the number of missing cells."""
+    name = "D1 control run: injection sites (cells of the design, '.' token, language mark, unit, distance to the tail)"
     rule = ("control run valid iff every row injects at the token '.', inject_lang is E at u10 and at u9 for K=0 and C2 / C3 "
-            "and D at u9 for C1 (K>0) and u9D, inject_unit is 9 at u9 and 10 at u10, and site_gap (tail_start - inject_pos) "
-            "equals the formulation's K=0 gap at u9 and 1 at u10 (PREREGISTRATION 6.11 (c))")
+            "and D at u9 for C1 (K>0) and u9D, inject_unit is 9 at u9 and 10 at u10, site_gap (tail_start - inject_pos) "
+            "equals the formulation's K=0 gap at u9 and 1 at u10 (PREREGISTRATION 6.11 (c)), and every formulation of the "
+            "confirmation set in the run has every cell of the design (u9: K=0, C1 / C2 / C3 at K 2/4/8 and u9D; u10: K=0 and "
+            "C1 at K 2/4/8; a variant excluded by section 4 in damage_ctl_checks excused)")
     need = ["family", "formulation", "K", "C", "inject"] + CTL_SITE_COLS
     miss = _missing_cols(dmg, need)
     if miss or dmg.empty:
@@ -1362,16 +1400,31 @@ def _ctl_site_audit(dmg: pd.DataFrame, src: str) -> dict:
                         for b9, b10, f, fo in zip(u9, u10, x["family"], x["formulation"])], dtype=float)
     bad_gap = ~(gap == exp_gap)
     bad = bad_tok | bad_lang | bad_unit | bad_gap | ~cell
+    # every cell of the design for every formulation of the confirmation set in the run (section-4 exclusions excused)
+    have = set(zip(x["family"], x["formulation"], inj, np.nan_to_num(K, nan=-1).astype(int), Cc))
+    chk = ctx.tables.get("D_ctl", "damage_ctl_checks")
+    excused: set = set()
+    if not _missing_cols(chk, ["family", "formulation", "K", "C", "excluded"]):
+        ex = chk[chk["excluded"].map(_flag) == True]  # noqa: E712
+        excused = set(zip(ex["family"].astype(str), ex["formulation"].astype(str),
+                          pd.to_numeric(ex["K"], errors="coerce").fillna(-1).astype(int), ex["C"].astype(str)))
+    forms = sorted(set(zip(*(ctx.split(x)[c] for c in ("family", "formulation")))))
+    gone = [(f, fo, s, k, c) for f, fo in forms for s, cells in CTL_DESIGN.items() for k, c in cells
+            if (f, fo, s, k, c) not in have and (f, fo, k, c) not in excused]
     ids = ""
     if "inject_token_id" in x.columns:
         tid = sorted({int(t) for t in pd.to_numeric(x["inject_token_id"], errors="coerce").dropna()})
         ids = f"token ids at the sites: {', '.join(str(t) for t in tid[:5])}" + (" ..." if len(tid) > 5 else "")
+    n_bad = int(bad.sum()) + len(gone)
     note = _join(f"{len(x)} rows; rows breaking a rule: {int(bad.sum())} (token != '.': {int(bad_tok.sum())}, language mark: "
                  f"{int(bad_lang.sum())}, unit: {int(bad_unit.sum())}, site_gap: {int(bad_gap.sum())}, outside the control "
-                 f"cells: {int((~cell).sum())})", ids,
-                 "control run not validated (PREREGISTRATION 6.11 (c))" if bad.any() else "")
-    return make_row("audit.D1ctl.site", name, role="audit", stage="D", rule=rule, estimate=float(bad.sum()), n_rows=len(x),
-                    verdict="not_supported" if bad.any() else "supported", note=note, source=src)
+                 f"cells: {int((~cell).sum())})",
+                 f"cells of the design missing: {len(gone)} of {len(forms) * sum(map(len, CTL_DESIGN.values()))} "
+                 f"({len(forms)} formulations of the confirmation set" + (", e.g. " + ", ".join(
+                     f"{f}{fo} K={k} {c} at {s}" for f, fo, s, k, c in gone[:3]) if gone else "") + ")", ids,
+                 "control run not validated (PREREGISTRATION 6.11 (c))" if n_bad else "")
+    return make_row("audit.D1ctl.site", name, role="audit", stage="D", rule=rule, estimate=float(n_bad), n_rows=len(x),
+                    verdict="not_supported" if n_bad else "supported", note=note, source=src)
 
 
 def _ctl_run_audit(ctx: EvalContext, run: StageRun) -> dict:
@@ -1398,7 +1451,11 @@ def _ctl_run_audit(ctx: EvalContext, run: StageRun) -> dict:
         bad.append("smoke / limited run")
     mr = m.get("main_run") if isinstance(m.get("main_run"), dict) else {}
     drun = ctx.tables.run("D")
+    filters = m.get("design_filters") or []
+    filters = [filters] if isinstance(filters, str) else list(filters)
     note = _join("; ".join(bad), "control run not validated (PREREGISTRATION 6.11 (d))" if bad else "",
+                 (f"design narrowed by cfg ({', '.join(str(f) for f in filters)}): valid only where it covers the rows of P "
+                  "(audit.D1ctl.rep) and every cell of the design (audit.D1ctl.site)") if filters else "",
                  f"run {run.timestamp or '?'}, git {str(m.get('git_sha') or '?')[:7]}",
                  (f"main run in the manifest: {mr.get('path', '?')} ({mr.get('timestamp', '?')}, git "
                   f"{str(mr.get('git_sha') or '?')[:7]})") if mr else "the manifest names no main run",

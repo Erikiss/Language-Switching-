@@ -3,7 +3,8 @@
 Diese Datei fasst die präregistrierte Auswertung (`lsne.prereg_eval`, Notebook 13) zusammen. Sie stützt
 sich auf die Läufe von Lauf 1 (`docs/RESULTS_RUN1.md`) und die Neuläufe nach den Korrekturen vom
 27.10.2026. Maßgeblich ist die Präregistrierung in `docs/PREREGISTRATION.md` (Stand `58ec270`) mit den
-datierten Nachträgen in Abschnitt 6, zuletzt 6.10 vom 28.10.2026.
+datierten Nachträgen in Abschnitt 6, zuletzt 6.11 vom 28.10.2026 (Kontrolle der Sprache an der
+Injektionsstelle, festgelegt nach dem Bericht von 07:07 UTC; der Kontrolllauf steht aus, §2.2).
 
 Quellen auf Drive (Konto A, `MyDrive/LSNE/prereg_eval/`):
 
@@ -32,8 +33,10 @@ Auswahlhälfte), 8/9 (Formulierungen A–D gepoolt), 10 (ii) „wie gelaufen“ 
   * In Zelle C1 steigt λ(`lang_dom`, K = 8) gegenüber K = 0 um 0,094–0,099. Die untere Intervallgrenze liegt
     bei 0,069–0,074, über dem Mindesteffekt 0,05. Gegenüber Zufallsrichtungen bleibt ein Unterschied von
     0,102–0,109 (Intervalle über 0).
-  * Fast der ganze Effekt liegt im Schritt K = 0 → 2. Dort wechselt auch die Sprache des Injektionstokens
-    (englisch → deutsch). Ob der Sprachwechsel oder die Tokensprache wirkt, ist offen (§8).
+  * Fast der ganze Effekt liegt im Schritt K = 0 → 2. Injiziert wird bei K = 0 und K > 0 in dasselbe Token,
+    den Punkt „.“ am Ende von Einheit 9; bei K > 0 schließt er aber einen deutschen Satzteil ab, und der
+    letzte Wechsel D → E folgt direkt danach. Ob der Sprachwechsel im Text wirkt oder die Sprache an der
+    Injektionsstelle, prüft die Kontrolle aus Nachtrag 6.11 (Notebook 14, Lauf ausstehend; §2.2, §8).
   * Ein weiterer Anstieg mit K ist nicht nachweisbar, aber auch nicht ausgeschlossen: Die Zuwächse pro Schritt
     haben Intervalle von etwa −0,03 bis +0,03. Damit ist „monoton in K“ weder gezeigt noch widerlegt, und
     H1 bleibt **offen**.
@@ -108,7 +111,9 @@ p-Werte für Δλ und DiD: ≤ 0,0003 nach Bonferroni über die drei Dosen. Das 
 
 * **Effekt in C1:** Bei jeder Dosis liegt Δλ sicher über dem Mindesteffekt. Zufallsrichtungen zeigen in C1
   keinen Effekt (Δλ `rand` ≈ −0,01, Intervall um 0). Der Effekt ist also größer als bei Zufallsrichtungen.
-  Was ihn verursacht, Sprachwechsel oder Tokensprache, trennen die Daten nicht (§2.2).
+  Ob ihn der Sprachwechsel im Text verursacht oder die Sprache des Satzteils an der Injektionsstelle (das
+  Token selbst ist dasselbe „.“), trennen die Daten nicht; das prüft der Kontrolllauf nach Nachtrag 6.11
+  (§2.2).
 * **Dosis-Wirkung in K:** nicht gezeigt. Der Sprung passiert zwischen K = 0 und K = 2. Danach bleibt Δλ
   innerhalb der Unsicherheit gleich; ein weiterer Anstieg von bis zu etwa 0,03 pro Schritt ist mit den Daten
   noch vereinbar.

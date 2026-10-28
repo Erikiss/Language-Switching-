@@ -420,7 +420,8 @@ Notebook 05 wird also nicht gestört.
    → „Verknüpfung hinzufügen“ → „Meine Ablage“ und die Verknüpfung in `LSNE_B` umbenennen.
 2. **Notebook öffnen und alle Zellen ausführen.** Die Konfigurationszelle fragt nach den
    Laufwurzeln; Enter übernimmt die vorhandenen unter `MyDrive/LSNE/{runs,runs_trace,runs_ctl}` und
-   `MyDrive/LSNE_B/{runs,runs_trace,runs_ctl}`. Weitere Wurzeln (z. B. `MyDrive/LSNE/runs_ttt`) komma-getrennt
+   `MyDrive/LSNE_B/{runs,runs_trace,runs_ctl}` (außerhalb von Colab die vorhandenen unter
+   `$LSNE_RUNS/{runs,runs_trace,runs_ctl}`). Weitere Wurzeln (z. B. `MyDrive/LSNE/runs_ttt`) komma-getrennt
    angeben. Liegt eine Stufe unter mehreren Wurzeln, gilt der neueste Lauf (`prereg_runs.csv`
    nennt die übrigen). Der Kontrolllauf von Notebook 14 (`runs_ctl`, Abschnitt 12) wird als eigener
    Schlüssel `D_ctl` geführt und ersetzt nie den Hauptlauf von Stufe D.
@@ -487,9 +488,10 @@ scheitern; die Prüfzelle warnt dann.
 
 **Sicherheit.** Das Notebook liest den Hauptlauf nur; in `MyDrive/LSNE/runs/` schreibt es nichts, nicht
 einmal den Ordner. Der Kontrolllauf verweigert vor jedem Schreiben ein Laufverzeichnis, das der Hauptlauf
-ist oder einen anderen Lauf von Stufe D enthält, und einen Hauptlauf mit anderem Modell, anderer
-Revision oder anderem dtype. Er hat sein eigenes `_resume/` mit eigener Signatur; das `_resume/` des
-Hauptlaufs wird nie berührt.
+ist, in ihm liegt oder einen anderen Lauf von Stufe D enthält, eine Wurzel (`--out`), die ein
+`runs`-Ordner ist, in der Wurzel des Hauptlaufs liegt oder den Hauptlauf enthält, einen Hauptlauf mit
+anderem Modell, anderer Revision oder anderem dtype und einen Lauf ohne Kontrollvariante. Er hat sein
+eigenes `_resume/` mit eigener Signatur; das `_resume/` des Hauptlaufs wird nie berührt.
 
 **Laufzeit.** 264 Varianten (24 Formulierungen × 11) an 360 Paaren aus Variante und Stelle, je 204 Paare
 aus Richtung und Dosis: ≈ 1 440 Forwards zu 64 Zeilen, etwa ein Sechstel von D1 im Hauptlauf;
@@ -498,9 +500,12 @@ geschätzt 5–15 min plus Modell-Download (nicht gemessen; die echte Zeit steht
 
 **Fortsetzen.** Bricht die Sitzung ab, alle Zellen erneut ausführen: Der Lauf setzt bei den gesicherten
 Blöcken unter `runs_ctl/D/pythia-160m@step98000/_resume/` fort (nach `status: ok` wird `_resume/`
-gelöscht). `REUSE = True` prüft einen fertigen Kontrolllauf nur (gleicher Hauptlauf, Nachtrag 6.11),
-statt ihn neu zu rechnen. `SMOKE = True` ist ein Rauchtest mit `pythia-14m` auf F01A gegen den
-Rauchlauf von Notebook 03; Notebook 13 zählt ihn nicht.
+gelöscht). `REUSE = True` prüft einen fertigen Kontrolllauf nur, statt ihn neu zu rechnen, wenn er zu
+genau diesem Hauptlauf gehört (Pfad, Zeitstempel und SHA-256 der Bank wie im Hauptlauf; Nachtrag 6.11);
+einen Kontrolllauf eines früheren Hauptlaufs am selben Pfad rechnet das Notebook neu. `SMOKE = True` ist
+ein Rauchtest mit `pythia-14m` auf F01A gegen den Rauchlauf von Notebook 03; dafür Notebook 03 mit
+`SMOKE = True` und `FAMILIES = ["F01A"]` rechnen (ohne `FAMILIES` rechnet es nur DEV01, und die
+Reproduktion findet kein Gegenstück). Notebook 13 zählt den Rauchtest nicht.
 
 **CLI-Äquivalent** (jede GPU-Maschine):
 
@@ -519,4 +524,7 @@ python -m lsne.cli run --stage D --d-control token_language \
 | `Keine GPU` | Auf eine A100-Laufzeit wechseln und alle Zellen erneut ausführen. |
 | `In …/runs_ctl/D/… liegt ein anderer Lauf als dieser Kontrolllauf` | Dort liegt ein Lauf ohne `control = token_language` (etwa ein kopierter Hauptlauf): Er wird nie überschrieben. Den Ordner prüfen und umbenennen. |
 | `Kontrolllauf fehlgeschlagen oder verweigert (exit 1, …)` | Ursache im Log unter `runs_ctl/logs/` (`control run refused: …`, `REFUSED`, `FAILED`, z. B. `CUDA out of memory`); nach der Korrektur die Laufzelle erneut ausführen, ein abgebrochener Lauf setzt fort. |
-| `Reproduktion … NICHT ok` | λ an der präregistrierten Stelle weicht um mehr als 1e-3 vom Hauptlauf ab, meist wegen anderer Hardware oder Torch-Version (Warnungen der Prüfzelle, `platform` im Manifest). Auf einer A100 wiederholen; weicht auch die Torch-Version ab, kann die Reproduktion trotzdem scheitern. Dann ist der Kontrolllauf ungültig, und P bleibt höchstens „offen“. |
+| `Reproduktion … NICHT ok` | λ an der präregistrierten Stelle weicht um mehr als 1e-3 vom Hauptlauf ab, meist wegen anderer Hardware oder Torch-Version (Warnungen der Prüfzelle; im Manifest `replication_platform` mit Torch, CUDA, GPU und den Angaben des Hauptlaufs, `platform` mit dem Betriebssystem). Auf einer A100 wiederholen; weicht auch die Torch-Version ab, kann die Reproduktion trotzdem scheitern. Dann ist der Kontrolllauf ungültig, und P bleibt höchstens „offen“. |
+| `Der Hauptlauf enthält keine dieser Varianten` (Rauchtest) | Der Rauchlauf von Notebook 03 hat nur DEV01 gerechnet: dort `SMOKE = True` und `FAMILIES = ["F01A"]` setzen, Notebook 03 und dann Notebook 14 erneut ausführen. |
+| `control run refused: … is a runs folder, lies inside the root of the main stage-D run …` | `--out` ist ein `runs`-Ordner (auch der des anderen Kontos) oder enthält den Hauptlauf: den Kontrolllauf unter `MyDrive/LSNE/runs_ctl` rechnen. |
+| Notebook 13: `audit.D1ctl.rep` „… without a control row“ oder `audit.D1ctl.site` „cells of the design missing“ | Der Kontrolllauf deckt nicht alle Zeilen von P oder nicht alle Zellen ab, meist weil er mit `--families`, `--limit-*` oder eingeschränkten K-/C-Stufen gerechnet wurde (`design_filters` im Manifest). Ohne diese Optionen neu rechnen; ein Lauf des ganzen Designs wird ohnehin vor einem eingeschränkten verwendet. |

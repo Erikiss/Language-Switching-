@@ -584,6 +584,27 @@ def test_prereg_notebook_skeleton(regenerated):
     assert "load_model" not in src and "run_stage(" not in src
 
 
+def test_prereg_notebook_local_roots_include_the_control_root(regenerated, tmp_path):
+    """Outside Colab (no MyDrive) notebook 13 takes the run roots below OUT_ROOT as on Drive: runs,
+    runs_trace and runs_ctl, so it finds notebook 14's control run (key D_ctl); RUNS_ROOT when none
+    of them exists."""
+    import os
+
+    nb = _prereg_nb(regenerated)
+    out = tmp_path / "LSNE"
+    my = {'MYDRIVE = "/content/drive/MyDrive"': f"MYDRIVE = {str(tmp_path / 'MyDrive')!r}"}
+
+    def roots() -> list:
+        ns = {"__name__": "__main__", "os": os, "OUT_ROOT": str(out), "RUNS_ROOT": str(out / "runs")}
+        _exec_cell(nb, "# --- Konfiguration: Laufwurzeln", ns, subst=my)
+        return ns["RUN_ROOTS"]
+
+    assert roots() == [str(out / "runs")]
+    for child in ("runs", "runs_ctl"):
+        (out / child / "D").mkdir(parents=True)
+    assert roots() == [str(out / "runs"), str(out / "runs_ctl")]
+
+
 def test_prereg_notebook_cli_equivalent_uses_existing_options(regenerated):
     """The printed CLI equivalent uses only options of ``python -m lsne.prereg_eval``."""
     import re
@@ -733,7 +754,7 @@ def test_token_control_notebook_skeleton(regenerated):
               "directions_depth.npz", "nicht neu angepasst", "`damage_ctl`", "`damage_ctl_checks`", "`damage_ctl_contrasts`",
               "`inject_token_id`", "`site_gap`", "„Wechsel“", "„lokal“", "„offen“", "1e-3", "nur schwächen", "Notebook 13",
               "`P.ctl…`", "`audit.D1ctl…`", "_resume", "wiederverwendete Colab-Laufzeit", "`REUSE = False`", "`SMOKE = True`",
-              "In `MyDrive/LSNE/runs/` schreibt"):
+              '`FAMILIES = ["F01A"]`', "SHA-256 der Bank", "In `MyDrive/LSNE/runs/` schreibt"):
         assert s in head, s
     md_all = "\n".join(c.source for c in nb.cells if c.cell_type == "markdown")
     assert "## Weiter mit Notebook 13" in md_all and "höchstens „offen“" in md_all and "`D_ctl`" in md_all
@@ -852,9 +873,11 @@ def test_token_control_notebook_check_and_summary(regenerated, tmp_path, capsys)
     site checks; a wrong language mark, a replication beyond 1e-3 and a run older than amendment 6.11
     are reported; the summary goes to OUT_ROOT and nothing below RUNS_ROOT changes.  Without REUSE
     the finished run would be recomputed, which needs a GPU."""
+    import hashlib
+
     import torch
 
-    from lsne.io import write_manifest
+    from lsne.io import read_manifest, write_manifest
 
     nb = _ctl_nb(regenerated)
     out = tmp_path / "LSNE"
@@ -862,12 +885,16 @@ def test_token_control_notebook_check_and_summary(regenerated, tmp_path, capsys)
     ctl_dir = out / "runs_ctl" / "D" / CTL_TAG
     ctl_dir.mkdir(parents=True)
     ctl, dmg = _fake_control_tables()
+    bank_sha = hashlib.sha256(b"depth bank").hexdigest()
 
-    def write(ctl, dmg, timestamp: str) -> None:
+    def write(ctl, dmg, timestamp: str, sha: str = bank_sha) -> None:
+        # the control run of this main run: its path, its timestamp and the SHA-256 of its bank (REUSE checks all three)
         ctl.to_csv(ctl_dir / "damage_ctl.csv", index=False)
         dmg.to_csv(main / "damage.csv", index=False)
         write_manifest(ctl_dir, stage="D", status="ok", control="token_language", amendment="6.11", timestamp=timestamp,
-                       main_run=dict(path=str(main.resolve())), audit={"max": 1e-7, "n_over_1e-4": 0, "valid": True},
+                       main_run=dict(path=str(main.resolve()), timestamp=read_manifest(main)["timestamp"]),
+                       bank=dict(file="directions_depth.npz", sha256=sha),
+                       audit={"max": 1e-7, "n_over_1e-4": 0, "valid": True},
                        limits=dict(is_smoke=False, limited=False), n_variants=8, n_excluded=0,
                        tables=dict(damage_ctl=len(ctl)))
 
@@ -921,11 +948,19 @@ def test_token_control_notebook_check_and_summary(regenerated, tmp_path, capsys)
     assert "NICHT ok" in text and "NICHT nach dem Commit von Nachtrag 6.11" in text
     assert _snapshot(out / "runs") == before
 
-    # REUSE = False: the finished run is recomputed (and overwritten), which needs a GPU
+    # REUSE = False: the finished run is recomputed (and overwritten), which needs a GPU; so is, with REUSE = True, a
+    # control run of an earlier main run at the same path (another bank) or of another main run
     if not torch.cuda.is_available():
         with pytest.raises(RuntimeError, match="Keine GPU"):
             run_all(reuse=False)
         assert "wird neu gerechnet und überschrieben (REUSE = False)" in capsys.readouterr().out
+        for stale in (dict(sha="0" * 64), dict()):
+            write(ctl, dmg, "2026-10-28T12:00:00+00:00", **stale)
+            if not stale:                                   # the main run was recomputed after the control run
+                _fake_main_run(main, model="EleutherAI/pythia-160m", timestamp="2026-10-28T13:00:00+00:00")
+            with pytest.raises(RuntimeError, match="Keine GPU"):
+                run_all(reuse=True)
+            assert "gehört zu einem früheren oder anderen Hauptlauf" in capsys.readouterr().out
 
 
 # --------------------------------------------------------------------------------------

@@ -287,11 +287,14 @@ python -m lsne.cli run --stage D --d-control token_language \
 control lives under its own root `runs_ctl` and never in the main run's `runs/D/…`.
 
 * **Guards** (`ControlRunError`, raised before anything is written; the CLI checks them before it
-  loads the model): the run directory is the main run's (also through a link) or holds a stage-D run
-  without `control == "token_language"` (any status) or a `directions_depth.npz` (an interrupted main
-  run); the main run directory has no ok stage-D manifest, is itself a control run, has another model
-  name / revision / dtype, or lacks `directions_depth.npz` / `directions_depth_meta.json`. A failed (not
-  a refused) control run leaves an error manifest with the control marks, so a restart resumes it.
+  loads the model): the run directory is the main run's (also through a link), lies inside it, or
+  holds a stage-D run without `control == "token_language"` (any status) or a `directions_depth.npz`
+  (an interrupted main run); the root (`--out`) is a `runs` folder (a main-run root, of either
+  account), lies inside the main run's root or holds the main run; the main run directory has no ok
+  stage-D manifest, is itself a control run, has another model name / revision / dtype, or lacks
+  `directions_depth.npz` / `directions_depth_meta.json`; no control variant is selected (no test
+  formulation among `cfg.families`, or none left after the filters). A failed (not a refused) control
+  run leaves an error manifest with the control marks, so a restart resumes it.
 * **Inputs from the main run**, never refitted: its manifest's `lattice_directions` and `doses`
   (order kept; run 1: `lang_dom`, `ent`, `rand_00`…`rand_31` × 0.01, 0.05, 0.1, 0.2, 0.5, 1.0) and
   `limits.damage_batch_size` (64), and its depth bank `directions_depth.npz`, loaded with the vectors
@@ -302,7 +305,13 @@ control lives under its own root `runs_ctl` and never in the main run's `runs/D/
   (no `seg`, no original 2143 variants), plus per test formulation `u9D`: unit mask `EEEEEEEEDE`
   realised at C1 (two switches; `stimuli.segment_masks_from_unit_mask` + `make_variant(…, 2, "u9D", …)`),
   checked against the formulation's K = 0 variant (PREREGISTRATION §4; an excluded one is recorded in
-  `damage_ctl_checks`, not run). `cfg.families` and the `limit_*` filters apply as in the regular builder.
+  `damage_ctl_checks`, not run). The regular builder runs on the test formulations of `cfg.families`
+  only, so its `limit_families` / `limit_variants` act on them (DEV01–DEV04 come first in the stimulus
+  bank: a limit applied before the split left nothing) and pick the same C1 variants as a main run
+  limited alike; `limit_variants` then applies once more to the control set. Settings that narrow the
+  design below the main run's selection (`--families` / `--limit-families` dropping a test formulation
+  the main run has, `--limit-variants`, K / C levels without a level of the design) are recorded in the
+  manifest (`design_filters`).
 * **Sites** (the depth site, block input of block `n_layers // 3`; defined by the unit through
   `common.unit_last_position`, never by `stimuli.last_switched_position`):
 
@@ -324,12 +333,14 @@ stage D's own injections (`dossier`, `depth`) are unchanged.
 Manifest (`finish_stage(run_dir, "D", …)`): `control = "token_language"`, `amendment = "6.11"`,
 `main_run` (`path, git_sha, timestamp, model, revision`), `bank` (`file, sha256, names`),
 `lattice_directions`, `doses`, `damage_batch_size`, `sites` (the site rules), `cells` (per site the
-(K, C) cells run), `u9D_unit_mask`, `n_variants`, `n_excluded`, `audit` (`audit_summary` of
-`damage_ctl`) and `platform` (torch / CUDA / device next to the main run's torch: the replication is
-exact on the main run's platform, while round-off of another build or GPU can move λ at the smallest
-dose beyond 1e-3). Resume: its own `_resume` in the control run directory with its own signature
-(stage `"D_ctl"`, version, variant tags, model, dtype, depth site, bank sha256, directions, doses,
-batch size, site rules, chunk size); the main run's `_resume` is never shared or wiped. Size of the
+(K, C) cells run), `u9D_unit_mask`, `n_variants`, `n_formulations`, `design_filters` ([] for the
+whole design), `n_excluded`, `audit` (`audit_summary` of `damage_ctl`) and `replication_platform`
+(torch / CUDA / device next to the main run's torch and OS, `main_torch` / `main_platform`; this run's
+OS is the manifest's own `platform`: the replication is exact on the main run's platform, while
+round-off of another build or GPU can move λ at the smallest dose beyond 1e-3). Resume: its own
+`_resume` in the control run directory with its own signature (stage `"D_ctl"`, version, variant
+tags, model, dtype, depth site, bank sha256, directions, doses, batch size, site rules, chunk size);
+the main run's `_resume` is never shared or wiped. Size of the
 full run: 24 formulations × 11 variants = 264 variants, 360 (variant, site) pairs × 204 (direction,
 dose) pairs = 73 440 rows of `damage_ctl`, ≈ 1 440 batched forwards of 64 rows, about a sixth of D1 in
 the main run (estimate, not measured).
@@ -359,7 +370,8 @@ parent folder contributes its `runs` / `runs_trace` / `runs_ctl`; with several o
 newest manifest wins; stage L is split into the stand-in run and the trace-source run by
 `manifest.source.kind`; stage D is split into the main run (key `D`) and the token-language control
 run (key `D_ctl`, `manifest.control == "token_language"`), so a control run never replaces the main
-run; stage F and its sub-runs are never opened). Confirmation set F01–F12 ×
+run, and a control run with `design_filters` never one of the whole design; stage F and its sub-runs
+are never opened). Confirmation set F01–F12 ×
 {A, B}, statistic = mean of family means, family cluster bootstrap (`stat_level="cluster"`),
 BH over the secondary group 1–6, 8 and 9 (when G0 passes), 10, 13 and 14 (one test per sub-row;
 the copied rows of 8, 9, 13, 14 take the table's `p_boot`, one-sided `p_boot / 2` on the H1 side
@@ -375,7 +387,7 @@ the point estimate.
 | `P` / `P@<eps>` | D `damage` | primary: depth injection, C1 only for K > 0, K = 0 reference; per family dlam(K) of `lang_dom`, the same for `rand` (mean over the directions present), DiD; components `P.lang.K*`, `P.did.K*`, `P.mono`; every pre-registered dose present (`P` = the DEV-frozen dose if one is recorded); deviation rows `P.dev.{C2,C3,seg}.*` (`not_interpretable`); gated by `P.ctl` of the same dose (below): without a valid control run at most `open` |
 | `P.ctl` / `P.ctl@<eps>` (+ `P.ctl1`, `P.ctl2`, `P.ctl3`, components) | D control run (key `D_ctl`) `damage_ctl` | PREREGISTRATION 6.11, role `primary_control`, outside the BH group (m stays 26). Same confirmation set, bootstrap and rules as P (interval rule with 0.05, DiD against `rand` at the same site, `primary_verdict(lang, did, "pass")` at K = 8, per pre-registered dose with P's suffix). `P.ctl1`: inject `u9`, C2 and C3 pooled in one family mean, K = 2 / 4 / 8 vs K = 0 at `u9`; `P.ctl2`: inject `u10`, C1 vs K = 0 at `u10`; components `P.ctl{1,2}.lang.K*`, `P.ctl{1,2}.did.K*`; `P.ctl3` (+ `.lang`, `.did`): `u9D` (K = 2) vs K = 0 at `u9`, reported only. `P.ctl`: the outcome "Wechsel" (`supported`: `P.ctl1` and `P.ctl2` supported), "lokal" (`not_supported`: dlam(lang_dom, K = 8) fails, `ci_high` < 0.05, in both) or "offen" (`open`); without a control run one row `P.ctl`, `not_tested` |
 | `audit.D1`, `audit.C` | D `damage`, C `grid` | max / quantiles of `audit_rel_err`, rows > 1e-4 (PREREGISTRATION §4; a failed D1 audit makes the primary rows `not_interpretable`) |
-| `audit.D1ctl`, `.rep`, `.site`, `.run` | D control run `damage_ctl` (+ D `damage`, the control manifest) | write audit of `damage_ctl` (rule of `audit.D1`); replication: every control row at `u9` with C1 (K 0/2/4/8) has a main-run row (inject `depth`, same tag, direction, eps) at the same `inject_pos` with \|λ_ctl − λ_main\| ≤ 1e-3 (estimate = the largest difference); sites: "." at every row, language E at `u10`, at K = 0 and at C2 / C3, D at `u9` with C1 (K > 0) and at `u9D`, unit 9 / 10, `site_gap` of the `u9` rows as at K = 0 and 1 at `u10`; run: manifest `control = "token_language"`, `amendment = "6.11"`, younger than the amendment commit, no smoke / limited run. A failed audit makes every `P.ctl*` row `not_interpretable` (the rule outcome stays in the note) and counts as no valid control run |
+| `audit.D1ctl`, `.rep`, `.site`, `.run` | D control run `damage_ctl` (+ D `damage`, the control manifest) | write audit of `damage_ctl` (rule of `audit.D1`); replication: every control row at `u9` with C1 (K 0/2/4/8) has a main-run row (inject `depth`, same tag, direction, eps) at the same `inject_pos` with \|λ_ctl − λ_main\| ≤ 1e-3 (estimate = the largest difference), and every `depth` row of the main run at C1 (K 0/2/4/8) in the confirmation set (the rows of P) has its control row, so a run narrowed by cfg filters does not count; sites: "." at every row, language E at `u10`, at K = 0 and at C2 / C3, D at `u9` with C1 (K > 0) and at `u9D`, unit 9 / 10, `site_gap` of the `u9` rows as at K = 0 and 1 at `u10`, no row outside the design, and every cell of the design (`u9`: K = 0, C1 / C2 / C3 at K 2/4/8, `u9D`; `u10`: K = 0, C1 at K 2/4/8) for every formulation of the confirmation set in the run (a variant excluded in `damage_ctl_checks` excused); run: manifest `control = "token_language"`, `amendment = "6.11"`, younger than the amendment commit, no smoke / limited run. A failed audit makes every `P.ctl*` row `not_interpretable` (the rule outcome stays in the note) and counts as no valid control run |
 | `S1`, `S2` | C `contrasts` | T(8, C1); paired T(8, C3) − T(8, C1) |
 | `S3.<pair>.L<layer>`, `S3x.nats.*` | C `attribution_contrasts` (+ `attribution`) | R_excess of class `delim` per pair and layer (one-sided, DESIGN 4.1); exploratory excess in nats |
 | `S4`, `S4.K*` | D `hysteresis` | `area_minus_null` of `lang_dom` (pooled core variants; by K as sensitivity) |

@@ -160,7 +160,9 @@ Vorbehalte (Gegenprüfung):
 * **Monotonie nur als Punktschätzung.** Die Schritte K2 → K4 → K8 betragen 0.006–0.009 und liegen
   weit innerhalb jedes Standardfehlers. Fast der ganze Effekt ist der Schritt K0 → K2, und genau
   dort wechselt die Sprache des Injektions-Tokens von Englisch zu Deutsch (§4, Punkt 7). Bei
-  ε 0.5 ist λ nicht monoton (0.1333, 0.1336, 0.1328).
+  ε 0.5 ist λ nicht monoton (0.1333, 0.1336, 0.1328). (Korrektur 28.10.2026, Nachtrag 6.11: Das
+  Token selbst ist bei K = 0 und K > 0 dasselbe „.“; verschieden sind die Sprache des Satzteils,
+  den es abschließt, und der letzte Wechsel D → E direkt danach. Kontrolle: Notebook 14.)
 * **Achse.** Die `lang_dom`-Achse an der Tiefenstelle L4 verfehlte ihr Entrauschungs-Gate
   (`cos_denoised_plain` 0.126, `within_var_removed` 0.989, d′ 0.26 → 2.66). Sie behält nur 12.6 %
   der rohen Trennung, und die rohe Achse ist nicht gespeichert.
@@ -640,7 +642,7 @@ vorhandenen Lauftabellen ändern sich dadurch nicht. Was neue Werte braucht, ste
 |---|---|---|---|
 | 8 | Keine Tabelle für die Statistik (kein `damage_boot`, `damage_phase` ohne Familienschlüssel) | `damage_contrasts` (je Formulierung Δλ `lang_dom`, Δλ `rand` über alle Richtungen, DiD) und `damage_boot` (Familienmittel, Splits, Intervallregel, `monotone_in_K`); `prereg_eval` rechnet P direkt aus `damage.parquet`, ohne GPU-Neulauf | – |
 | 9 | **Positions-Konfundierung außerhalb C1.** Für K > 0 bei C2/C3/seg injiziert der Code am letzten deutschen Token, nicht am letzten Token von Einheit 9 (§2); `rand`-λ steigt dort 4–5× | Spalte `position_deviation`, `confirmatory` nur C1; `prereg_eval`: `P.dev.*` nicht interpretierbar | Entscheidung: C1 als konfirmatorische Zelle festschreiben (H1 nennt kein C) und als Abweichung dokumentieren, oder eine positionsgleiche K=0-Referenz rechnen (zusätzlicher D1-Durchlauf über die K=0-Varianten) |
-| 10 | K0 → K>0 wechselt auch die Sprache des Injektions-Tokens (Englisch → Deutsch); Sprung bei K = 2, danach Plateau, in Lauf 1 und an jedem Sweep-Checkpoint | – | Kontrolle: positionsgleiches englisches Token in K>0 (oder umgekehrt), ein reduzierter D1-Durchlauf. Entscheidung, wie die Monotonie-Klausel gelesen wird |
+| 10 | K0 → K>0 wechselt auch die Sprache des Injektions-Tokens (Englisch → Deutsch); Sprung bei K = 2, danach Plateau, in Lauf 1 und an jedem Sweep-Checkpoint (Korrektur 28.10.2026: das Token ist dasselbe „.“, verschieden sind die Sprache des Satzteils davor und der letzte Wechsel danach; Kontrolle festgelegt in Nachtrag 6.11, Notebook 14) | – | Kontrolle: positionsgleiches englisches Token in K>0 (oder umgekehrt), ein reduzierter D1-Durchlauf. Entscheidung, wie die Monotonie-Klausel gelesen wird |
 | 11 | Dosen 0.001, 0.0025, 0.005, 0.02 fehlen; keine Dosis auf DEV eingefroren | `prereg_eval` berichtet jede vorhandene präregistrierte Dosis einzeln, mit Bonferroni-Hinweis; `FROZEN_DOSE` / `--frozen-dose` | Entscheidung: Dosis jetzt auf DEV einfrieren (nicht mehr blind, weil die gepoolten Zahlen bekannt sind) oder Bonferroni über drei Dosen. Die fehlenden Dosen gibt es nur mit einem Neulauf von D; `Limits.damage_doses` ist unverändert (0.01, 0.05, 0.1) |
 | 12 | Tiefen-`lang_dom` (L4) verfehlt das Entrauschungs-Gate (cos 0.126; L11: 0.591); die rohe Achse wird nicht gespeichert, obwohl die Warnung „beide Achsen berichten“ verlangt | – | Entscheidung, welche Achse der Primärendpunkt meint; `save_bank` verwirft `vec_plain` weiterhin |
 | 13 | Dossier-Stelle D1 strukturell leer (ein Fit-Layer, keine späteren Positionen) | – | Entscheidung: λ dort streichen oder die Positionsausbreitung von einer früheren Position an L11 messen |

@@ -139,6 +139,8 @@ def test_control_run_through_the_cli_takes_over_the_main_run(e2e):
     assert m["damage_batch_size"] == m["limits"]["damage_batch_size"] == mm["limits"]["damage_batch_size"] == BATCH
     assert not (m["limits"]["is_smoke"] or m["limits"]["limited"])
     assert m["n_variants"] == len(FAMILIES) * N_CTL_VARIANTS and m["n_excluded"] == 0 and m["audit"]["valid"]
+    # --families selects the main run's formulations: the whole design relative to the main run (no design filter)
+    assert m["n_formulations"] == len(FAMILIES) and m["design_filters"] == []
     assert datetime.fromisoformat(m["timestamp"]) > datetime.fromisoformat(PE.AMENDMENT_611["utc"])
     assert _snapshot(main) == e2e["before"]
     assert not (ctl / "_resume").exists() and not (ctl / "directions_depth.npz").exists()
