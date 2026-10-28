@@ -773,7 +773,7 @@ DAMAGE_COLS = ["tag", "family", "formulation", "K", "C", "kind", "inject", "dire
 #: Columns read from the main run's ``damage`` (``inject_pos`` only for the replication audit of
 #: the control run, ``audit.D1ctl.rep``; one cached read serves both).
 DAMAGE_READ_COLS = DAMAGE_COLS + ["inject_pos"]
-PRIMARY_NAME ="PRIMARY dlam(K, lang_dom) = lam(K>0, C1) - lam(K0), depth injection"
+PRIMARY_NAME = "PRIMARY dlam(K, lang_dom) = lam(K>0, C1) - lam(K0), depth injection"
 PRIMARY_RULE = ("supported iff the 95% CI of dlam(lang_dom, K=8, C1) lies at or above the minimum effect (ci_low >= 0.05; "
                 "the interval decides, never the point estimate, as in damage_boot) AND the CI of DiD (lang_dom - rand) "
                 "> 0 AND monotone in K (the CI of dlam at the first K and of every increment between successive K lies "
@@ -1076,9 +1076,9 @@ CTL3_C = "u9D"              # control 3: only unit 9 German (unit mask EEEEEEEED
 CTL_KS = (2, 4, 8)
 CTL_REP_TOL = 1e-3          # replication of the pre-registered site: |lam_ctl - lam_main| <= 1e-3
 #: The three controls: (site, C level(s), K levels, label); controls 1 and 2 decide, 3 is reported.
-CTL_ARMS = {1: ("u9", CTL1_C, CTL_KS, "C2 + C3 pooled, last token of unit 9 ('.' closing an English clause)"),
-            2: ("u10", PRIMARY_C, CTL_KS, "C1, last token of unit 10 ('.', English, 1 token before the tail)"),
-            3: ("u9", CTL3_C, (2,), "u9D (only unit 9 German, K=2), last token of unit 9")}
+CTL_ARMS = {1: ("u9", CTL1_C, CTL_KS, "C2 + C3 pooled at u9 (end of unit 9)"),
+            2: ("u10", PRIMARY_C, CTL_KS, "C1 at u10 (end of unit 10)"),
+            3: ("u9", CTL3_C, (2,), "u9D (only unit 9 German) at u9 (end of unit 9)")}
 #: Outcome per dose <-> verdict of ``P.ctl``.
 CTL_OUTCOME_VERDICT = {"Wechsel": "supported", "lokal": "not_supported", "offen": "open"}
 CTL_VERDICT_OUTCOME = {v: k for k, v in CTL_OUTCOME_VERDICT.items()}
@@ -1158,7 +1158,10 @@ def token_control_rows(ctx: EvalContext) -> list[dict]:
     dose_note = _join(f"pre-registered doses evaluated: {', '.join(_eps_key(e) for e in prereg) or 'none'}",
                       f"missing: {', '.join(_eps_key(e) for e in missing)}" if missing else "",
                       f"exploratory doses present (not evaluated): {', '.join(_eps_key(e) for e in explo)}" if explo else "",
-                      "" if main is not None else "no main dose (P's suffix rule): every pre-registered dose reported")
+                      "no DEV-frozen dose recorded: every pre-registered dose is reported, none is the main dose"
+                      if frozen is None else
+                      f"frozen dose {_eps_key(frozen)} not in the control run: every dose reported, no main dose"
+                      if main is None else "")
     u9d_note = _u9d_note(ctx)
     rows: list[dict] = []
     for eps in prereg:
@@ -1198,8 +1201,8 @@ def _token_control_dose(ctx: EvalContext, lang: dict, rand: dict, eps: float, ma
     summary = make_row(f"P.ctl{sfx}", f"{CTL_NAME}, eps={_eps_key(eps)}", role="primary_control", stage="D", rule=CTL_RULE,
                        verdict=CTL_OUTCOME_VERDICT[outcome], source=src,
                        n_families=min(a1["n_families"], a2["n_families"]), n_rows=a1["n_rows"] + a2["n_rows"],
-                       note=_join(f"outcome {outcome}: {why}", a1["summary"], a2["summary"], arms[3]["summary"] + " (reported only)",
-                                  dose_note, ctx.split_note, caveat_for("P.ctl")))
+                       note=_join(f"outcome {outcome}: {why}", a1["summary"], a2["summary"],
+                                  arms[3]["summary"] + " (reported only)", dose_note, ctx.split_note, caveat_for("P.ctl")))
     return [summary] + a1["rows"] + a2["rows"] + arms[3]["rows"]
 
 
@@ -1220,19 +1223,23 @@ def _ctl_arm(ctx: EvalContext, j: int, lang: pd.DataFrame, rand: pd.DataFrame, e
             fr = family_delta(rand, K, Cc)
             br[K] = _boot_fam(fr, ctx, 1)
             bd[K] = _boot_fam(_did(fl, fr), ctx, 1)
+    bd = {K: b for K, b in bd.items() if b["n_families"]}            # a DiD needs families on both sides
     st = {K: min_effect_status(bl[K]["estimate"], bl[K]["ci_low"], bl[K]["ci_high"], PRIMARY_MIN_EFFECT, 1) for K in ks}
     dst = {K: _did_status(bd[K]) if K in bd else "nan" for K in ks}
     verdict = primary_verdict(st[kmain], dst[kmain], "pass")
     rand_note = _rand_note(rand)
-    rtxt = {K: f"dlam(rand) {_ci_txt(br[K])}" if K in br else "" for K in ks}
+    rtxt = {K: f"dlam(rand) {_ci_txt(br[K])}" if K in br and br[K]["n_families"] else "" for K in ks}
     did_main = f"DiD(K={kmain}) {_ci_txt(bd[kmain])}" if kmain in bd else ""
     only = "reported only: never in the outcome (PREREGISTRATION 6.11)" if j == 3 else ""
     ref = f"K=0 reference at the same site ({site}, last token of unit {CTL_SITES[site]}) of the same run"
+    empty = {K: "" if bl[K]["n_families"] else f"no K={K} variants of these cells or no K=0 reference at {site} in the "
+                                               "confirmation set" for K in ks}
     rid = f"P.ctl{j}"
     rows = [make_row(f"{rid}{sfx}", f"control {j}: dlam(lang_dom) K={kmain} vs K=0, {label}, eps={e}", role="primary_control",
                      stage="D", rule=CTL3_RULE if j == 3 else CTL_ARM_RULE, verdict=verdict, direction=1, source=src,
                      min_effect=PRIMARY_MIN_EFFECT,
-                     note=_join(only, f"dlam(lang_dom, K={kmain}) {st[kmain]}, DiD {dst[kmain]} (no monotonicity required)",
+                     note=_join(only, empty[kmain],
+                                f"dlam(lang_dom, K={kmain}) {st[kmain]}, DiD {dst[kmain]} (no monotonicity required)",
                                 did_main, rtxt[kmain], rand_note, ref, note, ctx.split_note, caveat_for("P.ctl")),
                      **_stat_fields(bl[kmain]))]
     for K in ks:
@@ -1241,13 +1248,14 @@ def _ctl_arm(ctx: EvalContext, j: int, lang: pd.DataFrame, rand: pd.DataFrame, e
         rows.append(make_row(f"{rid}.lang{kid}{sfx}", f"control {j}: dlam(lang_dom) K={K} vs K=0, {label}, eps={e}",
                              role="primary_control", stage="D", direction=1, verdict=MIN_EFFECT_VERDICT[st[K]], source=src,
                              rule=COMPONENT_LANG_RULE, min_effect=PRIMARY_MIN_EFFECT,
-                             note=_join(only, main_k, rtxt[K], ctx.split_note), **_stat_fields(bl[K])))
+                             note=_join(only, empty[K], main_k, rtxt[K], ctx.split_note), **_stat_fields(bl[K])))
         rows.append(make_row(f"{rid}.did{kid}{sfx}", f"control {j}: DiD dlam(lang_dom) - dlam(rand) K={K}, {label}, eps={e}",
                              role="primary_control", stage="D", direction=1, verdict=MIN_EFFECT_VERDICT[dst[K]], source=src,
-                             rule=COMPONENT_DID_RULE, note=_join(only, main_k, rtxt[K], rand_note),
+                             rule=COMPONENT_DID_RULE, note=_join(only, empty[K], main_k, rtxt[K], rand_note),
                              **(_stat_fields(bd[K]) if K in bd else {})))
-    summary = (f"control {j} ({label}): dlam(lang_dom, K={kmain}) {_ci_txt(bl[kmain])} {st[kmain]}, DiD "
-               f"{_ci_txt(bd[kmain]) if kmain in bd else 'not computable'} {dst[kmain]} -> {verdict}")
+    lang_txt = f"{_ci_txt(bl[kmain])} {st[kmain]}" if bl[kmain]["n_families"] else "not computable"
+    did_txt = f"{_ci_txt(bd[kmain])} {dst[kmain]}" if kmain in bd else "not computable"
+    summary = f"control {j}, {label}: dlam(lang_dom, K={kmain}) {lang_txt}, DiD {did_txt} -> {verdict}"
     return dict(rows=rows, verdict=verdict, lang=st[kmain], did=dst[kmain], n_families=bl[kmain]["n_families"],
                 n_rows=bl[kmain]["n_rows"], summary=summary)
 
@@ -1274,9 +1282,9 @@ def _ctl_replication_audit(ctx: EvalContext, dmg: pd.DataFrame, src: str) -> dic
             "eps) at the same inject_pos and |lam_ctl - lam_main| <= 1e-3 (PREREGISTRATION 6.11 (b))")
 
     def row(verdict: str, note: str, **kw) -> dict:
+        invalid = "" if verdict == "supported" else "control run not validated (PREREGISTRATION 6.11 (b))"
         return make_row("audit.D1ctl.rep", name, role="audit", stage="D", rule=rule, verdict=verdict, source=src,
-                        note=_join(note, "" if verdict == "supported" else "control run not validated (PREREGISTRATION 6.11 (b))"),
-                        **kw)
+                        note=_join(note, invalid), **kw)
 
     c = dmg[(dmg["inject"].astype(str) == "u9") & (dmg["C"].astype(str) == PRIMARY_C)]
     if c.empty:
@@ -1290,17 +1298,20 @@ def _ctl_replication_audit(ctx: EvalContext, dmg: pd.DataFrame, src: str) -> dic
     m = ctx.tables.get("D", "damage", DAMAGE_READ_COLS)
     miss = _missing_cols(m, need)
     if miss:
-        return row("not_tested", f"main run {drun.path}: " + ("damage table missing" if m is None else f"columns {miss} missing in damage"))
+        return row("not_tested", f"main run {drun.path}: "
+                                 + ("damage table missing" if m is None else f"columns {miss} missing in damage"))
     key = ["tag", "direction", "eps"]
     c = c[key + ["K", "lam", "inject_pos"]].copy()
-    m = m[(m["inject"].astype(str) == "depth") & m["tag"].astype(str).isin(set(c["tag"].astype(str)))][key + ["lam", "inject_pos"]].copy()
+    m = m[(m["inject"].astype(str) == "depth") & m["tag"].astype(str).isin(set(c["tag"].astype(str)))]
+    m = m[key + ["lam", "inject_pos"]].copy()
     for x in (c, m):
         x["tag"], x["direction"] = x["tag"].astype(str), x["direction"].astype(str)
         x["eps"] = x["eps"].astype(float).round(10)
     j = c.merge(m, on=key, how="left", suffixes=("_ctl", "_main"), indicator=True)
+    num = lambda col: pd.to_numeric(j[col], errors="coerce").to_numpy(dtype=float)  # noqa: E731
     found = (j["_merge"] == "both").to_numpy()
-    diff = (pd.to_numeric(j["lam_ctl"], errors="coerce") - pd.to_numeric(j["lam_main"], errors="coerce")).abs().to_numpy()
-    same_pos = (pd.to_numeric(j["inject_pos_ctl"], errors="coerce") == pd.to_numeric(j["inject_pos_main"], errors="coerce")).to_numpy()
+    diff = np.abs(num("lam_ctl") - num("lam_main"))
+    same_pos = num("inject_pos_ctl") == num("inject_pos_main")
     n_missing = int((~found).sum())
     n_pos = int((found & ~same_pos).sum())
     n_over = int((found & ~(diff <= CTL_REP_TOL)).sum())          # a NaN difference is a mismatch
@@ -1359,8 +1370,8 @@ def _ctl_site_audit(dmg: pd.DataFrame, src: str) -> dict:
                  f"{int(bad_lang.sum())}, unit: {int(bad_unit.sum())}, site_gap: {int(bad_gap.sum())}, outside the control "
                  f"cells: {int((~cell).sum())})", ids,
                  "control run not validated (PREREGISTRATION 6.11 (c))" if bad.any() else "")
-    return make_row("audit.D1ctl.site", name, role="audit", stage="D", rule=rule, verdict="not_supported" if bad.any() else "supported",
-                    estimate=float(bad.sum()), n_rows=len(x), note=note, source=src)
+    return make_row("audit.D1ctl.site", name, role="audit", stage="D", rule=rule, estimate=float(bad.sum()), n_rows=len(x),
+                    verdict="not_supported" if bad.any() else "supported", note=note, source=src)
 
 
 def _ctl_run_audit(ctx: EvalContext, run: StageRun) -> dict:

@@ -2,11 +2,12 @@
 
 Tiny synthetic run directories with the real table schemas of the stages (column lists
 taken from the stage code) check the primary statistic (C1 restriction, K=0 reference,
-rand DiD, monotonicity, the D1 audit), the family-mean cluster bootstrap, the test split
-(F01-F12 x {A, B}), the constant-series rule of contrast 10 (ii), the BH grouping over the
-secondary group, the G0 gate, the selection of runs under several roots (two accounts, a
-parent folder, superseded and failed runs) and the handling of missing stages and tables.
-Everything runs on CPU without a model.
+rand DiD, monotonicity, the D1 audit), the token-language control of PREREGISTRATION 6.11
+(three worlds of the control run, its audits, its key ``D_ctl`` and its gate on P), the
+family-mean cluster bootstrap, the test split (F01-F12 x {A, B}), the constant-series rule of
+contrast 10 (ii), the BH grouping over the secondary group, the G0 gate, the selection of runs
+under several roots (two accounts, a parent folder, superseded and failed runs) and the
+handling of missing stages and tables.  Everything runs on CPU without a model.
 """
 from __future__ import annotations
 
@@ -60,10 +61,17 @@ def _noise(key: str, salt: int, scale: float = 0.01) -> float:
     return float(np.random.default_rng(zlib.crc32(f"{key}|{salt}".encode())).uniform(-scale, scale))
 
 
+def _site_gap(fam: str, form: str) -> int:
+    """Tokens from the "." ending unit 9 to the shared tail: 6-14 as in the stimuli, fixed per formulation."""
+    return 6 + zlib.crc32(f"{fam}{form}".encode()) % 9
+
+
 def damage_table(effect=(0.10, 0.12, 0.14), rand_effect=0.0, n_rand=4, audit=1e-7, eps_list=(0.05, 0.5)) -> pd.DataFrame:
     """D1 rows: lang_dom lam = base + effect[K] (+ family noise) at C1; C2 K=8 at +1.0 (must
     stay out of the C1 estimate), rand lam = base + rand_effect; the K>0 rows of families
-    outside the split and of formulation C carry +5 (must never leak in); dossier rows lam NaN."""
+    outside the split and of formulation C carry +5 (must never leak in); dossier rows lam NaN.
+    The depth injection of C1 sits at the "." ending unit 9 (tail_start - site gap, the
+    position the replication audit of the control run compares), C2's at the last German token."""
     fx = dict(zip((2, 4, 8), effect))
     rows = []
     fams = [(f, form) for f in TEST + OUTSIDE for form in ("A", "B")] + [(f, "C") for f in TEST[:3]]
@@ -76,6 +84,8 @@ def damage_table(effect=(0.10, 0.12, 0.14), rand_effect=0.0, n_rand=4, audit=1e-
             leak = 5.0 if out and K > 0 else 0.0
             for eps in eps_list:
                 for inj in ("depth", "dossier"):
+                    pos = (v["n_tokens"] - 1 if inj == "dossier"
+                           else v["tail_start"] - _site_gap(fam, form) - (0 if Cc == "C1" else 4))
                     for name in ["lang_dom", "ent"] + [f"rand_{i:02d}" for i in range(n_rand)]:
                         fam_d = "rand" if name.startswith("rand_") else name
                         if inj == "dossier":
@@ -86,9 +96,72 @@ def damage_table(effect=(0.10, 0.12, 0.14), rand_effect=0.0, n_rand=4, audit=1e-
                             lam = base + (0.0 if K == 0 else rand_effect) + 0.001 * (int(name[-2:]) - n_rand / 2) + leak
                         else:
                             lam = 0.3
-                        rows.append(dict(v, inject=inj, direction=name, dir_family=fam_d, eps=float(eps), lam=lam,
-                                         audit_rel_err=audit))
+                        rows.append(dict(v, inject=inj, inject_pos=pos, direction=name, dir_family=fam_d, eps=float(eps),
+                                         lam=lam, audit_rel_err=audit))
     return pd.DataFrame(rows).reindex(columns=DAMAGE_COLS)
+
+
+#: dlam(lang_dom) at K = 2, 4, 8 at the sites of the token-language control (PREREGISTRATION 6.11;
+#: control 1: C2 / C3 at the end of unit 9, control 2: C1 at the end of unit 10) in three worlds:
+#: the switching effect is there as well, it is absent there, or it is there only at control 1.
+CTL_WORLDS = {"wechsel": ((0.10, 0.12, 0.14), (0.09, 0.11, 0.13)),
+              "lokal": ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+              "offen": ((0.10, 0.12, 0.14), (0.0, 0.0, 0.0))}
+CTL_TIME = "2026-10-28T09:30:00+00:00"            # after the commit of amendment 6.11 (08:05:51 UTC)
+
+
+def damage_ctl_table(main: pd.DataFrame, world: str = "wechsel", u9d: float = 0.08, audit: float = 1e-7) -> pd.DataFrame:
+    """``damage_ctl`` of the control run (stage_d_control) for every formulation of the main run's
+    ``main``: u9 at C1 (K 0/2/4/8) = the main depth rows (same lam and inject_pos, so the
+    replication holds); control 1 (C2, C3 at u9) and control 2 (C1 at u10) add the world's
+    dlam(lang_dom) (+ family noise) to the K=0 row at the same site, rand / ent stay at it;
+    control 3 (u9D, K=2) adds ``u9d``.  Every site is "."; the K>0 rows outside the
+    confirmation set (DEV01 / F13, formulation C) carry +5 (must never leak in)."""
+    eff1, eff2 = (dict(zip((2, 4, 8), e)) for e in CTL_WORLDS[world])
+    dep = main[(main["inject"] == "depth") & (main["C"] == "C1")]
+    site = dict(inject_token=".", inject_token_id=15, inject_klass="punct", audit_rel_err=audit)
+    rows = []
+    for (fam, form), g in dep.groupby(["family", "formulation"], sort=True):
+        gap = _site_gap(fam, form)
+        leak = 5.0 if (fam in OUTSIDE or form == "C") else 0.0
+        for r in g.to_dict("records"):                                   # the pre-registered site, as in the main run
+            rows.append(dict(r, inject="u9", inject_lang="D" if r["K"] else "E", inject_unit=9, site_gap=gap, **site))
+        for r in g[g["K"] == 0].to_dict("records"):
+            ld = r["dir_family"] == "lang_dom"
+            u9 = dict(r, inject="u9", inject_lang="E", inject_unit=9, site_gap=gap, **site)
+            for K in (2, 4, 8):
+                for Cc in ("C2", "C3"):                                  # control 1: the "." closes an English clause
+                    rows.append(dict(u9, tag=f"{fam}{form}:K{K}:{Cc}", K=K, C=Cc,
+                                     lam=r["lam"] + leak + (eff1[K] + _noise(fam + Cc, K) if ld else 0.0)))
+            rows.append(dict(u9, tag=f"{fam}{form}:K2:u9D", K=2, C="u9D", inject_lang="D",      # control 3
+                             lam=r["lam"] + leak + (u9d + _noise(fam + "u9D", 2) if ld else 0.0)))
+            for K in (0, 2, 4, 8):                                       # control 2: the "." ending unit 10
+                shift = 0.0 if K == 0 else leak + (eff2[K] + _noise(fam + "u10", K) if ld else 0.0)
+                rows.append(dict(u9, tag=f"{fam}{form}:K{K}:C1", K=K, C="C1", inject="u10", inject_unit=10, site_gap=1,
+                                 inject_pos=int(r["inject_pos"]) + gap - 1, lam=r["lam"] + 0.02 + shift))
+    return pd.DataFrame(rows)
+
+
+def write_ctl_run(root: Path, ctl: pd.DataFrame, timestamp: str = CTL_TIME, checks=None, **manifest) -> Path:
+    """A token-language control run (stage D, PREREGISTRATION 6.11) under ``root`` with the manifest
+    marks of stage_d_control (``control``, ``amendment``, ``main_run``)."""
+    m = dict(control="token_language", amendment="6.11",
+             main_run=dict(path=f"/content/drive/MyDrive/LSNE/runs/D/{TAG}", git_sha="a" * 40,
+                           timestamp="2026-10-27T00:00:00+00:00", model="pythia-160m", revision="step98000"))
+    m.update(manifest)
+    tables = {"damage_ctl": ctl} if checks is None else {"damage_ctl": ctl, "damage_ctl_checks": checks}
+    return write_run(root, "D", tables, timestamp=timestamp, **m)
+
+
+def _ctl_expected(ctl: pd.DataFrame, site: str, Cs, K: int, fam_d: str = "lang_dom", eps: float = 0.05) -> pd.Series:
+    """Per test family: mean lam over the (K, C in ``Cs``) variants minus mean lam over K=0 at ``site``
+    (per variant first the mean over the directions of ``fam_d``)."""
+    d = ctl[(ctl["inject"] == site) & (ctl["dir_family"] == fam_d) & (ctl["eps"] == eps) & ctl["family"].isin(TEST)
+            & ctl["formulation"].isin(["A", "B"])]
+    lam = d.groupby(["family", "tag", "K", "C"])["lam"].mean().reset_index()
+    mixed = lam[(lam["K"] == K) & lam["C"].isin(Cs)].groupby("family")["lam"].mean()
+    ref = lam[lam["K"] == 0].groupby("family")["lam"].mean()
+    return mixed - ref
 
 
 def contrasts_table() -> pd.DataFrame:
@@ -219,7 +292,8 @@ def _primary_expected(dmg: pd.DataFrame, K: int, fam_filter=TEST) -> pd.Series:
 def test_primary_statistic_c1_restriction_and_test_split(tmp_path):
     dmg = damage_table()
     write_run(tmp_path, "D", {"damage": dmg})
-    res = PE.evaluate([tmp_path], n_boot=500, seed=1)
+    write_ctl_run(tmp_path / "ctl", damage_ctl_table(dmg, "wechsel"))     # a valid control run (6.11): P keeps its verdict
+    res = PE.evaluate([tmp_path, tmp_path / "ctl"], n_boot=500, seed=1)
     df = res["results"].set_index("id")
     # no frozen dose: every pre-registered dose present is reported with its own suffix, 0.5 is exploratory
     assert "P" not in df.index and "P@0.05" in df.index and not any(i.endswith("@0.5") for i in df.index)
@@ -235,6 +309,7 @@ def test_primary_statistic_c1_restriction_and_test_split(tmp_path):
     note = row["deviation_note"]
     assert "no DEV-frozen dose" in note and "exploratory doses present (not evaluated): 0.5" in note
     assert "fewer than the pre-registered 32" in note and "missing: 0.001" in note
+    assert "token-language control (PREREGISTRATION 6.11): Wechsel; rule outcome without the control: supported" in note
     # components: lang per K, DiD against the rand contrast, monotonicity
     for K in (2, 4, 8):
         assert df.loc[f"P.lang.K{K}@0.05", "estimate"] == pytest.approx(_primary_expected(dmg, K).mean())
@@ -290,15 +365,15 @@ def test_primary_audit_failure_invalidates_the_run(tmp_path):
 
 def _primary_damage(dl8) -> pd.DataFrame:
     """Damage rows of the confirmation set with per-family dlam(K) = (0.85, 0.93, 1) x ``dl8[i]``
-    (the same in A and B) and rand = 0 (four directions)."""
+    (the same in A and B) and rand = 0 (four directions); injected at the "." ending unit 9."""
     rows = []
     for i, fam in enumerate(TEST):
         for form in ("A", "B"):
             for K, dl in ((0, 0.0), (2, dl8[i] * 0.85), (4, dl8[i] * 0.93), (8, dl8[i])):
                 for name, fd in [("lang_dom", "lang_dom")] + [(f"rand_{j:02d}", "rand") for j in range(4)]:
                     rows.append(dict(tag=f"{fam}{form}:K{K}:C1", family=fam, formulation=form, K=K, C="C1", kind="standard",
-                                     inject="depth", direction=name, dir_family=fd, eps=0.05,
-                                     lam=0.05 + (dl if fd == "lang_dom" else 0.0), audit_rel_err=1e-7))
+                                     inject="depth", inject_pos=82 - _site_gap(fam, form), direction=name, dir_family=fd,
+                                     eps=0.05, lam=0.05 + (dl if fd == "lang_dom" else 0.0), audit_rel_err=1e-7))
     return pd.DataFrame(rows)
 
 
@@ -340,7 +415,9 @@ def test_primary_verdict_follows_the_interval_like_damage_boot(tmp_path):
     for case, dl8 in cases.items():
         dmg = _primary_damage(dl8)
         write_run(tmp_path / case, "D", {"damage": dmg}, frozen_dose=0.05)
-        df = PE.evaluate([tmp_path / case], n_boot=10000, seed=0)["results"].set_index("id")
+        write_ctl_run(tmp_path / case / "ctl", damage_ctl_table(dmg, "wechsel"))   # valid control (6.11): P keeps its rule outcome
+        df = PE.evaluate([tmp_path / case, tmp_path / case / "ctl"], n_boot=10000, seed=0)["results"].set_index("id")
+        assert "token-language control (PREREGISTRATION 6.11): Wechsel" in df.loc["P", "deviation_note"]
         boot = SD.damage_boot(SD.damage_contrasts(dmg), n_boot=10000, seed=0)
         conf = boot[boot["confirmatory"].astype(bool) & (boot["K"] == 8)].set_index("quantity")
         lang = conf.loc["dlam_lang_dom"]
@@ -358,6 +435,325 @@ def test_primary_verdict_follows_the_interval_like_damage_boot(tmp_path):
             assert df.loc["P", "verdict"] == "open" and df.loc["P.lang.K8", "verdict"] == "open"
         else:
             assert lang["verdict"] == "supported" and df.loc["P", "verdict"] == "supported"
+
+
+# --------------------------------------------------------------------------------------
+# token-language control of the primary endpoint (PREREGISTRATION 6.11)
+# --------------------------------------------------------------------------------------
+SPREAD = (-0.12, 0.10, -0.06, 0.09, 0.0, 0.05, -0.08, 0.11, -0.03, 0.02, -0.09, 0.01)     # per-family scatter, mean 0
+
+
+def _family_delta_before(var: pd.DataFrame, K: int, Cc: str) -> pd.DataFrame:
+    """``family_delta`` as it was before PREREGISTRATION 6.11 (one C level, equality filter)."""
+    mixed = var[(var["K"] == int(K)) & (var["C"].astype(str) == str(Cc))].groupby("family")["lam"].agg(["mean", "size"])
+    ref = var[var["K"] == 0].groupby("family")["lam"].agg(["mean", "size"])
+    j = mixed.join(ref, lsuffix="_k", rsuffix="_0", how="inner")
+    return pd.DataFrame({"family": j.index.astype(str), "value": (j["mean_k"] - j["mean_0"]).to_numpy(dtype=float),
+                         "n_rows": (j["size_k"] + j["size_0"]).to_numpy(dtype=int)})
+
+
+def test_control_constants_mirror_the_control_run():
+    """The evaluation's copies of the control run's names (lsne/experiments/stage_d_control.py):
+    the manifest marks, the sites, the u9D label and the columns damage_ctl adds."""
+    from lsne.experiments import stage_d_control as SDC
+
+    assert PE.CTL_CONTROL == SDC.CONTROL and PE.AMENDMENT_611["id"] == SDC.AMENDMENT
+    assert PE.CTL_SITES == SDC.SITE_UNITS and PE.CTL3_C == SDC.U9D_C
+    assert set(SDC.EXTRA_COLS) <= set(PE.DAMAGE_CTL_COLS)
+    assert {"family", "formulation", "C", "excluded"} <= set(SDC.CHECK_COLS)
+
+
+def test_family_delta_pools_a_tuple_of_c_levels():
+    """Control 1 pools C2 and C3 in one family mean; a single C level gives what it gave before."""
+    var = pd.DataFrame(dict(family=["F01"] * 6 + ["F02"] * 4, K=[0, 0, 8, 8, 8, 8, 0, 8, 8, 8],
+                            C=["C1", "C1", "C2", "C3", "C3", "C1", "C1", "C2", "C3", "C1"],
+                            lam=[1.0, 3.0, 4.0, 6.0, 8.0, 100.0, 0.0, 1.0, 3.0, 100.0]))
+    pooled = PE.family_delta(var, 8, ("C2", "C3")).set_index("family")
+    # F01: mean(4, 6, 8) - mean(1, 3) = 4 (not the mean of the per-level contrasts, 3.5); F02: mean(1, 3) - 0 = 2;
+    # the C1 rows (100) stay out
+    assert pooled.loc["F01", "value"] == pytest.approx(4.0) and pooled.loc["F02", "value"] == pytest.approx(2.0)
+    assert pooled["n_rows"].tolist() == [5, 3]
+    pd.testing.assert_frame_equal(PE.family_delta(var, 8, ["C2", "C3"]), PE.family_delta(var, 8, ("C2", "C3")))
+    for Cc in ("C1", "C2", "C3"):
+        pd.testing.assert_frame_equal(PE.family_delta(var, 8, Cc), _family_delta_before(var, 8, Cc))
+        pd.testing.assert_frame_equal(PE.family_delta(var, 8, (Cc,)), _family_delta_before(var, 8, Cc))
+
+
+def test_token_control_wechsel_leaves_p_unchanged(tmp_path):
+    """Switching world: lambda also rises with K where the injected "." closes an English clause
+    (control 1: C2 + C3 at the end of unit 9; control 2: C1 at the end of unit 10), so the outcome
+    is "Wechsel" and P keeps its verdict.  The statistic is P's: family means of the confirmation
+    set (the +5 rows outside it never leak in), C2 and C3 pooled in one family mean, K=0 at the
+    same site of the same run; control 3 (u9D) is reported only."""
+    dmg = damage_table()
+    write_run(tmp_path / "runs", "D", {"damage": dmg})
+    ctl = damage_ctl_table(dmg, "wechsel")
+    u9d = ctl[ctl["C"] == "u9D"].drop_duplicates("tag")[["tag", "family", "formulation", "K", "C"]]
+    gone = u9d["tag"] == "F02B:K2:u9D"                                   # excluded by section 4: recorded, not run
+    checks = u9d.assign(step="check_variant", problem=np.where(gone, "tail ids differ from K=0", ""), excluded=gone)
+    ctl = ctl[ctl["tag"] != "F02B:K2:u9D"]
+    write_ctl_run(tmp_path / "runs_ctl", ctl, checks=checks)
+    res = PE.evaluate([tmp_path / "runs", tmp_path / "runs_ctl"], n_boot=500, seed=1)
+    df = res["results"].set_index("id")
+    p, s = df.loc["P@0.05"], df.loc["P.ctl@0.05"]
+    assert p["verdict"] == "supported"
+    assert "token-language control (PREREGISTRATION 6.11): Wechsel; rule outcome without the control: supported" in p["deviation_note"]
+    assert s["verdict"] == "supported" and s["deviation_note"].startswith("outcome Wechsel")
+    # control 1: C2 and C3 pooled at u9 against K=0 at u9, confirmation set only
+    c1 = df.loc["P.ctl1@0.05"]
+    pooled = _ctl_expected(ctl, "u9", ("C2", "C3"), 8)
+    assert len(pooled) == 12 and c1["estimate"] == pytest.approx(pooled.mean())
+    single = [_ctl_expected(ctl, "u9", (Cc,), 8).mean() for Cc in ("C2", "C3")]
+    assert c1["estimate"] == pytest.approx(np.mean(single)) and single[0] != pytest.approx(single[1], abs=1e-6)
+    assert c1["n_families"] == 12 and c1["n_rows"] == 12 * 6             # 4 C2 / C3 variants at K=8 + 2 at K=0 per family
+    assert c1["verdict"] == "supported" and c1["ci_low"] >= 0.05 and c1["min_effect"] == pytest.approx(0.05)
+    # control 2: C1 at u10 against K=0 at u10
+    c2 = df.loc["P.ctl2@0.05"]
+    assert c2["estimate"] == pytest.approx(_ctl_expected(ctl, "u10", ("C1",), 8).mean()) and c2["verdict"] == "supported"
+    for j, site, Cs in ((1, "u9", ("C2", "C3")), (2, "u10", ("C1",))):
+        for K in (2, 4, 8):
+            lang, did = df.loc[f"P.ctl{j}.lang.K{K}@0.05"], df.loc[f"P.ctl{j}.did.K{K}@0.05"]
+            exp, rnd = _ctl_expected(ctl, site, Cs, K).mean(), _ctl_expected(ctl, site, Cs, K, fam_d="rand").mean()
+            assert lang["estimate"] == pytest.approx(exp) and lang["verdict"] == "supported"
+            assert did["estimate"] == pytest.approx(exp - rnd) and "dlam(rand)" in did["deviation_note"]
+    # control 3: reported only, computed without the excluded variant
+    c3 = df.loc["P.ctl3@0.05"]
+    assert c3["estimate"] == pytest.approx(_ctl_expected(ctl, "u9", ("u9D",), 2).mean())
+    assert "reported only" in c3["deviation_note"]
+    assert "u9D variants excluded by section 4 (damage_ctl_checks): 1 of 24" in c3["deviation_note"]
+    assert {"P.ctl3.lang@0.05", "P.ctl3.did@0.05"} <= set(df.index)
+    # every control row: role primary_control, outside BH; no row at the exploratory dose 0.5
+    rows = df[df.index.str.startswith("P.ctl")]
+    assert len(rows) == 1 + 7 + 7 + 3 and (rows["role"] == "primary_control").all()
+    assert not rows["bh_group"].astype(bool).any() and not any(i.endswith("@0.5") for i in rows.index)
+    # validity: write audit, replication (the main run's lam at the same position), sites, manifest
+    for a in ("audit.D1ctl", "audit.D1ctl.rep", "audit.D1ctl.site", "audit.D1ctl.run"):
+        assert df.loc[a, "verdict"] == "supported" and df.loc[a, "role"] == "audit", a
+    assert df.loc["audit.D1ctl.rep", "estimate"] == 0.0
+    assert df.loc["audit.D1ctl.rep", "n_rows"] == int(((ctl["inject"] == "u9") & (ctl["C"] == "C1")).sum())
+    # caveats: the control rows carry the control's caveat, P its reworded one
+    assert PE.caveat_keys("P.ctl1.lang.K8@0.05") == ["P.ctl"] and PE.endpoint_key("P.ctl2@0.05") == "P.ctl"
+    assert PE.CAVEATS["P.ctl"] in s["deviation_note"] and PE.CAVEATS["P"] not in s["deviation_note"]
+    assert PE.CAVEATS["P"] in p["deviation_note"] and 'the same "."' in PE.CAVEATS["P"]
+    md = PE.markdown_report(res)
+    assert "| P.ctl@0.05 |" in md and "- **P.ctl**:" in md and "Nachtrag 6.11" in md
+    # control 3 is reported only: without its effect the outcome is still "Wechsel"
+    write_ctl_run(tmp_path / "runs_ctl", damage_ctl_table(dmg, "wechsel", u9d=0.0))
+    df = PE.evaluate([tmp_path / "runs", tmp_path / "runs_ctl"], n_boot=500, seed=1)["results"].set_index("id")
+    assert df.loc["P.ctl3@0.05", "verdict"] == "not_supported" and df.loc["P.ctl@0.05", "verdict"] == "supported"
+    assert df.loc["P@0.05", "verdict"] == "supported"
+
+
+@pytest.mark.parametrize("before", ["supported", "open", "not_supported"])
+def test_token_control_lokal_makes_a_supported_or_open_p_not_interpretable(tmp_path, before):
+    """Local world: lambda does not rise at the English-closing sites (ci_high of dlam(lang_dom,
+    K=8) < 0.05 in controls 1 and 2), so the outcome is "lokal": a supported or open P is not
+    interpretable as a switching effect, a P that is not supported stays so; the note keeps the
+    rule outcome without the control."""
+    mains = {"supported": (damage_table(), {}),
+             "open": (_primary_damage(np.array([0.0987 + 1.6 * x for x in SPREAD])), dict(frozen_dose=0.05)),  # ci_low < 0.05
+             "not_supported": (damage_table(rand_effect=0.20), {})}                                           # the DiD fails
+    dmg, man = mains[before]
+    write_run(tmp_path / "runs", "D", {"damage": dmg}, **man)
+    write_ctl_run(tmp_path / "runs_ctl", damage_ctl_table(dmg, "lokal"))
+    df = PE.evaluate([tmp_path / "runs", tmp_path / "runs_ctl"], n_boot=500, seed=0)["results"].set_index("id")
+    sfx = "" if man else "@0.05"                          # a frozen dose is the main dose of P and of its control
+    for j in (1, 2):
+        lang = df.loc[f"P.ctl{j}.lang.K8{sfx}"]
+        assert lang["verdict"] == "not_supported" and lang["ci_high"] < 0.05
+        assert df.loc[f"P.ctl{j}{sfx}", "verdict"] == "not_supported"
+    s = df.loc[f"P.ctl{sfx}"]
+    assert s["verdict"] == "not_supported" and s["deviation_note"].startswith("outcome lokal")
+    assert df.loc[f"P.ctl3{sfx}", "verdict"] == "supported"          # control 3 shows the effect: never in the outcome
+    p = df.loc[f"P{sfx}"]
+    assert p["verdict"] == ("not_supported" if before == "not_supported" else "not_interpretable")
+    assert (f"token-language control (PREREGISTRATION 6.11): lokal; rule outcome without the control: {before}"
+            in p["deviation_note"])
+    assert df.loc[f"P.lang.K8{sfx}", "verdict"] == ("open" if before == "open" else "supported")   # components: own rule
+
+
+def test_token_control_offen_or_no_control_run_caps_p_at_open(tmp_path):
+    """Without a control run there is one P.ctl row (not tested) and P is at most open; with the
+    mixed world (control 1 shows the effect, control 2 excludes it) the outcome is "offen" and P
+    is capped at open as well."""
+    dmg = damage_table()
+    write_run(tmp_path / "runs", "D", {"damage": dmg})
+    df = PE.evaluate([tmp_path / "runs"], n_boot=300)["results"].set_index("id")
+    assert [i for i in df.index if i.startswith("P.ctl")] == ["P.ctl"]
+    assert not any(i.startswith("audit.D1ctl") for i in df.index)
+    assert df.loc["P.ctl", "verdict"] == "not_tested" and "token-language control run" in df.loc["P.ctl", "deviation_note"]
+    p = df.loc["P@0.05"]
+    assert p["verdict"] == "open"
+    assert ("token-language control (PREREGISTRATION 6.11): no valid control run; rule outcome without the control: supported"
+            in p["deviation_note"])
+    assert df.loc["P.lang.K8@0.05", "verdict"] == "supported" and df.loc["P.mono@0.05", "verdict"] == "supported"
+    write_ctl_run(tmp_path / "runs_ctl", damage_ctl_table(dmg, "offen"))
+    df = PE.evaluate([tmp_path / "runs", tmp_path / "runs_ctl"], n_boot=300)["results"].set_index("id")
+    assert df.loc["P.ctl1@0.05", "verdict"] == "supported" and df.loc["P.ctl2@0.05", "verdict"] == "not_supported"
+    assert df.loc["P.ctl2.lang.K8@0.05", "ci_high"] < 0.05
+    s = df.loc["P.ctl@0.05"]
+    assert s["verdict"] == "open" and s["deviation_note"].startswith("outcome offen")
+    p = df.loc["P@0.05"]
+    assert p["verdict"] == "open"
+    assert "token-language control (PREREGISTRATION 6.11): offen; rule outcome without the control: supported" in p["deviation_note"]
+
+
+def test_the_control_gate_never_improves_the_primary_verdict():
+    """apply_token_control per (P verdict, P.ctl verdict of the same dose): Wechsel keeps P, lokal
+    makes a supported or open P not_interpretable, anything else (offen, not tested, not
+    interpretable, no row) caps it at open; the note keeps the rule outcome; other rows stay."""
+    word = {"supported": "Wechsel", "not_supported": "lokal", "open": "offen"}
+    for c in ("supported", "not_supported", "open", "not_tested", "not_interpretable", None):
+        for v in PE.VERDICTS:
+            rows = [PE.make_row("P@0.05", "p", role="primary", stage="D", verdict=v, note="rule note"),
+                    PE.make_row("P.lang.K8@0.05", "c", role="primary_component", stage="D", verdict="supported")]
+            if c is not None:
+                rows.append(PE.make_row("P.ctl@0.05", "ctl", role="primary_control", stage="D", verdict=c))
+            out = PE.apply_token_control(pd.DataFrame(rows, columns=PE.RESULT_COLS + PE.EXTRA_COLS)).set_index("id")
+            if c == "supported":
+                exp = v
+            elif c == "not_supported":
+                exp = "not_interpretable" if v in ("supported", "open") else v
+            else:
+                exp = "open" if v == "supported" else v
+            assert out.loc["P@0.05", "verdict"] == exp, (c, v)
+            assert out.loc["P@0.05", "deviation_note"] == (f"rule note; token-language control (PREREGISTRATION 6.11): "
+                                                           f"{word.get(c, 'no valid control run')}; rule outcome without "
+                                                           f"the control: {v}")
+            assert out.loc["P.lang.K8@0.05", "verdict"] == "supported" and out.loc["P.lang.K8@0.05", "deviation_note"] == ""
+    # each dose reads its own control: P -> P.ctl, P@0.01 -> P.ctl@0.01
+    rows = [PE.make_row(i, "x", role=r, stage="D", verdict=v) for i, r, v in
+            (("P", "primary", "supported"), ("P@0.01", "primary", "supported"), ("P.ctl", "primary_control", "supported"),
+             ("P.ctl@0.01", "primary_control", "open"))]
+    out = PE.apply_token_control(pd.DataFrame(rows, columns=PE.RESULT_COLS + PE.EXTRA_COLS)).set_index("id")
+    assert out.loc["P", "verdict"] == "supported" and out.loc["P@0.01", "verdict"] == "open"
+
+
+def test_control_run_is_keyed_d_ctl_and_never_replaces_the_main_d_run(tmp_path):
+    """The control run is a stage-D run (runs_ctl/D/<model>@<rev>, newer than the main run): its
+    manifest mark keys it D_ctl, so the main run stays the stage-D run of P; a newer smoke control
+    run of account B is superseded by the full one."""
+    a, b = tmp_path / "LSNE", tmp_path / "LSNE_B"
+    dmg = damage_table()
+    write_run(a / "runs", "D", {"damage": dmg})                                     # 27.10.: the main run
+    ctl = damage_ctl_table(dmg)
+    write_ctl_run(a / "runs_ctl", ctl)                                               # 28.10., after the amendment
+    write_ctl_run(b / "runs_ctl", ctl.assign(lam=0.0), timestamp="2026-10-28T12:00:00+00:00",
+                  limits=dict(n_boot=200, is_smoke=True))                            # newer, but a smoke run
+    res = PE.evaluate([a, b], n_boot=300, seed=1)
+    runs = res["runs"]
+    used = runs[runs["used"].astype(bool)].set_index("key")
+    assert set(used.index) == {"D", "D_ctl"} and set(runs.loc[runs["key"] == "D_ctl", "stage"]) == {"D"}
+    assert str(used.loc["D", "path"]).startswith(str(a / "runs" / "D"))
+    assert str(used.loc["D_ctl", "path"]).startswith(str(a / "runs_ctl" / "D"))
+    notes = " ".join(runs["note"].astype(str))
+    assert "superseded by a full run" in notes and "using runs, runs_ctl below it" in notes
+    df = res["results"].set_index("id")
+    assert df.loc["P@0.05", "estimate"] == pytest.approx(_primary_expected(dmg, 8).mean())   # from the main run
+    assert df.loc["P.ctl@0.05", "verdict"] == "supported" and df.loc["P@0.05", "verdict"] == "supported"
+    assert "| D_ctl | ja |" in PE.markdown_report(res)
+    # the key comes from the manifest mark of stage D only
+    assert PE.StageRun(stage="D", path=a, root=a, manifest=dict(control="token_language")).key == "D_ctl"
+    assert PE.StageRun(stage="D", path=a, root=a).key == "D"
+    assert PE.StageRun(stage="L", path=a, root=a, manifest=dict(control="token_language")).key == "L"
+    assert "D_ctl" in PE.EVAL_KEYS and "runs_ctl" in PE.ROOT_CHILDREN
+
+
+def _edit_first(x: pd.DataFrame, mask: pd.Series, col: str, value=None, add=None) -> pd.DataFrame:
+    """A copy of ``x`` with ``col`` of the first row in ``mask`` set to ``value`` (or raised by ``add``)."""
+    x = x.copy()
+    i = x.index[mask.to_numpy()][0]
+    x.loc[i, col] = value if add is None else x.loc[i, col] + add
+    return x
+
+
+#: One broken validity condition of 6.11 per case: (audit row, change of damage_ctl, manifest fields,
+#: text of the audit note).
+CTL_BREAKS = {
+    "write": ("audit.D1ctl", lambda x: _edit_first(x, x["inject"] == "u10", "audit_rel_err", 2e-4), {},
+              "rows > 1e-4: 1 of"),
+    "replication_lam": ("audit.D1ctl.rep", lambda x: _edit_first(x, (x["inject"] == "u9") & (x["C"] == "C1") & (x["K"] == 8),
+                                                                 "lam", add=0.002), {}, "|difference| > 1e-3 or not finite: 1"),
+    "replication_pos": ("audit.D1ctl.rep", lambda x: _edit_first(x, (x["inject"] == "u9") & (x["K"] == 0), "inject_pos", add=1),
+                        {}, "different inject_pos: 1"),
+    "site_token": ("audit.D1ctl.site", lambda x: _edit_first(x, x["inject"] == "u10", "inject_token", ","), {},
+                   "token != '.': 1,"),
+    "site_language": ("audit.D1ctl.site", lambda x: _edit_first(x, (x["inject"] == "u9") & (x["C"] == "C3"), "inject_lang", "D"),
+                      {}, "language mark: 1,"),
+    "site_unit": ("audit.D1ctl.site", lambda x: _edit_first(x, x["inject"] == "u10", "inject_unit", 9), {}, "unit: 1,"),
+    "site_gap": ("audit.D1ctl.site", lambda x: _edit_first(x, x["C"] == "u9D", "site_gap", add=2), {}, "site_gap: 1,"),
+    "run_marks": ("audit.D1ctl.run", lambda x: x, dict(amendment=None), "amendment None instead of '6.11'"),
+    "run_smoke": ("audit.D1ctl.run", lambda x: x, dict(limits=dict(n_boot=200, is_smoke=True)), "smoke / limited run"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(CTL_BREAKS))
+def test_a_failed_control_audit_invalidates_the_control_and_caps_p(tmp_path, case):
+    """6.11 validity: a write audit over 1e-4, a replication off by more than 1e-3 or at another
+    position, a site that breaks the token / language / unit / distance rule, or a manifest
+    without the marks (or a smoke run) makes the control run invalid: every P.ctl row is
+    not_interpretable (the rule outcome stays in the note) and P is capped at open."""
+    audit, brk, man, text = CTL_BREAKS[case]
+    dmg = damage_table()
+    write_run(tmp_path / "runs", "D", {"damage": dmg})
+    write_ctl_run(tmp_path / "runs_ctl", brk(damage_ctl_table(dmg, "wechsel")), **man)
+    df = PE.evaluate([tmp_path / "runs", tmp_path / "runs_ctl"], n_boot=200)["results"].set_index("id")
+    audits = df[df.index.str.startswith("audit.D1ctl")]
+    assert len(audits) == 4 and set(audits.index[audits["verdict"] != "supported"]) == {audit}
+    assert df.loc[audit, "verdict"] == "not_supported" and text in df.loc[audit, "deviation_note"]
+    if case == "replication_lam":
+        assert df.loc[audit, "estimate"] == pytest.approx(0.002)
+    rows = df[df.index.str.startswith("P.ctl")]
+    assert len(rows) == 18 and (rows["verdict"] == "not_interpretable").all()
+    note = rows.loc["P.ctl@0.05", "deviation_note"]
+    assert f"control run INVALID by its audits ({audit} not_supported)" in note
+    assert "rule outcome ignoring the audits: Wechsel (supported)" in note
+    assert "rule outcome ignoring the audits: supported" in rows.loc["P.ctl1@0.05", "deviation_note"]
+    p = df.loc["P@0.05"]
+    assert p["verdict"] == "open"
+    assert ("token-language control (PREREGISTRATION 6.11): no valid control run; rule outcome without the control: supported"
+            in p["deviation_note"])
+
+
+def test_a_control_run_older_than_amendment_611_fails_the_run_audit(tmp_path):
+    """6.11 (d): the control run must be younger than the commit that froze the amendment
+    (2026-10-28 08:05:51 UTC); an older run (or one of that very second) is no valid control."""
+    assert PE.AMENDMENT_611 == dict(id="6.11", commit="2ce9c71f4d0f902fdb504785c4d934b662e46f5b",
+                                    utc="2026-10-28T08:05:51+00:00")
+    dmg = damage_table()
+    write_run(tmp_path / "runs", "D", {"damage": dmg})
+    ctl = damage_ctl_table(dmg)
+    for ts, valid in (("2026-10-28T07:59:00.123456+00:00", False), (PE.AMENDMENT_611["utc"], False),
+                      ("2026-10-28T08:05:52.000001+00:00", True), ("2026-10-28T10:00:00Z", True)):
+        write_ctl_run(tmp_path / "runs_ctl", ctl, timestamp=ts)
+        df = PE.evaluate([tmp_path / "runs", tmp_path / "runs_ctl"], n_boot=100)["results"].set_index("id")
+        run = df.loc["audit.D1ctl.run"]
+        assert run["verdict"] == ("supported" if valid else "not_supported"), ts
+        assert ("predates the commit of amendment 6.11 (2ce9c71" in run["deviation_note"]) == (not valid), ts
+        assert df.loc["P.ctl@0.05", "verdict"] == ("supported" if valid else "not_interpretable"), ts
+        assert df.loc["P@0.05", "verdict"] == ("supported" if valid else "open"), ts
+
+
+def test_control_rows_stay_outside_the_bh_group(tmp_path):
+    """The P.ctl rows never enter the BH group: m, the ids, the q-values and the verdicts of the
+    secondary rows are the same with and without a control run (6.11: m stays 26)."""
+    dmg = damage_table()
+    write_run(tmp_path / "runs", "D", {"damage": dmg})
+    write_run(tmp_path / "runs", "C", {"contrasts": contrasts_table(),
+                                       "grid_summary": grid_summary_table({1: lambda i, K: 0.2 + _noise(str(i), 6), -1: -0.1})})
+    before = PE.evaluate([tmp_path / "runs"], n_boot=300)
+    write_ctl_run(tmp_path / "runs_ctl", damage_ctl_table(dmg))
+    after = PE.evaluate([tmp_path / "runs", tmp_path / "runs_ctl"], n_boot=300)
+    assert after["bh"]["m"] == before["bh"]["m"] >= 4 and after["bh"]["ids"] == before["bh"]["ids"]
+    assert after["bh"]["endpoints"] == before["bh"]["endpoints"]
+    a, b = (r["results"].set_index("id") for r in (before, after))
+    ids = before["bh"]["ids"]
+    assert b.loc[ids, "bh_q"].to_numpy() == pytest.approx(a.loc[ids, "bh_q"].to_numpy())
+    assert b.loc[ids, "verdict"].tolist() == a.loc[ids, "verdict"].tolist()
+    rows = b[b.index.str.startswith("P.ctl")]
+    assert len(rows) == 18 and not rows["bh_group"].astype(bool).any() and rows["bh_q"].isna().all()
+    assert not any(i.startswith(("P", "audit")) for i in after["bh"]["ids"])
+    assert a.loc["P@0.05", "verdict"] == "open" and b.loc["P@0.05", "verdict"] == "supported"     # P is outside BH as well
 
 
 # --------------------------------------------------------------------------------------
@@ -788,9 +1184,9 @@ def test_missing_stages_are_not_tested_and_outputs_are_written(tmp_path):
     assert set(df["verdict"]) <= set(PE.VERDICTS)
     reasons = dict(zip(df["id"], df["deviation_note"]))
     assert "no run of stage D" in reasons["P"] and "no run of stage G" in reasons["S7"]
-    assert "trace-source stage-L run" in reasons["S18T"]
-    assert {"P", "audit.D1", "audit.C", "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10i", "S10ii", "S10iii", "S11",
-            "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S18T"} <= set(df["id"])
+    assert "trace-source stage-L run" in reasons["S18T"] and "token-language control run" in reasons["P.ctl"]
+    assert {"P", "P.ctl", "audit.D1", "audit.C", "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10i", "S10ii", "S10iii",
+            "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S18T"} <= set(df["id"])
     md = (out / "prereg_results.md").read_text(encoding="utf-8")
     assert md.startswith("# Präregistrierte Auswertung") and "## Primärer Endpunkt" in md and "## BH-Gruppierung" in md
     assert (out / "prereg_runs.csv").exists() and json.loads((out / "prereg_meta.json").read_text())["n_boot"] == 50

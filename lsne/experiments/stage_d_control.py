@@ -62,6 +62,7 @@ import hashlib
 import json
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
@@ -171,9 +172,9 @@ def load_main_bank(main_dir) -> C.DirectionBank:
     """The main run's depth bank (:func:`~lsne.experiments.common.load_bank`, no refit) with every
     vector exactly as stored.  ``load_bank`` passes the vectors through
     :class:`~lsne.directions.Direction`, which normalises them again: a float32 unit vector whose
-    computed norm is not exactly 1 changes in its last bits, and at the small doses, where the
-    damage of the last snapshot is near round-off, that moves lambda far beyond the replication
-    bound (seen: 0.06 for ``ent`` at eps 0.01 on pythia-14m).  The main run injected the stored
+    computed norm is not exactly 1 changes in its last bits, and at the smallest dose that moves
+    lambda beyond the 1e-3 replication bound (measured for a 1-ulp change at eps 0.01: up to
+    5e-3 on pythia-160m, 0.06 for ``ent`` on pythia-14m).  The main run injected the stored
     vectors themselves (:func:`~lsne.experiments.common.save_bank` writes the float32 vectors
     unchanged), so these replicate its lambda exactly."""
     md = Path(os.fspath(main_dir))
@@ -334,12 +335,24 @@ def control_damage_tables(mb: ModelBundle, variants, bank: C.DirectionBank, dir_
                                        batch_size=batch_size, injections_fn=control_injections)
     by_tag = {v.tag: v for v in variants}
     pos = damage["inject_pos"].astype(int).tolist()
-    tok_id = [int(by_tag[t].ids[p]) for t, p in zip(damage["tag"], pos)]
-    gap = [int(ts) - p for ts, p in zip(damage["tail_start"].astype(int).tolist(), pos)]
+    extra = dict(inject_token_id=[int(by_tag[t].ids[p]) for t, p in zip(damage["tag"], pos)],
+                 site_gap=[int(ts) - p for ts, p in zip(damage["tail_start"].astype(int).tolist(), pos)])
     at = list(damage.columns).index("inject_klass") + 1
-    damage.insert(at, "site_gap", pd.Series(gap, index=damage.index, dtype="int64"))
-    damage.insert(at, "inject_token_id", pd.Series(tok_id, index=damage.index, dtype="int64"))
+    for i, name in enumerate(EXTRA_COLS):
+        damage.insert(at + i, name, pd.Series(extra[name], index=damage.index, dtype="int64"))
     return damage, profile
+
+
+def platform_info(mb: ModelBundle, main_manifest: dict) -> dict:
+    """Manifest ``platform``: torch / CUDA build and device of this run next to the main run's torch
+    version.  The replication of the primary site is exact on the same platform; another build
+    changes round-off, and lambda at the smallest dose moves by up to ~5e-3 under round-off-level
+    input changes (pythia-160m, measured on CPU), which is above the 1e-3 bound of the audit."""
+    gpu = ""
+    if mb.device.type == "cuda" and torch.cuda.is_available():
+        gpu = torch.cuda.get_device_name(mb.device)
+    return dict(torch=str(torch.__version__), cuda=str(torch.version.cuda or ""), device=str(mb.device), gpu=gpu,
+                main_torch=str(main_manifest.get("torch_version", "")))
 
 
 def control_contrasts(damage: pd.DataFrame) -> pd.DataFrame:
@@ -371,9 +384,9 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     if dbank.site != dsite:
         raise ControlRunError(f"the depth bank of the main run sits at {dbank.site.key}, this model's depth site "
                               f"is {dsite.key}")
-    limits = C.get_limits(cfg, kw)
-    variants, checks = control_variants(cfg, mb, kw.get("ctx"))
     lattice_dirs, doses, batch = main["lattice_dirs"], main["doses"], main["batch_size"]
+    limits = replace(C.get_limits(cfg, kw), damage_batch_size=batch)     # the manifest records the layout used
+    variants, checks = control_variants(cfg, mb, kw.get("ctx"))
     sig = C.resume_signature(stage="D_ctl", version=RESUME_VERSION, tags=[v.tag for v in variants],
                              model=mb.spec.tag(), dtype=mb.spec.dtype, depth_site=dsite.key, bank=main["bank_sha256"],
                              lattice_dirs=lattice_dirs, doses=doses, batch_size=batch, sites=SITE_RULES,
@@ -394,6 +407,7 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
                          sites=SITE_RULES, cells=control_cells(variants), u9D_unit_mask=U9D_UNIT_MASK,
                          n_variants=len(variants),
                          n_excluded=int(checks["excluded"].astype(bool).sum()) if len(checks) else 0,
-                         resumed_checkpoints=len(res.loaded), audit=C.audit_summary(damage))
+                         resumed_checkpoints=len(res.loaded), audit=C.audit_summary(damage),
+                         platform=platform_info(mb, mm))
     res.clear()
     return out
