@@ -172,13 +172,16 @@ def depth_bank(cfg: RunConfig, mb: ModelBundle, variants, site: HookSite, base: 
 
 
 def damage_tables(mb: ModelBundle, variants, banks, dir_names, doses, enabled=True,
-                  batch_size: int = DAMAGE_BATCH_SIZE) -> tuple[pd.DataFrame, pd.DataFrame]:
+                  batch_size: int = DAMAGE_BATCH_SIZE, injections_fn=None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Returns (damage, damage_profile).
 
     ``banks`` is a single bank or a mapping ``site.key -> DirectionBank`` (see
     :func:`bank_for_site`): every injection is made with the direction fitted at its own
     site, recorded as ``dir_site``.  A direction missing from a site's bank is skipped
-    for that injection (one warning per name and site).
+    for that injection (one warning per name and site).  ``injections_fn(mb, v)`` replaces
+    :func:`injections` as the source of the ``(name, site, position)`` injections of a
+    variant (the control run of :mod:`lsne.experiments.stage_d_control` injects at
+    unit-defined sites); ``None`` keeps stage D's two injections.
 
     All (direction, dose) pairs of one injection run through
     :func:`lsne.dynamics.damage_spreading_batch` in forwards of ``batch_size`` rows (the
@@ -190,11 +193,12 @@ def damage_tables(mb: ModelBundle, variants, banks, dir_names, doses, enabled=Tr
     run out of memory on a 40 GB A100)."""
     rows, prof = [], []
     missing: set = set()
+    inject_at = injections if injections_fn is None else injections_fn
     for v in C.progress(variants, "D1 damage", enabled=enabled):
         ids = C.ids_tensor(mb, v)
         T = int(v.n_tokens)
         tail = C.tail_positions(v)
-        for inj_name, site, pos in injections(mb, v):
+        for inj_name, site, pos in inject_at(mb, v):
             bank = bank_for_site(banks, site)
             info = position_info(v, pos)
             positions = [p for p in tail if p >= pos] or [T - 1]
@@ -537,7 +541,14 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     D1, D2/D9 and D3-D7 are checkpointed per chunk of
     :data:`~lsne.experiments.common.RESUME_CHUNK` variants under ``<run_dir>/_resume`` and
     picked up when the stage is started again with the same inputs; the checkpoints are
-    removed after the manifest is written."""
+    removed after the manifest is written.
+
+    ``kw['d_control']`` (``--d-control``, with ``kw['d_main_run']``) runs a control of the main
+    stage-D run instead: :func:`lsne.experiments.stage_d_control.run` (``"token_language"``,
+    PREREGISTRATION section 6, amendment 11; any other value raises ``ValueError``)."""
+    if kw.get("d_control"):
+        from . import stage_d_control           # local import: the control module imports this one
+        return stage_d_control.run(cfg, mb, run_dir, **kw)
     t0 = time.perf_counter()
     limits = C.get_limits(cfg, kw)
     ctx = kw.get("ctx")

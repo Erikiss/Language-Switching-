@@ -6,6 +6,8 @@
         [--pairs model@rev,...|trace|self] [--f-stages B,C,D] [--shard-index I --shard-count N] \\
         [--ttt-corpus DIR] [--ttt-checkpoints step4000,step98000,step143000] \\
         [--transplant-source rotated_self|self|model@rev] [--atlas-dir DIR]
+    python -m lsne.cli run --stage D --d-control token_language --d-main-run <root>/D/<model>@<rev> \\
+        --out <LSNE>/runs_ctl [--model ... --revision ...]
     python -m lsne.cli merge --root runs --out merged/
 
 ``run`` loads the model once, runs the requested stages in order (``all`` = A B C D E F
@@ -20,6 +22,14 @@ the exit code is 1 only when every requested stage failed outright (``status='er
 ``--smoke`` sets every limit for a short CPU run with pythia-14m (one family, three
 variants, tiny generation / path / training budgets; stage F re-runs the same
 model/revision only); the per-stage durations are printed at the end.
+
+``--d-control token_language --d-main-run DIR`` turns stage D into the control run of the
+injection-site language (PREREGISTRATION section 6, amendment 11;
+:mod:`lsne.experiments.stage_d_control`): stage D alone, with the main stage-D run's directions,
+doses and depth bank, written to ``<out>/D/<model>@<rev>`` under its own root (``runs_ctl``).  The
+run is refused before the model is loaded when that directory is the main run's or holds a stage-D
+run other than this control; a refused control run writes nothing, and the error manifest of a
+failed one carries the control marks, so a restart resumes it.
 
 ``merge`` concatenates all same-named csv files below ``--root`` (any depth, including
 the stage-F sub-run directories of all shards) into ``<out>/<name>.csv`` with the
@@ -43,6 +53,7 @@ from .io import RunDir, read_manifest
 from .model import load_model
 from .experiments import STAGES, STAGE_ORDER, STAGE_TITLES
 from .experiments import common as C
+from .experiments import stage_d_control as SDC
 from .experiments.stage_f_scale import parse_pairs
 
 
@@ -90,6 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="stage L: rotated_self (default) | self | model@revision (HF causal LM, e.g. EleutherAI/pythia-70m@step143000)")
     r.add_argument("--atlas-dir", default=None, help="stage I: directory with the stored atlas extraction (default data/atlas)")
     r.add_argument("--worst-head", default=None, help="stage I: frozen worst head 'L:H' from a development run (pre-registration 14)")
+    r.add_argument("--d-control", default=None, choices=SDC.CONTROLS,
+                   help="stage D alone as a control run of the main stage-D run (token_language: PREREGISTRATION 6.11); "
+                        "needs --d-main-run and its own --out root, e.g. <LSNE>/runs_ctl")
+    r.add_argument("--d-main-run", default=None,
+                   help="with --d-control: directory of the main stage-D run (<root>/D/<model>@<revision>)")
     r.add_argument("--no-progress", action="store_true")
 
     m = sub.add_parser("merge", help="merge csv tables of several run directories")
@@ -170,10 +186,15 @@ def run_stages(cfg: RunConfig, limits: C.Limits, stages: Sequence[str], mb=None,
             for name, err in sub["substage_errors"].items():
                 print(f"[lsne]   substage {st}/{name} FAILED: {err}", file=sys.stderr, flush=True)
         except Exception as e:  # noqa: BLE001 - keep the other stages running
-            C.write_error(rd, st, e, cfg, mb)
+            refused = isinstance(e, SDC.ControlRunError)
+            if not refused:         # a refused control run wrote nothing; its directory may hold a main run
+                C.write_error(rd, st, e, cfg, mb)
+                if st == "D" and kw.get("d_control"):
+                    SDC.mark_error_manifest(rd, kw["d_control"])
             report[st] = dict(status="error", run_dir=str(rd.path), seconds=time.perf_counter() - t0, tables=[],
                               error=repr(e))
-            print(f"[lsne] stage {st} FAILED: {e!r} (see {rd.file('error.txt')})", file=sys.stderr, flush=True)
+            where = "" if refused else f" (see {rd.file('error.txt')})"
+            print(f"[lsne] stage {st} {'REFUSED' if refused else 'FAILED'}: {e!r}{where}", file=sys.stderr, flush=True)
     print(duration_summary(report), flush=True)
     return report
 
@@ -189,19 +210,41 @@ def duration_summary(report: dict[str, dict]) -> str:
     return "\n".join(lines)
 
 
+def check_d_control(cfg: RunConfig, stages: Sequence[str], control: Optional[str], main_run: Optional[str]) -> None:
+    """``--d-control`` / ``--d-main-run``: both or neither, stage D alone, a run directory
+    ``<out>/D/<model>@<rev>`` that is neither the main run's nor one holding another stage-D run, and
+    an ok main stage-D run of the same model with its depth bank (the guards of
+    :mod:`lsne.experiments.stage_d_control`); SystemExit before the model is loaded."""
+    if not (control and main_run):
+        raise SystemExit("[lsne] --d-control and --d-main-run go together: a stage-D control run needs the "
+                         "directory of the main stage-D run")
+    if list(stages) != ["D"]:
+        raise SystemExit(f"[lsne] --d-control runs stage D alone (--stage D), got --stage {','.join(stages)}")
+    try:
+        SDC.check_control(control)
+        SDC.check_run_dir(RunDir(cfg.out_root, "D", cfg.model, mkdir=False).path, main_run)
+        SDC.main_run_inputs(cfg, main_run)
+    except SDC.ControlRunError as e:
+        raise SystemExit(f"[lsne] control run refused: {e}") from e
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     cfg, limits = make_config(args)
     stages = parse_stages(args.stage)
+    if args.d_control or args.d_main_run:
+        check_d_control(cfg, stages, args.d_control, args.d_main_run)
     kw = dict(axis_npz=args.axis_npz, shard_index=int(args.shard_index), shard_count=int(args.shard_count),
               ttt_corpus=args.ttt_corpus, transplant_source=args.transplant_source, atlas_dir=args.atlas_dir, worst_head=args.worst_head,
-              ttt_checkpoints=([s.strip() for s in args.ttt_checkpoints.split(",") if s.strip()] if args.ttt_checkpoints else None))
+              ttt_checkpoints=([s.strip() for s in args.ttt_checkpoints.split(",") if s.strip()] if args.ttt_checkpoints else None),
+              d_control=args.d_control, d_main_run=args.d_main_run)
     if args.pairs:
         kw["pairs"] = parse_pairs(args.pairs, cfg)
     elif args.smoke:
         kw["pairs"] = [(cfg.model.name, cfg.model.revision)]
     kw["f_stages"] = list(limits.f_stages)
     print(f"[lsne] model {cfg.model.tag()} device={cfg.model.device} stages={''.join(stages)} out={cfg.out_root}"
-          f"{' SMOKE' if limits.is_smoke else ''}", flush=True)
+          f"{' SMOKE' if limits.is_smoke else ''}"
+          f"{f' CONTROL {args.d_control} of {args.d_main_run}' if args.d_control else ''}", flush=True)
     report = run_stages(cfg, limits, stages, **kw)
     summary_path = Path(cfg.out_root) / f"run_report_{cfg.model.tag().replace(':', '_').replace('@', '_')}.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
