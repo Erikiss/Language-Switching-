@@ -5,11 +5,12 @@ taken from the stage code) check the primary statistic (C1 restriction, K=0 refe
 rand DiD, monotonicity, the D1 audit), the token-language control of PREREGISTRATION 6.11
 (three worlds of the control run, its audits down to the (direction, dose) pairs inside the
 cells, the same audits for notebook 14 (``control_audits_for``), its key ``D_ctl``, the choice
-of a valid one among several control runs, and its gate on P), the family-mean cluster
-bootstrap, the test split (F01-F12 x {A, B}), the constant-series rule of contrast 10 (ii), the
-BH grouping over the secondary group, the G0 gate, the selection of runs under several roots
-(two accounts, a parent folder, superseded and failed runs), the handling of missing stages and
-tables, the version of the evaluation code in its outputs and the archive of an earlier report.
+of a valid one among several control runs, also when a candidate's audits or the choice itself
+raise, and its gate on P), the family-mean cluster bootstrap, the test split (F01-F12 x {A, B}),
+the constant-series rule of contrast 10 (ii), the BH grouping over the secondary group, the G0
+gate, the selection of runs under several roots (two accounts, a parent folder, superseded and
+failed runs), the handling of missing stages and tables, the version of the evaluation code in
+its outputs and the archive of an earlier report.
 Everything runs on CPU without a model.
 """
 from __future__ import annotations
@@ -1001,6 +1002,67 @@ def test_narrowed_smoke_or_failed_control_runs_never_displace_a_valid_whole_desi
     runs = res["runs"].set_index("path")
     assert runs.loc[p["B"], "used"] and "none of the 2 ok control runs passes all four audits" in runs.loc[p["B"], "note"]
     assert runs.loc[p["D"], "note"] == f"superseded by a full run {p['B']}; fails audit.D1ctl.run not_supported"
+
+
+def _decimal_comma(ctl: pd.DataFrame) -> pd.DataFrame:
+    """``damage_ctl`` whose eps in one row at the pre-registered site (u9, C1) is written with a decimal comma ("0,05", as
+    a spreadsheet in a German locale writes it): the column is read back as text, and control_audits raises."""
+    x = ctl.astype({"eps": object})
+    x.loc[x.index[((x["inject"] == "u9") & (x["C"] == "C1")).to_numpy()][0], "eps"] = "0,05"
+    return x
+
+
+@pytest.mark.parametrize("case", ["next_to_a_valid_run", "alone", "choice_fails"])
+def test_a_control_run_whose_audits_raise_and_a_failed_choice(tmp_path, monkeypatch, case):
+    """The exception paths of the choice among control runs, with a newer control run whose audits cannot be computed (a
+    damage_ctl column of the wrong type).  Next to an older valid run, the choice goes past it: the valid run is used and
+    the corrupt run's note says "audits not computable".  Alone (one candidate, nothing to choose), its audits raise in
+    token_control_rows: the guard leaves the single not_tested row P.ctl (evaluation error), no audit row, and P@0.05 is at
+    most open.  When select_control_run itself raises, the meta notes say that the choice failed and select_runs' choice
+    (the newer, corrupt run, not the valid one) is evaluated, as alone."""
+    a, b = tmp_path / "LSNE", tmp_path / "LSNE_B"
+    dmg = damage_table()
+    write_run(a / "runs", "D", {"damage": dmg})
+    ctl = damage_ctl_table(dmg)
+    if case != "alone":
+        write_ctl_run(a / "runs_ctl", ctl)                                                # older, valid
+    write_ctl_run(b / "runs_ctl", _decimal_comma(ctl), timestamp=CTL_LATER)               # newer, its audits raise
+    pa, pb = _ctl_path(a), _ctl_path(b)
+    with pytest.raises(ValueError, match="could not convert string to float: '0,05'"):
+        PE.control_audits_for(a / "runs" / "D" / TAG, pb)
+    if case == "choice_fails":
+        def failing_choice(ctx, runs):
+            raise RuntimeError("no choice")
+
+        monkeypatch.setattr(PE, "select_control_run", failing_choice)
+    res = PE.evaluate([a, b], n_boot=200, seed=1)
+    runs, df = res["runs"].set_index("path"), res["results"].set_index("id")
+    p = df.loc["P@0.05"]
+    failed = [n for n in res["meta"]["notes"] if n.startswith("choice among the control runs failed")]
+    if case == "next_to_a_valid_run":
+        assert runs.loc[pa, "used"] and not runs.loc[pb, "used"] and failed == []
+        assert runs.loc[pb, "note"].startswith("newer control run not used: fails audits not computable (ValueError: could not "
+                                               f"convert string to float: '0,05') (PREREGISTRATION 6.11); the evaluation uses {pa}")
+        assert runs.loc[pa, "note"].startswith("used instead of the control run(s) preferred by select_runs that fail their "
+                                               f"audits: {pb} (audits not computable (ValueError: ")
+        assert (df.loc[list(PE.CTL_AUDIT_IDS), "verdict"] == "supported").all()
+        assert df.loc["P.ctl@0.05", "verdict"] == "supported" and p["verdict"] == "supported"
+        return
+    # select_runs' choice, the corrupt run, is evaluated: its audits raise, and the guard of token_control_rows leaves one row
+    assert runs.loc[pb, "used"] and (case == "alone" or not runs.loc[pa, "used"])
+    rows = df[df.index.str.startswith(("P.ctl", "audit.D1ctl"))]
+    assert list(rows.index) == ["P.ctl"] and (rows.loc["P.ctl", "verdict"], rows.loc["P.ctl", "role"]) == ("not_tested",
+                                                                                                         "primary_control")
+    assert rows.loc["P.ctl", "deviation_note"].startswith("evaluation error: ValueError: could not convert string to float: "
+                                                          "'0,05'")
+    assert p["verdict"] == "open"
+    assert ("token-language control (PREREGISTRATION 6.11): no valid control run; rule outcome without the control: supported"
+            in p["deviation_note"])
+    if case == "choice_fails":
+        assert failed == ["choice among the control runs failed (RuntimeError: no choice): select_runs' choice is used"]
+        assert runs.loc[pa, "note"] == f"superseded by the newer run {pb}"
+    else:
+        assert failed == [] and runs.loc[pb, "note"] == ""
 
 
 def test_control_audits_for_reads_two_run_directories_as_the_evaluation(tmp_path):

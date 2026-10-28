@@ -9,7 +9,7 @@ CPU, pythia-14m, family F01).
 * the guards refuse before anything is written, and never touch the main run; other torch /
   transformers versions than the main run's are refused unless allowed, and then recorded;
 * a restart resumes only checkpoints of the same platform (torch, transformers, attention
-  implementation) and code version;
+  implementation) and commit (git sha; uncommitted edits and a non-git install are not detected);
 * the manifest carries the fields the evaluation (``lsne.prereg_eval``, key ``D_ctl``) reads, and
   the SHA-256 of the evaluation code;
 * stage D's own injections are unchanged.
@@ -450,7 +450,7 @@ def test_resume_only_from_the_same_platform_and_code(mb, depth_bank, tmp_path, m
     interrupted(sdpa)                                            # started with another attention kernel
     assert restart(mb)["resumed_checkpoints"] == 0
     interrupted(mb)
-    with monkeypatch.context() as mp:                            # another code version
+    with monkeypatch.context() as mp:                            # another commit (git sha)
         mp.setattr(SDC, "git_sha", lambda *a, **k: "f" * 40)
         assert restart(mb)["resumed_checkpoints"] == 0
 

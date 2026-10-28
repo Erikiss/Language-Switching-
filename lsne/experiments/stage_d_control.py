@@ -71,8 +71,10 @@ is written; the CLI does not create the run directory of a control run (the run 
 it writes), removes it if a refusal leaves it empty (:func:`remove_empty_run_dir`), and records
 the refusal in its run report in ``--out``.  Its checkpoints (``_resume``) stay in its own
 directory; their signature holds the run's inputs, its platform (:func:`run_platform`: torch,
-CUDA, device, GPU, transformers, attention implementation) and the git sha of the code, so a
-restart on another platform or code version starts over instead of mixing chunks of both.
+CUDA, device, GPU, transformers, attention implementation) and the commit of the code (git sha,
+:func:`lsne.io.git_sha`, ``"unknown"`` outside a git checkout; uncommitted edits and a non-git
+install are not detected), so a restart on another platform or commit starts over instead of
+mixing chunks of both.
 
 Provenance in the manifest: ``replication_platform`` (:func:`platform_info`), ``platform_mismatch``
 (:func:`check_platform`, [] when none) and ``eval_code_sha256``, the SHA-256 of
@@ -560,9 +562,10 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     :class:`ControlRunError` before anything is written.  Resumable like stage D in
     ``<run_dir>/_resume`` (chunks of :data:`~lsne.experiments.common.RESUME_CHUNK` variants;
     ``kw['resume']=False`` disables it); the signature holds the run's inputs, its platform
-    (:func:`run_platform`) and the git sha of the code (:func:`lsne.io.git_sha`), so the
-    checkpoints of a run on another platform or code version are discarded
-    (:class:`~lsne.experiments.common.Resume`), never mixed with this run's chunks."""
+    (:func:`run_platform`) and the commit of the code (the git sha of the package checkout,
+    :func:`lsne.io.git_sha`, ``"unknown"`` outside a git checkout: uncommitted edits and a non-git
+    install are not detected), so the checkpoints of a run on another platform or commit are
+    discarded (:class:`~lsne.experiments.common.Resume`), never mixed with this run's chunks."""
     t0 = time.perf_counter()
     control = check_control(kw.get("d_control"))
     main_dir = kw.get("d_main_run")
@@ -583,7 +586,7 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     sig = C.resume_signature(stage="D_ctl", version=RESUME_VERSION, tags=[v.tag for v in variants],
                              model=mb.spec.tag(), dtype=mb.spec.dtype, depth_site=dsite.key, bank=main["bank_sha256"],
                              lattice_dirs=lattice_dirs, doses=doses, batch_size=batch, sites=SITE_RULES,
-                             chunk=chunk, platform=run_platform(mb), git_sha=git_sha(PACKAGE_ROOT) or "")
+                             chunk=chunk, platform=run_platform(mb), git_sha=git_sha(PACKAGE_ROOT))
     res = C.Resume(run_dir, sig, enabled=bool(kw.get("resume", True)))
     damage, profile = res.chunked("damage_ctl", variants, lambda vs: control_damage_tables(
         mb, vs, dbank, lattice_dirs, doses, enabled=limits.progress, batch_size=batch), chunk=chunk)

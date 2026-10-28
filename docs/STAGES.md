@@ -368,7 +368,7 @@ and the evaluation compares it with its own `prereg_eval_sha256`). Resume: its o
 control run directory with its own signature (stage `"D_ctl"`, version, variant tags, model, dtype,
 depth site, bank sha256, directions, doses, batch size, site rules, chunk size, the platform of
 `run_platform` — torch, CUDA build, device type, GPU, transformers, attention implementation — and the
-git sha of the code): checkpoints of another platform or code version are discarded and the run starts
+git sha of the commit): checkpoints of another platform or commit are discarded and the run starts
 over instead of mixing chunks; the main run's `_resume` is never shared or wiped. Size of the
 full run: 24 formulations × 11 variants = 264 variants, 360 (variant, site) pairs × 204 (direction,
 dose) pairs = 73 440 rows of `damage_ctl`, ≈ 1 440 batched forwards of 64 rows, about a sixth of D1 in
@@ -402,7 +402,10 @@ configuration and helpers:
    `--families F01A --limit-variants 2` (smoke: `--limit-variants 2`) into a fresh local temp root
    (`tempfile`, never on Drive or below `OUT_ROOT`, removed afterwards); λ at `u9` / C1 (K 0 and 8)
    must equal the main run's `depth` rows exactly (same `inject_pos`; a NaN counts as unequal), else it
-   stops; a failed CLI call always stops.
+   stops; a failed CLI call always stops. Its result is also written next to its log
+   (`runs_ctl/logs/<notebook>_<model>_<revision>_preflight.json`, also when it is not bit-identical and
+   the cell stops; a failed CLI call writes none, its cause is in the log), because the summary
+   json has a fixed name and a later execution that only checks the finished run overwrites it.
 4. *2b* the control run (log under `runs_ctl/logs/`, as the pre-flight's); stops when it fails or is
    refused.
 5. *3* rows per site / K / C and max |Δλ| per dose at `u9` / C1 (descriptive), then the four validity
@@ -415,10 +418,16 @@ configuration and helpers:
 `ALLOW_PLATFORM_MISMATCH = True` turns the platform, determinism and pre-flight stops into warnings and
 passes `--d-allow-platform-mismatch` to the pre-flight and the run. `SMOKE = True` is self-contained:
 cell 1a builds its own smoke main run of stage D (pythia-14m, F01A, `--smoke`) by the command line below
-`<OUT_ROOT>/smoke_14/runs` (an ok one with F01A rows and this runtime's torch and transformers is
-reused), the control root is `<OUT_ROOT>/smoke_14/runs_ctl` (notebook 13's default roots never see it),
-platform and determinism are only reported, and `audit.D1ctl.site` / `.run` fail by design. The
-verdicts are made by `lsne.prereg_eval` (notebook 13).
+`<OUT_ROOT>/smoke_14/runs` and then records its device in `<OUT_ROOT>/smoke_14/smoke_main_device.txt`
+(the GPU name, else `cpu/<CPU capability>`); an ok one with F01A rows and this runtime's torch and
+transformers is reused only with `REUSE = True` and only on that device, any other is removed and
+rebuilt, and the output names the reason (e.g. "anderes Gerät", "REUSE = False"), so a smoke main run
+computed on a CPU runtime is never the reference of the pre-flight on the A100. The control root is
+`<OUT_ROOT>/smoke_14/runs_ctl` (notebook 13's default roots never see it), platform and determinism are
+only reported, a pre-flight that is not bit-identical names the smoke test's cause and remedy (a smoke
+main run of another machine with the same device name: `REUSE = False` or delete
+`<OUT_ROOT>/smoke_14/runs`) instead of an A100 with the main run's versions, and `audit.D1ctl.site` /
+`.run` fail by design. The verdicts are made by `lsne.prereg_eval` (notebook 13).
 
 ---
 
@@ -499,8 +508,10 @@ The files of an earlier evaluation in `--out` are first moved to `archive/<stamp
 stamp = the UTC timestamp of its `prereg_meta.json`, e.g. `2026-10-28T07-07-48Z` for the report of
 28.10.2026 07:07 UTC cited in `docs/RESULTS_PREREG.md`, else the newest mtime of its files; an existing
 folder is never reused: `<stamp>_2`, `<stamp>_3`, …), never overwritten. Notebook 13 prints, after the
-evaluation, one `ACHTUNG` line per control-run audit that fails, the choice among several control runs,
-the code version and the archive folder.
+evaluation, one `ACHTUNG` line per control-run audit that fails (or, when a control run is used but has
+no audit rows because its audits could not be computed, one `ACHTUNG` line saying that it is not
+evaluable, see row `P.ctl`; its summary then has `control_valid: false`), the choice among several
+control runs, the code version and the archive folder.
 
 ---
 

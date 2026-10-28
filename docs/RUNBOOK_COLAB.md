@@ -454,7 +454,10 @@ Notebook 05 wird also nicht gestört.
 5. **Prüfen.** Die Zelle nach der Auswertung druckt
    - je nicht bestandenem Audit des Kontrolllaufs eine Zeile `ACHTUNG: Kontrolllauf ungültig – <Audit>:
      <Urteil>; <Notiz>` (dann ist P höchstens „offen“) oder `Kontrolllauf gültig: alle vier Audits
-     bestanden`,
+     bestanden`; ließen sich die Audits des verwendeten Kontrolllaufs gar nicht berechnen (keine Zeilen
+     `audit.D1ctl…`, der Fehler steht in der Zeile `P.ctl`), stattdessen `ACHTUNG: Kontrolllauf nicht
+     auswertbar (keine Audit-Zeilen; siehe Zeile P.ctl): der Primärendpunkt ist höchstens „offen“.`, und die
+     Zusammenfassung führt `control_valid: false`,
    - bei mehreren Kontrollläufen `Mehrere Kontrollläufe gefunden (n); verwendet: …` mit der Begründung,
    - `Code der Auswertung: Git <Kurz-SHA>, lsne/prereg_eval.py SHA-256 <erste 12 Zeichen>` und, wenn ein
      Kontrolllauf verwendet wird, ob er mit demselben Code der Auswertung gerechnet wurde
@@ -584,8 +587,13 @@ präregistrierten Stelle (Ende von Einheit 9, K = 0 und C1) muss er den Hauptlau
    ungültiger Lauf zählt in Notebook 13 nicht, und P bleibt höchstens „offen“.
 7. **Zusammenfassung und Drive leeren.** `MyDrive/LSNE/summary_14_token_control_pythia-160m_step98000_float32.json`
    (Plattformvergleich, Reproduzierbarkeit, Vorabprüfung, Lauf, Audits, `control_valid`, SHA-256 der Bank,
-   Code der Auswertung); die letzte Zelle schreibt alle gepufferten Dateien nach Drive und trennt Drive
-   (`drive.flush_and_unmount()`). Danach in dieser Sitzung nichts mehr auf Drive schreiben.
+   Code der Auswertung). Sie trägt einen festen Namen, und ein späterer Durchlauf, der den fertigen Lauf nur
+   prüft, überschreibt sie (die Vorabprüfung steht dann auf „nicht nötig (nur geprüft)“); das Ergebnis der
+   Vorabprüfung schreibt Zelle 2a deshalb auch neben ihr Log:
+   `runs_ctl/logs/14_token_control_pythia-160m_step98000_preflight.json`, auch wenn sie nicht bitgleich ist und
+   die Zelle deshalb anhält (scheitert der Aufruf selbst, steht die Ursache nur im Log). Die letzte
+   Zelle schreibt alle gepufferten Dateien nach Drive und trennt Drive (`drive.flush_and_unmount()`). Danach
+   in dieser Sitzung nichts mehr auf Drive schreiben.
 8. **Danach Notebook 13 in einer neuen Sitzung** (CPU-Laufzeit genügt, Abschnitt 11), sobald der
    Kontrolllauf in Google Drive sichtbar ist (`MyDrive/LSNE/runs_ctl/D/pythia-160m@step98000/manifest.json`).
    Erst dort fallen die Urteile: je Dosis `P.ctl` mit „Wechsel“, „lokal“ oder „offen“, die Audits
@@ -643,8 +651,12 @@ fertigen Kontrolllauf neu und überschreibt ihn; einen gültigen deshalb nicht o
 
 **Rauchtest.** `SMOKE = True` ist eigenständig und braucht kein Notebook 03: Zelle 1a baut mit der
 Kommandozeile einen eigenen Rauch-Hauptlauf von Stufe D (`pythia-14m`, F01A, `--smoke`) unter
-`<OUT_ROOT>/smoke_14/runs`; einen fertigen mit Zeilen von F01A und derselben Torch- und
-transformers-Version nimmt sie wieder, einen anderen ersetzt sie. Danach laufen die Prüfungen (Plattform
+`<OUT_ROOT>/smoke_14/runs` und vermerkt danach das Gerät in `<OUT_ROOT>/smoke_14/smoke_main_device.txt`
+(Name der GPU, sonst `cpu/<CPU-Fähigkeit>`). Einen fertigen mit Zeilen von F01A und derselben Torch- und
+transformers-Version nimmt sie nur mit `REUSE = True` wieder und nur, wenn er auf diesem Gerät gerechnet
+wurde; sonst entfernt sie ihn und baut ihn neu, und die Ausgabe nennt den Grund (etwa „anderes Gerät“
+oder „REUSE = False“). Ein auf einer CPU-Laufzeit gerechneter Rauch-Hauptlauf wird auf der A100 also nicht
+wiederverwendet (die Vorabprüfung würde an ihm scheitern). Danach laufen die Prüfungen (Plattform
 und Reproduzierbarkeit werden nur berichtet), die Vorabprüfung (mit `--limit-variants 2`), der Kontrolllauf
 unter `<OUT_ROOT>/smoke_14/runs_ctl` und die Audits; `audit.D1ctl.site` und `audit.D1ctl.run` scheitern dort
 absichtlich (wenige Varianten, Rauchlauf). Auf der CPU dauert das wenige Minuten. `MyDrive/LSNE/runs` und
@@ -675,7 +687,7 @@ scheitert dann sehr wahrscheinlich.
 | `In …/runs_ctl/D/… liegt ein anderer Lauf als dieser Kontrolllauf` | Dort liegt ein Lauf ohne `control = token_language` (etwa ein kopierter Hauptlauf): Er wird nie überschrieben. Den Ordner prüfen und umbenennen. |
 | `Diese Laufzeit weicht vom Hauptlauf ab: GPU … statt A100 …` / `Torch … statt 2.11.0+cu130` / `transformers … statt 5.20.2` (Zelle 1b) | Keine A100 (auch: keine GPU) oder andere Versionen als im Hauptlauf; der Kontrolllauf wäre fast sicher ungültig. Laufzeit → Laufzeittyp ändern → A100; die Versionen mit den pip-Befehlen aus der Meldung installieren (Ablauf, Schritt 3); Laufzeit → Sitzung neu starten; alle Zellen erneut ausführen. `ALLOW_PLATFORM_MISMATCH = True` nur bewusst. |
 | `Der Hauptlauf war auf seiner GPU bei gleicher Form nicht bitgleich reproduzierbar …` (Zelle 1b) | `logp_target_ref` der ungestörten Referenzzeile weicht zwischen Forwards gleicher Größe derselben Variante ab: Schon der Hauptlauf rechnete nicht bitgleich, also kann kein neuer Lauf Bedingung (b) erfüllen. Den Kontrolllauf **nicht** rechnen, auch nicht mit `ALLOW_PLATFORM_MISMATCH = True`: Vor jedem Kontrolllauf ist ein datierter Nachtrag zu 6.11 (b) in `docs/PREREGISTRATION.md` §6 nötig. |
-| `Die Vorabprüfung reproduziert den Hauptlauf nicht bitgleich …` (Zelle 2a) | Diese Laufzeit rechnet den Hauptlauf nicht Bit für Bit nach, obwohl GPU-Typ und Versionen passen (etwa eine A100 mit anderem Speicher, Treiber- oder Bibliotheksstand); der ganze Lauf würde Bedingung (b) sehr wahrscheinlich verfehlen. Eine andere A100-Laufzeit mit den Versionen des Hauptlaufs nehmen (pip-Befehle aus der Meldung), neu starten, alle Zellen erneut ausführen. |
+| `Die Vorabprüfung reproduziert den Hauptlauf nicht bitgleich …` (Zelle 2a) | Diese Laufzeit rechnet den Hauptlauf nicht Bit für Bit nach, obwohl GPU-Typ und Versionen passen (etwa eine A100 mit anderem Speicher, Treiber- oder Bibliotheksstand); der ganze Lauf würde Bedingung (b) sehr wahrscheinlich verfehlen. Eine andere A100-Laufzeit mit den Versionen des Hauptlaufs nehmen (pip-Befehle aus der Meldung), neu starten, alle Zellen erneut ausführen. Im Rauchtest (`SMOKE = True`, Meldung mit „Rauchtest: …“) stammt der Rauch-Hauptlauf am wahrscheinlichsten von einem anderen Gerät, etwa einer anderen Maschine mit derselben Gerätebezeichnung (`smoke_main_device.txt`); dort helfen weder A100 noch pip: `REUSE = False` setzen oder `<OUT_ROOT>/smoke_14/runs` löschen und alle Zellen erneut ausführen, Zelle 1a baut ihn dann auf dieser Laufzeit neu. |
 | `Kontrolllauf fehlgeschlagen oder verweigert (exit 1, …)` / `Die Vorabprüfung ist fehlgeschlagen oder wurde verweigert (…)` | Ursache im Log unter `runs_ctl/logs/` (`control run refused: …`, `REFUSED`, `FAILED`, z. B. `CUDA out of memory`); nach der Korrektur die Zelle erneut ausführen, ein abgebrochener Lauf setzt fort (gleiche Plattform und gleicher Code-Stand). |
 | `ACHTUNG, Kontrolllauf ungültig: audit.D1ctl.rep …` (Abschnitt 3) / Notebook 13: `ACHTUNG: Kontrolllauf ungültig – audit.D1ctl.rep: nicht bestanden …` (`\|difference\| > 1e-3 or not finite`) | λ an der präregistrierten Stelle weicht um mehr als 1e-3 vom Hauptlauf ab, fast immer wegen einer anderen Plattform (`replication_platform`, `platform_mismatch` im Manifest). Der Kontrolllauf ist ungültig, und P bleibt höchstens „offen“. Abhilfe: auf einer A100 mit Torch `2.11.0+cu130` und transformers `5.20.2` wiederholen (die pip-Befehle, die das Notebook druckt), Sitzung neu starten, `REUSE = False` setzen (sonst wird der fertige Lauf nur erneut geprüft) und alle Zellen ausführen. Der neue Lauf ersetzt den alten im selben Ordner; liegen mehrere fertige Kontrollläufe vor (etwa einer unter `LSNE_B/runs_ctl`), nimmt Notebook 13 den ersten gültigen in der Reihenfolge aus Abschnitt 11, bei vollen Läufen des ganzen Designs also den neuesten gültigen. |
 | Notebook 13: `audit.D1ctl.rep` „… without a control row“, `audit.D1ctl.site` „cells of the design missing“ oder „(tag, site) of the design without exactly the … (direction, eps) pairs“ | Der Kontrolllauf deckt nicht alle Zeilen von P, nicht alle Zellen oder nicht alle Paare aus Richtung und Dosis ab, meist weil er mit `--families`, `--limit-*` oder eingeschränkten K-/C-Stufen gerechnet wurde (`design_filters` im Manifest). Ohne diese Optionen neu rechnen; ein Lauf des ganzen Designs wird ohnehin vor einem eingeschränkten verwendet. |

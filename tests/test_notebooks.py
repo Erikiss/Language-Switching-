@@ -20,12 +20,14 @@ the Xatu fixture is marked ``slow``.  The committed notebooks must also be byte-
 to the generator output.
 
 Notebook 13 (``13_prereg_evaluation``, CPU runtime without accelerator metadata) has its own
-tests: the skeleton (header, the ``LSNE_B`` shortcut note, the run roots asked for in the
-configuration cell, the evaluation through ``lsne.prereg_eval``), the CLI equivalent (only
-options of ``python -m lsne.prereg_eval``), a headless execution on a tiny synthetic run root
-(no model, so it is not marked ``slow``; skipped without a Jupyter kernel) and its cells in
-this process on synthetic control runs (one ``ACHTUNG`` line per failing audit, the choice
-among several control runs, the code version, the archive of the previous report).
+tests: the skeleton (header, the ``LSNE_B`` shortcut note, the run roots of the configuration
+cell: the defaults or ``RUN_ROOTS_TEXT``, a prompt only with ``ASK = True``, the evaluation
+through ``lsne.prereg_eval``), the CLI equivalent (only options of ``python -m
+lsne.prereg_eval``), a headless execution on a tiny synthetic run root (no model, so it is not
+marked ``slow``; skipped without a Jupyter kernel) and its cells in this process on synthetic
+control runs (one ``ACHTUNG`` line per failing audit, a used control run without audit rows
+reported as not evaluable, the choice among several control runs, the code version, the
+archive of the previous report).
 
 Notebook 14 (``14_token_control``, the A100 control run of the injection-site language,
 PREREGISTRATION 6.11) has its own tests: the skeleton and defaults (main run of account A,
@@ -34,12 +36,14 @@ the ``LSNE_B`` shortcut only when it is missing, the own root ``runs_ctl``, ``RE
 run``), its cells executed in this process on synthetic runs with the CLI stubbed (the stops
 with a German message: main run missing, not ok, without its bank or damage table, a foreign
 run in the control directory, another GPU / torch / transformers, a main run that was not
-reproducible for identical shapes, a pre-flight that is not bit-identical; the self-contained
-smoke mode; REUSE of a finished run, never of a narrowed one; section 3 printing exactly the
-audits of ``lsne.prereg_eval.control_audits_for``; the summary; nothing is written below
-``RUNS_ROOT``) and, marked ``slow``, a headless execution in smoke mode that builds its own
-smoke main run, runs the pre-flight and the control through the CLI, a second execution that
-only reuses it, and notebook 13 on the smoke roots.
+reproducible for identical shapes (also at the real geometry: 34 directions x 6 doses, batch
+64), a pre-flight that is not bit-identical, whose result is kept next to its log; the
+self-contained smoke mode, whose smoke main run is reused only with REUSE on the device that
+built it; REUSE of a finished run, never of a narrowed one outside the smoke test; section 3
+printing exactly the audits of ``lsne.prereg_eval.control_audits_for``; the summary; nothing is
+written below ``RUNS_ROOT``) and, marked ``slow``, a headless execution in smoke mode that
+builds its own smoke main run, runs the pre-flight and the control through the CLI, a second
+execution that only reuses it, and notebook 13 on the smoke roots.
 
 ``test_notebook_runs_headless_in_smoke_mode`` (marked ``slow``) executes notebooks 00 and
 06 with ``SMOKE = True`` (pythia-14m, DEV01) through nbclient inside this checkout: every
@@ -702,7 +706,9 @@ def test_prereg_notebook_reports_control_validity_and_archive(regenerated, tmp_p
     built as for notebook 14's tests; the roots given explicitly): one line "ACHTUNG: Kontrolllauf ungültig – <audit>"
     per failing audit of the control run, the choice among several control runs (meta notes), the code version
     (git_sha, prereg_eval_sha256, the control run's eval_code_sha256) and, on a second run, the archive folder of the
-    previous report; the summary carries git_sha, prereg_eval_sha256, archive and control_valid."""
+    previous report; the summary carries git_sha, prereg_eval_sha256, archive and control_valid.  A used control run
+    whose audits cannot be computed (no audit row; the evaluation error in the row P.ctl) gets the line "ACHTUNG:
+    Kontrolllauf nicht auswertbar …", and control_valid is False."""
     import os
 
     from lsne import prereg_eval as PE
@@ -758,6 +764,26 @@ def test_prereg_notebook_reports_control_validity_and_archive(regenerated, tmp_p
                                                       "prereg_runs.csv"]
     assert s["archive"] == str(arch) and s["control_valid"] is True and s["runs_used"]["D_ctl"] == str(good_dir)
     assert json.loads((eval_out / "prereg_meta.json").read_text(encoding="utf-8"))["previous_evaluation_archive"] == str(arch)
+
+    # 3. a control run whose audits cannot be computed (one eps written with a decimal comma), used alone: no audit row, the
+    # evaluation error stands in the row P.ctl; the cell says so in one ACHTUNG line, and control_valid is False
+    broken = _fake_control_tables().astype({"eps": object})
+    assert (broken.loc[0, "inject"], broken.loc[0, "C"]) == ("u9", "C1")             # a row the replication audit reads
+    broken.loc[0, "eps"] = "0,01"
+    broken_dir = _write_ctl_run(tmp_path / "C" / "runs_ctl" / "D" / CTL_TAG, main, broken,
+                                timestamp="2026-10-28T14:00:00+00:00")
+    ns, text, s = run(a / "runs", tmp_path / "C" / "runs_ctl")
+    assert "übersprungen" not in text, text
+    assert ("ACHTUNG: Kontrolllauf nicht auswertbar (keine Audit-Zeilen; siehe Zeile P.ctl): der Primärendpunkt ist "
+            "höchstens „offen“.") in text.splitlines()
+    for phrase in ("ACHTUNG: Kontrolllauf ungültig", "Kontrolllauf gültig", "Ohne gültigen Kontrolllauf", "Mehrere Kontrollläufe"):
+        assert phrase not in text, phrase
+    tab = ns["res"]["results"].set_index("id")
+    assert not tab.index.isin(PE.CTL_AUDIT_IDS).any()
+    assert tab.loc["P.ctl", "deviation_note"].startswith("evaluation error: ValueError: could not convert string to float")
+    assert ns["CONTROL_VALID"] is False and s["control_valid"] is False and s["control_audits"] == []
+    assert s["runs_used"]["D_ctl"] == str(broken_dir) and [(r["id"], r["verdict"]) for r in s["primary_control"]] == \
+        [("P.ctl", "not_tested")]
 
 
 # --------------------------------------------------------------------------------------
@@ -1116,8 +1142,9 @@ def test_token_control_notebook_stops_before_the_run(regenerated, tmp_path, monk
 def test_token_control_notebook_smoke_mode_is_self_contained(regenerated, tmp_path, monkeypatch, capsys):
     """SMOKE = True: the main run is the notebook's own smoke run below OUT_ROOT/smoke_14 (MAIN_D_RUN ignored), the control
     root is OUT_ROOT/smoke_14/runs_ctl, the smoke main run is built by ``python -m lsne.cli run --stage D --smoke --families
-    F01A`` (reused when an ok one with F01A rows of this runtime's versions exists); a main run that is not reproducible
-    and another platform are only reported; notebook 13's default roots never see smoke_14."""
+    F01A`` (reused when an ok one with F01A rows of this runtime's versions was built on this device; the reuse rule in
+    detail: test_token_control_notebook_smoke_main_reuse_rule); a main run that is not reproducible and another platform
+    are only reported; notebook 13's default roots never see smoke_14."""
     import os
 
     nb = _ctl_nb(regenerated)
@@ -1176,6 +1203,98 @@ def test_token_control_notebook_smoke_mode_is_self_contained(regenerated, tmp_pa
     assert all("smoke_14" not in str(r) for r in roots)
 
 
+def test_token_control_notebook_smoke_main_reuse_rule(regenerated, tmp_path, monkeypatch, capsys):
+    """SMOKE = True, CLI stubbed: after building the smoke main run, cell 1a writes its device to
+    <SMOKE_ROOT>/smoke_main_device.txt (the GPU name, else cpu/<CPU capability>) and reuses the run only with REUSE = True
+    on that device; REUSE = False, another device (a run built on a CPU runtime, started on an A100) or a missing marker
+    removes it and builds it again, and the output names the reason.  A pre-flight that is not bit-identical names the
+    smoke test's cause and remedy (a smoke main run of another device: REUSE = False or delete OUT_ROOT/smoke_14/runs)
+    instead of an A100 runtime with the main run's versions; its result stays next to its log."""
+    import torch
+
+    nb = _ctl_nb(regenerated)
+    out, mydrive = tmp_path / "LSNE", tmp_path / "MyDrive"
+    smoke = out / "smoke_14"
+    main, marker = smoke / "runs" / "D" / CTL_SMOKE_TAG, smoke / "smoke_main_device.txt"
+    calls: list = []
+    built_damage: list = [None]                               # the damage table the stubbed smoke main run gets
+
+    def stub(ns):
+        control = _cli_stub(calls)(ns)
+
+        def run_cli(name, args, module="lsne.cli"):
+            if "--d-control" in args:                        # the pre-flight and the control run
+                return control(name, args, module)
+            calls.append((name, [str(a) for a in args]))      # the smoke main run, as the command line builds it
+            _fake_main_run(main, model="EleutherAI/pythia-14m",
+                           **({} if built_damage[0] is None else dict(damage=built_damage[0])))
+            return 0
+        return run_cli
+
+    def start(cells=CTL_CELLS[:2], **subst) -> tuple:
+        capsys.readouterr()
+        ns = _ctl_cells(nb, out, mydrive, cells=cells, smoke=True, stub=stub, **subst)
+        return ns, capsys.readouterr().out
+
+    def built() -> int:
+        return sum("_smoke_main_" in name for name, _ in calls)
+
+    cpu, a100 = "cpu/" + torch.backends.cpu.get_cpu_capability(), "NVIDIA A100-SXM4-40GB"
+    # a CPU runtime: built, the marker names the CPU; a second start on it reuses the run
+    _fake_gpu(monkeypatch, None)
+    ns, text = start()
+    assert built() == 1 and ns["RESULT"]["smoke_main"]["status"] == "gerechnet" and ns["RESULT"]["smoke_main"]["device"] == cpu
+    assert marker.read_text(encoding="utf-8") == cpu + "\n" and f"(Gerät {cpu}, vermerkt in {marker})" in text
+    ns, text = start()
+    assert built() == 1 and ns["RESULT"]["smoke_main"] == dict(status="wiederverwendet", path=str(main),
+                                                               timestamp=FAKE_MAIN_TS, device=cpu)
+    assert f"gerechnet auf diesem Gerät: {cpu}): {main}" in text
+    # REUSE = False: removed and built again
+    ns, text = start(**{"REUSE = True ": "REUSE = False "})
+    assert built() == 2 and ns["RESULT"]["smoke_main"]["status"] == "gerechnet"
+    assert f"Alter Rauch-Hauptlauf entfernt (REUSE = False): {main}" in text
+    # an A100 runtime: the run built on the CPU is of another device, so it is removed and built again; then reused
+    _fake_gpu(monkeypatch, a100)
+    ns, text = start()
+    assert built() == 3 and ns["RESULT"]["smoke_main"]["device"] == a100 and marker.read_text(encoding="utf-8") == a100 + "\n"
+    assert f"Alter Rauch-Hauptlauf entfernt (anderes Gerät: gerechnet auf {cpu}, diese Laufzeit: {a100}): {main}" in text
+    ns, text = start()
+    assert built() == 3 and ns["RESULT"]["smoke_main"]["status"] == "wiederverwendet"
+    # a smoke main run without a marker (its device is unknown): built again
+    marker.unlink()
+    ns, text = start()
+    assert built() == 4 and "anderes Gerät: gerechnet auf unbekannt (smoke_main_device.txt fehlt)" in text
+    assert marker.read_text(encoding="utf-8") == a100 + "\n"
+
+    # the reused smoke main run is not reproduced bit for bit by the pre-flight: the cause and remedy of the smoke test
+    dmg = _fake_main_damage()
+    dmg.loc[(dmg["tag"] == "F01A:K8:C1") & (dmg["inject"] == "depth") & (dmg["direction"] == "lang_dom")
+            & (dmg["eps"] == 0.01), "lam"] += 1e-6
+    _fake_main_run(main, model="EleutherAI/pythia-14m", damage=dmg)
+    with pytest.raises(RuntimeError) as e:
+        start(cells=CTL_CELLS[:4])
+    msg = str(e.value)
+    assert type(e.value).__name__ == "ControlStop" and built() == 4 and calls[-1][0].endswith("_preflight")
+    for s in ("Die Vorabprüfung reproduziert den Hauptlauf nicht bitgleich",
+              "Rauchtest: Die wahrscheinlichste Ursache ist ein Rauch-Hauptlauf von einem anderen Gerät",
+              f"(Zelle 1a: wiederverwendet, Gerät {a100} laut smoke_main_device.txt;", "Abhilfe: REUSE = False setzen oder "
+              f"{smoke / 'runs'} löschen, dann alle Zellen erneut ausführen", "ALLOW_PLATFORM_MISMATCH = True"):
+        assert s in msg, s
+    assert "A100-Laufzeit" not in msg and "pip install" not in msg
+    pf = json.loads((smoke / "runs_ctl" / "logs" / f"{CTL_NB}_pythia-14m_step98000_preflight.json").read_text(encoding="utf-8"))
+    assert pf["status"] == "NICHT bitgleich" and pf["exact"] is False and pf["max_abs_dlam"] == pytest.approx(1e-6)
+    assert not (out / "runs").exists() and not (out / "runs_ctl").exists()
+
+    # a smoke main run built just now on this runtime that the pre-flight does not reproduce: no rebuild can help
+    built_damage[0] = dmg
+    with pytest.raises(RuntimeError) as e:
+        start(cells=CTL_CELLS[:4], **{"REUSE = True ": "REUSE = False "})
+    msg = str(e.value)
+    assert type(e.value).__name__ == "ControlStop" and built() == 5
+    assert f"Der Rauch-Hauptlauf wurde eben in Zelle 1a auf dieser Laufzeit gerechnet (Gerät {a100})" in msg
+    assert "REUSE = False setzen oder" not in msg and "A100-Laufzeit" not in msg and "ALLOW_PLATFORM_MISMATCH = True" in msg
+
+
 def test_token_control_notebook_platform_stop(regenerated, tmp_path, monkeypatch, capsys):
     """Another torch / transformers version than the main run (an A100 faked) or no A100 stops notebook 14 before any CLI
     call with the remedy (an A100 with the main run's versions, the pip commands built from its manifest, restart);
@@ -1231,6 +1350,10 @@ def test_token_control_notebook_platform_stop(regenerated, tmp_path, monkeypatch
     assert ns["REUSE_RUN"] is True and calls == [] and ns["RESULT"]["run"]["status"] == "wiederverwendet (nur geprüft)"
     assert "Nur geprüft: Plattform und Reproduzierbarkeit dienen hier nur der Information." in capsys.readouterr().out
     assert main.exists()
+    # that check overwrote the summary (fixed name); the pre-flight of the computing run stays next to its log
+    s = json.loads((out / f"summary_{CTL_NB}_pythia-160m_step98000_float32.json").read_text(encoding="utf-8"))
+    pf = json.loads((out / "runs_ctl" / "logs" / f"{CTL_NB}_pythia-160m_step98000_preflight.json").read_text(encoding="utf-8"))
+    assert s["preflight"]["status"] == "nicht nötig (nur geprüft)" and pf["status"] == "bitgleich" and pf["exact"] is True
 
 
 def test_token_control_notebook_determinism_check(regenerated, tmp_path, monkeypatch, capsys):
@@ -1301,11 +1424,52 @@ def test_token_control_notebook_determinism_check(regenerated, tmp_path, monkeyp
     assert "WARNUNG: Reproduzierbarkeit des Hauptlaufs nicht prüfbar" in capsys.readouterr().out
 
 
+def test_token_control_notebook_determinism_check_at_the_real_geometry(regenerated, tmp_path):
+    """determinism_check assumes D1's layout: per (tag, inject) the (direction, dose) pairs in the manifest order, direction
+    by direction over lattice_directions x doses, in forwards of damage_batch_size - 1 perturbed rows plus the reference.
+    At the geometry of the real main run (34 directions x 6 doses = 204 pairs per injection, batch 64: three forwards of
+    63 pairs and a short one of 15, two injections) a table whose logp_target_ref follows that assignment (the short last
+    forward's reference offset by +0.25: another shape may differ) is reproducible; the same values laid out as if the
+    pairs had run dose by dose are not."""
+    import pandas as pd
+
+    ns = _ctl_cells(_ctl_nb(regenerated), tmp_path / "LSNE", tmp_path / "MyDrive", cells=CTL_CELLS[:1])
+    dirs = ["ent", "lang_dom"] + [f"rand_{i:02d}" for i in range(32)]
+    doses = [0.01, 0.05, 0.1, 0.2, 0.5, 1.0]
+    batch, n = 64, len(dirs) * len(doses)
+    manifest = dict(lattice_directions=dirs, doses=doses, limits=dict(damage_batch_size=batch))
+    step = batch - 1
+    short = [(r // step + 1) * step > n for r in range(n)]          # the 15 pairs of the short last forward (16 rows)
+    assert (n, sum(short)) == (204, 15)
+    order = {"direction-major": [(dirs[r // len(doses)], doses[r % len(doses)]) for r in range(n)],
+             "dose-major": [(dirs[r % len(dirs)], doses[r // len(dirs)]) for r in range(n)]}
+    tags = [f"F{f:02d}{form}:K8:C1" for f in (1, 2) for form in "AB"]
+    res = {}
+    for layout, pairs in order.items():
+        rows = [dict(tag=t, inject=inject, direction=d, eps=e, logp_target_ref=-1.0 - 0.01 * i + (0.25 if short[r] else 0.0))
+                for i, t in enumerate(tags) for inject in ("depth", "dossier") for r, (d, e) in enumerate(pairs)]
+        (tmp_path / layout).mkdir()
+        pd.DataFrame(rows).sample(frac=1.0, random_state=0).to_csv(tmp_path / layout / "damage.csv", index=False)
+        res[layout] = ns["determinism_check"](str(tmp_path / layout), manifest)
+    d = res["direction-major"]
+    assert d["status"] == "reproduzierbar" and d["reproducible"] is True and d["n_nonzero"] == 0
+    assert (d["n_variants"], d["injections"], d["batch"], d["n_pairs_max"], d["forwards_max"], d["short_rows"]) == \
+        (4, ["depth", "dossier"], 64, 204, 4, [16])
+    assert d["full_per_injection"] == dict(n_groups=8, n_nonzero=0, max_spread=0.0)
+    assert d["full_per_variant"] == dict(n_groups=4, n_nonzero=0, max_spread=0.0)
+    assert d["short_same_size"] == dict(n_groups=4, n_nonzero=0, max_spread=0.0)
+    assert d["short_vs_full"]["n_nonzero"] == 4 and d["short_vs_full"]["max_abs_diff"] == pytest.approx(0.25)
+    m = res["dose-major"]
+    assert m["status"] == "NICHT reproduzierbar" and m["reproducible"] is False
+    assert m["full_per_variant"]["n_nonzero"] == 4 and m["short_same_size"]["n_nonzero"] == 4
+    assert m["full_per_variant"]["max_spread"] == pytest.approx(0.25)
+
+
 def test_token_control_notebook_preflight(regenerated, tmp_path, monkeypatch, capsys):
     """The live pre-flight (CLI stubbed): the same command with --families F01A --limit-variants 2 into a fresh local temp
     root (never below OUT_ROOT, removed afterwards); bit-identical lambda at u9 / C1 (K 0 and 8) passes and the run
     follows; a main depth lambda perturbed by 1e-6 stops before the control run (German message), unless
-    ALLOW_PLATFORM_MISMATCH."""
+    ALLOW_PLATFORM_MISMATCH.  Its result is also written as json next to its log, a failing one before the stop."""
     import os
 
     _fake_gpu(monkeypatch)
@@ -1327,6 +1491,12 @@ def test_token_control_notebook_preflight(regenerated, tmp_path, monkeypatch, ca
         [root if a == str(out / "runs_ctl") else a for a in ns["CLI_ARGS"]]
     text = capsys.readouterr().out
     assert "-> bitgleich" in text and "Temporärer Ordner entfernt" in text
+    # the result is also kept next to its log (the summary json has a fixed name, and a later check overwrites it)
+    pf_json = out / "runs_ctl" / "logs" / f"{name}.json"
+    saved = json.loads(pf_json.read_text(encoding="utf-8"))
+    assert pf["result_json"] == str(pf_json) and f"Ergebnis der Vorabprüfung: {pf_json}" in text
+    assert (saved["status"], saved["exact"], saved["n_rows"], saved["root"], saved["per_dose"]) == \
+        ("bitgleich", True, 18, root, pf["per_dose"])
     # the run followed: the control run of the whole design, checked by the audits of notebook 13
     assert calls[1][0] == "14_token_control_pythia-160m_step98000" and ns["RESULT"]["run"]["status"] == "gerechnet"
     _exec_cell(nb, "# --- 3. Audits", ns)
@@ -1349,6 +1519,8 @@ def test_token_control_notebook_preflight(regenerated, tmp_path, monkeypatch, ca
     text = capsys.readouterr().out
     assert "nicht bitgleich 1" in text and "-> NICHT bitgleich" in text and "max |Δλ| = 1.000e-06" in text
     assert not os.path.exists(calls[0][1][calls[0][1].index("--out") + 1])
+    saved = json.loads(pf_json.read_text(encoding="utf-8"))                    # written before the stop
+    assert saved["status"] == "NICHT bitgleich" and saved["exact"] is False and saved["max_abs_dlam"] == pytest.approx(1e-6)
     # ALLOW_PLATFORM_MISMATCH = True: a warning, and the control run is computed anyway
     calls.clear()
     ns = _ctl_cells(nb, out, mydrive, cells=CTL_CELLS[:5], stub=_cli_stub(calls),
@@ -1578,8 +1750,9 @@ def test_trace_notebook_runs_headless_in_smoke_mode(regenerated, tmp_path, monke
 @pytest.mark.slow
 def test_token_control_notebook_runs_headless_in_smoke_mode(regenerated, tmp_path, monkeypatch):
     """Execute notebook 14 with SMOKE = True through nbclient, self-contained: it builds its own smoke main run (pythia-14m,
-    F01A) by the command line below OUT_ROOT/smoke_14, checks that run's same-shape determinism, runs the pre-flight into
-    a local temp root (bit-identical lambda at u9 / C1), the control run through ``python -m lsne.cli`` and prints the
+    F01A) by the command line below OUT_ROOT/smoke_14 (its device in smoke_main_device.txt), checks that run's same-shape
+    determinism, runs the pre-flight into a local temp root (bit-identical lambda at u9 / C1; its result kept as json
+    next to its log), the control run through ``python -m lsne.cli`` and prints the
     four audits of notebook 13 (write audit and replication pass; .site and .run fail by design in a smoke run).  A second
     execution with the default REUSE makes no CLI call and leaves the smoke folder byte-identical.  Then notebook 13 on
     the smoke roots (given explicitly) reports the invalid control run (ACHTUNG lines) and, on a second run, the archive of
@@ -1647,6 +1820,10 @@ def test_token_control_notebook_runs_headless_in_smoke_mode(regenerated, tmp_pat
     assert pf["status"] == "bitgleich" and pf["exact"] is True and pf["n_rows"] > 0 and pf["max_abs_dlam"] == 0.0
     assert pf["ks"] == [0, 8] and pf["root_removed"] is True and not os.path.exists(pf["root"])
     assert not str(pf["root"]).startswith(str(out_root))
+    # the pre-flight's result next to its log, the smoke main run's device in its marker
+    assert pf["result_json"] == str(smoke / "runs_ctl" / "logs" / f"{CTL_NB}_pythia-14m_step98000_preflight.json")
+    assert json.loads(Path(pf["result_json"]).read_text(encoding="utf-8"))["status"] == "bitgleich"
+    assert (smoke / "smoke_main_device.txt").read_text(encoding="utf-8") == s["smoke_main"]["device"] + "\n"
     audits = [(a["id"], a["verdict"]) for a in s["audits"]]
     assert audits == [("audit.D1ctl", "supported"), ("audit.D1ctl.rep", "supported"), ("audit.D1ctl.site", "not_supported"),
                       ("audit.D1ctl.run", "not_supported")]

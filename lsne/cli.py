@@ -39,8 +39,8 @@ it is loaded: the depth bank's site and a selection whose variants all drop out 
 section-4 exclusions).  They too stop the run before it writes into its directory, which is
 created only when the run writes there and removed again if a refusal leaves it empty; the run
 report in ``<out>`` records the refusal.  The error manifest of a failed control run carries the
-control marks, so a restart resumes it (from checkpoints of the same platform and code version
-only).
+control marks, so a restart resumes it (from checkpoints of the same platform and commit only:
+the git sha of the checkout, so uncommitted edits and a non-git install are not detected).
 
 ``merge`` concatenates all same-named csv files below ``--root`` (any depth, including
 the stage-F sub-run directories of all shards) into ``<out>/<name>.csv`` with the

@@ -4640,7 +4640,9 @@ def nb_13() -> list[tuple[str, str]]:
             eingeschränktem, neuester zuerst“ der erste verwendet, dessen vier Audits bestehen; besteht keiner, wird der
             bevorzugte ausgewertet, und es gibt keinen gültigen Kontrolllauf. Die Zelle nach der Auswertung nennt jedes
             nicht bestandene Audit in einer Zeile „ACHTUNG: Kontrolllauf ungültig – …“ und, wenn es mehrere Kontrollläufe
-            gab, die Begründung der Auswahl.
+            gab, die Begründung der Auswahl. Lassen sich die Audits des verwendeten Kontrolllaufs gar nicht berechnen (der
+            Fehler steht dann in der Zeile `P.ctl`), meldet sie „ACHTUNG: Kontrolllauf nicht auswertbar …“; auch dann ist
+            P höchstens „offen“.
 
             **Herkunft und Archiv.** Der Bericht nennt in der Zeile „Code der Auswertung“ den Git-Stand und den SHA-256 von
             `lsne/prereg_eval.py` (in `prereg_meta.json`: `git_sha`, `prereg_eval_sha256`); die Notiz von `audit.D1ctl.run`
@@ -4871,7 +4873,13 @@ def nb_13() -> list[tuple[str, str]]:
                 tab, meta = res["results"], res["meta"]
                 AUDIT_DE = {"supported": "bestanden", "not_supported": "nicht bestanden", "not_tested": "nicht getestet"}
                 ctl_audits = tab[tab["id"].astype(str).isin(PE.CTL_AUDIT_IDS)]
-                CONTROL_VALID = PE.control_valid(ctl_audits.to_dict("records")) if len(ctl_audits) else None
+                runs_all = res["runs"]
+                ctl_runs = runs_all[runs_all["key"] == "D_ctl"]
+                used_run = ctl_runs[ctl_runs["used"].astype(bool)]
+                # a control run is used, but there is no audit row: its audits could not be computed (the evaluation error
+                # stands in the row P.ctl), so it is no valid control run
+                CONTROL_VALID = (PE.control_valid(ctl_audits.to_dict("records")) if len(ctl_audits)
+                                 else False if len(used_run) else None)
                 for _, a in ctl_audits.iterrows():
                     if a["verdict"] != "supported":
                         note = a["deviation_note"] if isinstance(a["deviation_note"], str) else ""
@@ -4881,11 +4889,12 @@ def nb_13() -> list[tuple[str, str]]:
                                             break_on_hyphens=False))
                 if CONTROL_VALID:
                     print("Kontrolllauf gültig: alle vier Audits bestanden (audit.D1ctl, .rep, .site, .run; Nachtrag 6.11).")
+                elif CONTROL_VALID is False and not len(ctl_audits):
+                    print("ACHTUNG: Kontrolllauf nicht auswertbar (keine Audit-Zeilen; siehe Zeile P.ctl): der Primärendpunkt ist "
+                          "höchstens „offen“.")
                 elif CONTROL_VALID is False:
                     print("Ohne gültigen Kontrolllauf sind alle Zeilen P.ctl… nicht interpretierbar, und der Primärendpunkt ist "
                           "nach Nachtrag 6.11 höchstens „offen“.")
-                runs_all = res["runs"]
-                ctl_runs = runs_all[runs_all["key"] == "D_ctl"]
                 sel = [n for n in meta["notes"] if str(n).startswith(("control run ", "choice among the control runs"))]
                 if len(ctl_runs) > 1 or sel:
                     used_ctl = ctl_runs.loc[ctl_runs["used"].astype(bool), "path"]
@@ -4897,7 +4906,6 @@ def nb_13() -> list[tuple[str, str]]:
                 sha, src = str(meta.get("git_sha") or ""), str(meta.get("prereg_eval_sha256") or "")
                 print(f"Code der Auswertung: Git {sha[:7] or 'unbekannt'}, lsne/prereg_eval.py SHA-256 {src[:12] or 'unbekannt'} "
                       "(prereg_meta.json: git_sha, prereg_eval_sha256)")
-                used_run = ctl_runs[ctl_runs["used"].astype(bool)]
                 if len(used_run):
                     try:
                         with open(os.path.join(used_run["path"].iloc[0], "manifest.json"), encoding="utf-8") as f:
@@ -4986,6 +4994,8 @@ def nb_13() -> list[tuple[str, str]]:
 
                 tab = res["results"]
                 ctl_audits = tab[tab["id"].astype(str).isin(PE.CTL_AUDIT_IDS)]
+                # a control run used without audit rows (its audits could not be computed) is no valid control run
+                ctl_used = bool(res["runs"].loc[res["runs"]["key"] == "D_ctl", "used"].astype(bool).any())
                 summary = dict(
                     notebook=NOTEBOOK, stage=STAGE, model=MODEL_TAG, revision=REVISION, n_boot=N_BOOT, seed=SEED,
                     frozen_dose=FROZEN_DOSE, run_roots=RUN_ROOTS, out=EVAL_OUT, cli_command=CLI_COMMAND,
@@ -4997,7 +5007,8 @@ def nb_13() -> list[tuple[str, str]]:
                     primary=tab[tab["role"] == "primary"][["id", "estimate", "ci_low", "ci_high", "verdict"]].to_dict("records"),
                     primary_control=tab[tab["role"] == "primary_control"][["id", "estimate", "ci_low", "ci_high",
                                                                            "verdict"]].to_dict("records"),
-                    control_valid=PE.control_valid(ctl_audits.to_dict("records")) if len(ctl_audits) else None,
+                    control_valid=PE.control_valid(ctl_audits.to_dict("records")) if len(ctl_audits) else (
+                        False if ctl_used else None),
                     control_audits=ctl_audits[["id", "verdict"]].to_dict("records"),
                     bh=dict(m=res["bh"]["m"], m_endpoints=res["bh"]["m_endpoints"]),
                     files={k: str(p) for k, p in paths.items() if p is not None},
@@ -5055,10 +5066,10 @@ def _ctl_header() -> tuple[str, str]:
         ausgeschlossener Variante) und `damage_ctl_contrasts` (deskriptiv) als CSV (+ Parquet) und `manifest.json`
         (`control = "token_language"`, `amendment = "6.11"`, Hauptlauf mit Git-SHA und Zeitstempel, SHA-256 der Bank,
         Richtungen, Dosen, Stellen, Zellen, Schreib-Audit, Plattform neben der des Hauptlaufs, `platform_mismatch`,
-        `eval_code_sha256`); die Logs der Vorabprüfung und des Laufs unter `runs_ctl/logs/`; am Ende
-        `summary_14_token_control_*.json` in `OUT_ROOT` (`MyDrive/LSNE`) mit Plattformvergleich, Reproduzierbarkeit
-        des Hauptlaufs, Vorabprüfung und den vier Audits. In `MyDrive/LSNE/runs/` schreibt das Notebook nichts: der
-        Hauptlauf wird nur gelesen.
+        `eval_code_sha256`); die Logs der Vorabprüfung und des Laufs unter `runs_ctl/logs/`, neben dem Log der
+        Vorabprüfung auch ihr Ergebnis als JSON; am Ende `summary_14_token_control_*.json` in `OUT_ROOT`
+        (`MyDrive/LSNE`) mit Plattformvergleich, Reproduzierbarkeit des Hauptlaufs, Vorabprüfung und den vier Audits.
+        In `MyDrive/LSNE/runs/` schreibt das Notebook nichts: der Hauptlauf wird nur gelesen.
 
         **Laufzeit.** A100 wie der Hauptlauf. Gerechnet werden 264 Varianten (24 Formulierungen × 11) an 360 Paaren
         aus Variante und Stelle mit je 204 Paaren aus Richtung und Dosis, also ≈ 1 440 Forwards zu 64 Zeilen, etwa ein
@@ -5126,19 +5137,19 @@ def _ctl_header() -> tuple[str, str]:
         ist, im Kontrollordner ein anderer Lauf liegt, eine der Prüfungen oben scheitert oder der Kontrolllauf scheitert
         oder verweigert wird; die Zellen danach sind abgesichert (Traceback, dann weiter). `REUSE = True` (Standard)
         prüft einen fertigen Kontrolllauf genau dieses Hauptlaufs (Pfad, Zeitstempel und SHA-256 der Bank) nur und
-        rechnet ihn nicht neu; einen eingeschränkten Lauf (`design_filters` im Manifest) behält es nie, sondern rechnet
-        ihn neu. `REUSE = False` rechnet einen fertigen Kontrolllauf neu und überschreibt ihn. Ein abgebrochener Lauf
-        setzt beim nächsten Start bei den gesicherten Blöcken unter `runs_ctl/D/<modell>@<revision>/_resume/` fort, aber
-        nur auf derselben Plattform und mit demselben Code-Stand: Die Signatur von `_resume/` enthält Torch, CUDA,
-        Gerät, GPU, transformers, Attention-Implementierung und Git-SHA, sonst beginnt der Lauf neu. Der Hauptlauf und
-        sein `_resume/` werden nie berührt. Das Notebook lädt das Modell nicht selbst, sondern ruft die Kommandozeile in
-        einem eigenen Prozess auf; so rechnet auch eine wiederverwendete Colab-Laufzeit mit dem aktuellen Code (die
-        Setup-Zelle bringt den Checkout auf den Stand des Zweigs). `SMOKE = True` ist ein eigenständiger Rauchtest mit
-        `pythia-14m` auf F01A: Er baut seinen eigenen Rauch-Hauptlauf von Stufe D unter `<OUT_ROOT>/smoke_14/runs` und
-        rechnet Vorabprüfung, Kontrolllauf (unter `<OUT_ROOT>/smoke_14/runs_ctl`) und Audits. `MyDrive/LSNE/runs` und
-        `MyDrive/LSNE/runs_ctl` berührt er nicht, und die Standardwurzeln von Notebook 13 sehen ihn nicht. Keine
-        wissenschaftliche Aussage: `audit.D1ctl.site` und `audit.D1ctl.run` scheitern dort absichtlich (wenige
-        Varianten, Rauchlauf).
+        rechnet ihn nicht neu; einen eingeschränkten Lauf (`design_filters` im Manifest) behält es außerhalb des
+        Rauchtests nie, sondern rechnet ihn neu. `REUSE = False` rechnet einen fertigen Kontrolllauf neu und
+        überschreibt ihn. Ein abgebrochener Lauf setzt beim nächsten Start bei den gesicherten Blöcken unter
+        `runs_ctl/D/<modell>@<revision>/_resume/` fort, aber nur auf derselben Plattform und mit demselben Code-Stand:
+        Die Signatur von `_resume/` enthält Torch, CUDA, Gerät, GPU, transformers, Attention-Implementierung und
+        Git-SHA, sonst beginnt der Lauf neu. Der Hauptlauf und sein `_resume/` werden nie berührt. Das Notebook lädt
+        das Modell nicht selbst, sondern ruft die Kommandozeile in einem eigenen Prozess auf; so rechnet auch eine
+        wiederverwendete Colab-Laufzeit mit dem aktuellen Code (die Setup-Zelle bringt den Checkout auf den Stand des
+        Zweigs). `SMOKE = True` ist ein eigenständiger Rauchtest mit `pythia-14m` auf F01A: Er baut seinen eigenen
+        Rauch-Hauptlauf von Stufe D unter `<OUT_ROOT>/smoke_14/runs` und rechnet Vorabprüfung, Kontrolllauf (unter
+        `<OUT_ROOT>/smoke_14/runs_ctl`) und Audits. `MyDrive/LSNE/runs` und `MyDrive/LSNE/runs_ctl` berührt er nicht,
+        und die Standardwurzeln von Notebook 13 sehen ihn nicht. Keine wissenschaftliche Aussage: `audit.D1ctl.site`
+        und `audit.D1ctl.run` scheitern dort absichtlich (wenige Varianten, Rauchlauf).
         """
     )
 
@@ -5474,8 +5485,11 @@ def _ctl_smoke_main_cell() -> tuple[str, str]:
         # --- 1a. Rauch-Hauptlauf (nur mit SMOKE = True): eigener Hauptlauf von Stufe D unter OUT_ROOT/smoke_14 ---------
         # The smoke test is self-contained: it builds the main stage-D run it controls (pythia-14m, smoke limits, F01A) by the
         # command line into OUT_ROOT/smoke_14/runs, never into MyDrive/LSNE/runs.  An ok one with F01A rows, computed with this
-        # runtime's torch and transformers, is reused; any other is removed and built again (the control run refuses a main
-        # run of other versions, and the pre-flight needs bit-identical lambda).
+        # runtime's torch and transformers on this device, is reused, and only with REUSE = True; any other is removed and
+        # built again (the control run refuses a main run of other versions, and the pre-flight needs bit-identical lambda,
+        # which a smoke main run of another device does not give).  Its device is in the marker
+        # OUT_ROOT/smoke_14/smoke_main_device.txt, written after each successful build: the GPU name, else
+        # cpu/<CPU capability>.
         import torch
         import transformers
 
@@ -5483,24 +5497,39 @@ def _ctl_smoke_main_cell() -> tuple[str, str]:
             RESULT["smoke_main"] = None
             print("Kein Rauchtest: der Hauptlauf wird nur gelesen (Zelle 1b).")
         else:
+            SMOKE_DEVICE = (torch.cuda.get_device_name(0) if torch.cuda.is_available()
+                            else "cpu/" + torch.backends.cpu.get_cpu_capability())
+            SMOKE_DEVICE_FILE = os.path.join(SMOKE_ROOT, "smoke_main_device.txt")
             _mp = Path(MAIN_D_RUN)
             _m = read_json(_mp / "manifest.json", {}) or {}
             _tags = read_table(_mp, "damage", ["tag"]) if _m.get("status") == "ok" else None
             _f01a = bool(_tags is not None and "tag" in _tags.columns and _tags["tag"].astype(str).str.startswith("F01A:").any())
             _same = (str(_m.get("torch_version")) == str(torch.__version__)
                      and str(_m.get("transformers_version")) == str(transformers.__version__))
-            if _m.get("status") == "ok" and _f01a and _same:
-                RESULT["smoke_main"] = dict(status="wiederverwendet", path=str(_mp), timestamp=_m.get("timestamp"))
+            try:
+                with open(SMOKE_DEVICE_FILE, encoding="utf-8") as _f:
+                    _dev = _f.read().strip()
+            except OSError:
+                _dev = ""
+            if _m.get("status") == "ok" and _f01a and _same and REUSE and _dev == SMOKE_DEVICE:
+                RESULT["smoke_main"] = dict(status="wiederverwendet", path=str(_mp), timestamp=_m.get("timestamp"),
+                                            device=SMOKE_DEVICE)
                 print(f"Rauch-Hauptlauf vorhanden (ok, Zeilen von F01A, Torch {torch.__version__}, transformers "
-                      f"{transformers.__version__}): {_mp}")
+                      f"{transformers.__version__}, gerechnet auf diesem Gerät: {SMOKE_DEVICE}): {_mp}")
             else:
                 if _mp.exists():
                     if not _inside(_mp, SMOKE_ROOT):          # never remove anything outside the smoke folder
                         raise ControlStop(f"{_mp} liegt nicht unter {SMOKE_ROOT}: der Rauchtest räumt dort nicht auf.")
                     _why = (f"Status {_m.get('status')!r}" if _m.get("status") != "ok" else
-                            "ohne Zeilen von F01A" if not _f01a else "andere Torch- oder transformers-Version")
+                            "ohne Zeilen von F01A" if not _f01a else
+                            "andere Torch- oder transformers-Version" if not _same else
+                            "REUSE = False" if not REUSE else
+                            f"anderes Gerät: gerechnet auf {_dev or 'unbekannt (smoke_main_device.txt fehlt)'}, diese "
+                            f"Laufzeit: {SMOKE_DEVICE}")
                     shutil.rmtree(_mp)
                     print(f"Alter Rauch-Hauptlauf entfernt ({_why}): {_mp}")
+                if os.path.exists(SMOKE_DEVICE_FILE):        # the marker names the device of the run built after it only
+                    os.remove(SMOKE_DEVICE_FILE)
                 _t0 = time.time()
                 _name = f"{NOTEBOOK}_smoke_main_{MODEL_TAG}_{REVISION}"
                 _rc = run_cli(_name, SMOKE_MAIN_ARGS)
@@ -5508,9 +5537,11 @@ def _ctl_smoke_main_cell() -> tuple[str, str]:
                 if _rc != 0 or _m.get("status") != "ok":
                     raise ControlStop(f"Der Rauch-Hauptlauf ist fehlgeschlagen (exit {_rc}, Status {_m.get('status')!r}); die "
                                       f"Ursache steht im Log {os.path.join(LOG_DIR, _name + '.log')}.")
+                with open(SMOKE_DEVICE_FILE, "w", encoding="utf-8") as _f:
+                    _f.write(SMOKE_DEVICE + "\n")
                 RESULT["smoke_main"] = dict(status="gerechnet", path=str(_mp), timestamp=_m.get("timestamp"), rc=_rc,
-                                            seconds=round(time.time() - _t0, 1))
-                print(f"Rauch-Hauptlauf gerechnet: {_mp}")
+                                            seconds=round(time.time() - _t0, 1), device=SMOKE_DEVICE)
+                print(f"Rauch-Hauptlauf gerechnet: {_mp} (Gerät {SMOKE_DEVICE}, vermerkt in {SMOKE_DEVICE_FILE})")
         """
     )
 
@@ -5730,20 +5761,46 @@ def _ctl_preflight_cell() -> tuple[str, str]:
             finally:
                 shutil.rmtree(PREFLIGHT_ROOT, ignore_errors=True)
             PREFLIGHT.update(status="bitgleich" if PREFLIGHT["exact"] else "NICHT bitgleich", seconds=round(time.time() - _t0, 1),
-                             log=os.path.join(LOG_DIR, _name + ".log"), root=PREFLIGHT_ROOT,
-                             root_removed=not os.path.exists(PREFLIGHT_ROOT))
+                             log=os.path.join(LOG_DIR, _name + ".log"), result_json=os.path.join(LOG_DIR, _name + ".json"),
+                             root=PREFLIGHT_ROOT, root_removed=not os.path.exists(PREFLIGHT_ROOT))
             RESULT["preflight"] = PREFLIGHT
+            # the result also next to its log: the summary json has a fixed name, and a later run that only checks
+            # overwrites it (preflight "nicht nötig")
+            from lsne.experiments import common as C
+
+            os.makedirs(LOG_DIR, exist_ok=True)
+            with open(PREFLIGHT["result_json"], "w", encoding="utf-8") as _f:
+                json.dump(C.to_jsonable(PREFLIGHT), _f, indent=1, ensure_ascii=False)
             print(f"Vorabprüfung: {PREFLIGHT['n_rows']} Zeilen an u9 / C1 (K {', '.join(map(str, PREFLIGHT['ks'])) or '–'}) gegen die "
                   f"Zeilen depth des Hauptlaufs: max |Δλ| = {fmt(PREFLIGHT['max_abs_dlam'])}, nicht bitgleich "
                   f"{PREFLIGHT['n_not_exact']} (ohne Gegenstück {PREFLIGHT['n_missing']}, andere Position "
                   f"{PREFLIGHT['n_position_mismatch']}, nicht endlich {PREFLIGHT['n_not_finite']}) -> {PREFLIGHT['status']}")
             show(dose_table(PREFLIGHT), n=50)
             print(f"Temporärer Ordner {'entfernt' if PREFLIGHT['root_removed'] else 'NICHT entfernt'}: {PREFLIGHT_ROOT}")
+            print(f"Ergebnis der Vorabprüfung: {PREFLIGHT['result_json']}")
             if not PREFLIGHT["exact"]:
                 _msg = ("Die Vorabprüfung reproduziert den Hauptlauf nicht bitgleich: Diese Laufzeit rechnet den Hauptlauf nicht "
                         "Bit für Bit nach, und der ganze Kontrolllauf würde Nachtrag 6.11 (b) (|Δλ| ≤ 1e-3 bei ε 0,01) sehr "
-                        "wahrscheinlich verfehlen. Abhilfe: eine A100-Laufzeit mit den Versionen des Hauptlaufs, "
-                        f"{pip_hint(MAIN_MANIFEST)}, dann die Laufzeit neu starten und alle Zellen erneut ausführen.")
+                        "wahrscheinlich verfehlen. ")
+                if SMOKE:
+                    # the smoke main run has this runtime's versions (cell 1a), so an A100 with the main run's versions is
+                    # no remedy: a reused smoke main run most likely comes from another machine under the same device name;
+                    # one built just now on this runtime means that this runtime does not reproduce its own lambda
+                    _sm = RESULT.get("smoke_main") or {}
+                    if _sm.get("status") == "gerechnet":
+                        _msg += ("Rauchtest: Der Rauch-Hauptlauf wurde eben in Zelle 1a auf dieser Laufzeit gerechnet (Gerät "
+                                 f"{_sm.get('device') or '?'}); diese Laufzeit rechnet ihr eigenes λ also in zwei Prozessen "
+                                 "nicht bitgleich. REUSE = False oder das Löschen des Rauch-Hauptlaufs hilft dann nicht: eine "
+                                 "andere Laufzeit versuchen und den Befund melden.")
+                    else:
+                        _msg += ("Rauchtest: Die wahrscheinlichste Ursache ist ein Rauch-Hauptlauf von einem anderen Gerät "
+                                 f"(Zelle 1a: {_sm.get('status', '?')}, Gerät {_sm.get('device') or '?'} laut "
+                                 "smoke_main_device.txt; dieselbe Gerätebezeichnung heißt nicht dieselbe Maschine). Abhilfe: "
+                                 f"REUSE = False setzen oder {os.path.join(SMOKE_ROOT, 'runs')} löschen, dann alle Zellen erneut "
+                                 "ausführen (Zelle 1a baut den Rauch-Hauptlauf dann auf dieser Laufzeit neu).")
+                else:
+                    _msg += (f"Abhilfe: eine A100-Laufzeit mit den Versionen des Hauptlaufs, {pip_hint(MAIN_MANIFEST)}, dann die "
+                             "Laufzeit neu starten und alle Zellen erneut ausführen.")
                 if not ALLOW_PLATFORM_MISMATCH:
                     raise ControlStop(_msg + " Wer bewusst trotzdem rechnen will: ALLOW_PLATFORM_MISMATCH = True (der Lauf ist "
                                       "dann fast sicher ungültig).")
@@ -5761,7 +5818,7 @@ def _ctl_run_cell() -> tuple[str, str]:
         #       --device auto --out <OUT_ROOT>/runs_ctl --d-control token_language --d-main-run <MAIN_D_RUN>
         # The subprocess loads the model (this kernel holds no GPU memory) and refuses, before it writes anything, a run
         # directory that holds another run and other torch / transformers versions than the main run's; a run that stops
-        # resumes from its own _resume on the next start (same platform and code version only).
+        # resumes from its own _resume on the next start (same platform and commit only).
         if REUSE_RUN:
             RESULT["run"] = dict(status="wiederverwendet (nur geprüft)", ok=True, rc=None, seconds=0.0, log=None)
         else:
@@ -5936,8 +5993,10 @@ def nb_14() -> list[tuple[str, str]]:
             ## 1. Hauptlauf, Plattform und Reproduzierbarkeit
 
             Mit `SMOKE = True` baut die erste Zelle zuerst den eigenen Rauch-Hauptlauf (`pythia-14m`, F01A) unter
-            `<OUT_ROOT>/smoke_14/runs`; einen fertigen, mit derselben Torch- und transformers-Version gerechneten nimmt sie
-            wieder. Sonst tut sie nichts.
+            `<OUT_ROOT>/smoke_14/runs`. Einen fertigen nimmt sie nur mit `REUSE = True` wieder und nur, wenn er mit derselben
+            Torch- und transformers-Version auf diesem Gerät gerechnet wurde (`<OUT_ROOT>/smoke_14/smoke_main_device.txt`,
+            nach jedem Bau geschrieben: Name der GPU, sonst `cpu/<CPU-Fähigkeit>`); sonst entfernt sie ihn und baut ihn neu
+            (der Grund steht in der Ausgabe, etwa „anderes Gerät“ oder „REUSE = False“). Ohne Rauchtest tut sie nichts.
 
             Die zweite Zelle prüft den Hauptlauf von Stufe D (`status: ok`, Stufe D, kein Kontrolllauf, gleiches Modell mit
             Revision und dtype, Richtungen, Dosen, Batch-Aufteilung, Tabelle `damage` und Tiefen-Richtungsbank vorhanden)
