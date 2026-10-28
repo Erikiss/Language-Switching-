@@ -4563,7 +4563,8 @@ def nb_13() -> list[tuple[str, str]]:
             letztes Token von Einheit 9), dieselbe Differenz für `rand` (Mittel über die Zufallsrichtungen) und die
             Differenz der Differenzen; gestützt nur, wenn die untere KI-Grenze von Δλ(K=8) den Mindesteffekt 0,05
             erreicht (dieselbe Intervallregel wie `damage_boot` in Stufe D), das KI der Differenz der Differenzen positiv
-            ist und die Punktschätzer monoton in K steigen; „offen“, wenn das Intervall den Mindesteffekt weder sichert
+            ist und der Anstieg in K belegt ist (Intervall von Δλ beim ersten K und jedes Zuwachses zwischen
+            aufeinanderfolgenden K über 0; PREREGISTRATION 6.10); „offen“, wenn das Intervall den Mindesteffekt weder sichert
             noch ausschließt. Ohne eine auf DEV eingefrorene Dosis werden alle präregistrierten Dosen berichtet.
             C2/C3/seg erscheinen nur als Abweichungszeilen. §4: Läufe mit `audit_rel_err` > 1e-4 sind ungültig (Zeilen
             `audit.D1`, `audit.C`). Kontrast 6: `ent` im Vorzeichen von State 2143 gegen Zufall, einseitig, über alle

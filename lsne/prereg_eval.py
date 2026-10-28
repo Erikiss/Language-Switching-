@@ -39,7 +39,9 @@ Endpoints (``id`` column)
               Supported iff the CI of dlam(lang_dom, K=8) lies at or above the minimum effect
               (``ci_low >= 0.05``: the interval decides, never the point estimate, the rule of
               stage D's ``damage_boot`` and ``common.min_effect_verdict``), the DiD CI excludes 0
-              (positive) and the point estimates are monotone in K (``P.mono``); "open" when the
+              (positive) and the rise in K is shown (``P.mono``: dlam(K_1) and every increment
+              dlam(K_i) - dlam(K_i-1) have a CI above 0; PREREGISTRATION 6.10, reading (b) of
+              28.10.2026; monotone point estimates are reported as reading (a)); "open" when the
               interval neither establishes nor excludes the minimum effect.  Every
               pre-registered dose present is evaluated (``P@<eps>``); the main dose (``P``) is
               the DEV-frozen dose when one is recorded (``--frozen-dose`` or ``frozen_dose`` in
@@ -732,9 +734,13 @@ DAMAGE_COLS = ["tag", "family", "formulation", "K", "C", "kind", "inject", "dire
 PRIMARY_NAME = "PRIMARY dlam(K, lang_dom) = lam(K>0, C1) - lam(K0), depth injection"
 PRIMARY_RULE = ("supported iff the 95% CI of dlam(lang_dom, K=8, C1) lies at or above the minimum effect (ci_low >= 0.05; "
                 "the interval decides, never the point estimate, as in damage_boot) AND the CI of DiD (lang_dom - rand) "
-                "> 0 AND point estimates monotone in K; not_supported iff the dlam CI lies below 0.05, the DiD CI lies "
-                "below 0 or includes 0 below 0.05, or not monotone; open otherwise (minimum effect neither established "
-                "nor excluded; PREREGISTRATION section 2)")
+                "> 0 AND monotone in K (the CI of dlam at the first K and of every increment between successive K lies "
+                "above 0; PREREGISTRATION 6.10); not_supported iff the dlam CI lies below 0.05, the DiD CI lies below 0 "
+                "or includes 0 below 0.05, or the rise in K is not shown; open otherwise (minimum effect neither "
+                "established nor excluded; PREREGISTRATION section 2)")
+PRIMARY_MONO_RULE = ("monotone in K (PREREGISTRATION 6.10, reading (b)): the 95% CI of dlam at the first K > 0 and of every "
+                     "increment dlam(K_i) - dlam(K_i-1) lies above 0; monotone point estimates (reading (a)) and the "
+                     "bootstrap P(monotone) are reported in the note")
 
 
 def _variant_lam(d: pd.DataFrame, fam: str) -> pd.DataFrame:
@@ -772,8 +778,8 @@ def _did_status(b: dict) -> str:
 
 
 def primary_verdict(lang_status: str, did_status: str, monotone: bool) -> str:
-    """Section 2: supported iff the lang_dom contrast and the DiD pass and the point
-    estimates are monotone in K; open iff no component fails and one is open; not_tested
+    """Section 2: supported iff the lang_dom contrast and the DiD pass and the rise in K is
+    shown (``monotone``, PREREGISTRATION 6.10); open iff no component fails and one is open; not_tested
     when the lang_dom contrast (or, with it passing, the rand contrast) is missing."""
     if lang_status == "nan":
         return "not_tested"
@@ -899,19 +905,22 @@ def _primary_dose(ctx: EvalContext, lang: pd.DataFrame, rand: pd.DataFrame, eps:
             bd[K] = _boot_fam(_did(fl, fr), ctx, 1)
     kmain = PRIMARY_K if PRIMARY_K in ks else max(ks)
     deltas = [bl[K]["estimate"] for K in ks]
-    mono = bool(np.all(np.diff([0.0] + deltas) > 0))
+    mono_point = bool(np.all(np.diff([0.0] + deltas) > 0))      # reading (a), reported only
     # monotonicity under the bootstrap: the draws align when every K has the same families
     same = len({tuple(bl[K]["keys"]) for K in ks}) == 1
     p_mono = np.nan
     if same and ctx.n_boot > 0:
         arr = np.vstack([np.zeros(len(bl[ks[0]]["boot"]))] + [bl[K]["boot"] for K in ks])
         p_mono = float(np.mean(np.all(np.diff(arr, axis=0) > 0, axis=0)))
-    inc_notes = []
+    inc_notes, inc_lows = [], [bl[ks[0]]["ci_low"]]
     for k0, k1 in zip(ks[:-1], ks[1:]):
         m = fls[k1].merge(fls[k0], on="family", suffixes=("_1", "_0"))
         inc = pd.DataFrame({"family": m["family"], "value": m["value_1"] - m["value_0"], "n_rows": m["n_rows_1"]})
         b = _boot_fam(inc, ctx, 1)
+        inc_lows.append(b["ci_low"])
         inc_notes.append(f"K{k0}->K{k1} {_g(b['estimate'])} [{_g(b['ci_low'])}, {_g(b['ci_high'])}]")
+    # reading (b) of PREREGISTRATION 6.10: the rise from K=0 to the first K and every later step has a CI above 0
+    mono = bool(all(np.isfinite(lo) and lo > 0 for lo in inc_lows))
     lang_status = min_effect_status(bl[kmain]["estimate"], bl[kmain]["ci_low"], bl[kmain]["ci_high"], PRIMARY_MIN_EFFECT, 1)
     did_status = _did_status(bd[kmain]) if kmain in bd else "nan"
     verdict = primary_verdict(lang_status, did_status, mono)
@@ -921,7 +930,8 @@ def _primary_dose(ctx: EvalContext, lang: pd.DataFrame, rand: pd.DataFrame, eps:
                       f"rule outcome ignoring the audit: {verdict}")
         verdict = "not_interpretable"
     did_main = bd.get(kmain)
-    k_note = (f"dlam(lang_dom, K={kmain}) {lang_status}, DiD {did_status}, monotone {mono}"
+    k_note = (f"dlam(lang_dom, K={kmain}) {lang_status}, DiD {did_status}, monotone {mono} (increments' CIs above 0, "
+              f"PREREGISTRATION 6.10); point estimates monotone {mono_point}"
               + (f" (bootstrap P(monotone) {_g(p_mono, 3)})" if np.isfinite(p_mono) else ""))
     did_txt = (f"DiD(K={kmain}) {_g(did_main['estimate'])} [{_g(did_main['ci_low'])}, {_g(did_main['ci_high'])}]"
                if did_main else "")
@@ -956,9 +966,10 @@ def _primary_dose(ctx: EvalContext, lang: pd.DataFrame, rand: pd.DataFrame, eps:
                                  **_stat_fields(b)))
     rows.append(make_row(f"P.mono{sfx}", f"monotonicity of lam(lang_dom) in K (C1), eps={_eps_key(eps)}",
                          role="primary_component", stage="D", estimate=float(mono), verdict=comp or ("supported" if mono else "not_supported"),
-                         rule="point estimates lam(0) < lam(2) < lam(4) < lam(8) (strict)", source=src,
+                         rule=PRIMARY_MONO_RULE, source=src,
                          n_families=bl[kmain]["n_families"], n_rows=sum(bl[K]["n_rows"] for K in ks),
                          note=_join("dlam by K: " + ", ".join(f"K{K} {_g(bl[K]['estimate'])}" for K in ks),
+                                    f"point estimates monotone (reading (a), not the rule): {mono_point}",
                                     "increments " + "; ".join(inc_notes) if inc_notes else "",
                                     f"bootstrap P(monotone) {_g(p_mono, 3)}" if np.isfinite(p_mono) else "")))
     # ---- deviation rows: C2 / C3 / seg (injection position != pre-registered position)

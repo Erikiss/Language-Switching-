@@ -298,6 +298,31 @@ def _primary_damage(dl8) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def test_primary_monotonicity_needs_increments_with_a_ci_above_zero(tmp_path):
+    """PREREGISTRATION 6.10, reading (b): monotone point estimates are not enough; the rise
+    from K = 0 to K = 2 and every later step needs a CI above 0.  Here dlam(K=2) is clearly
+    positive and the point estimates rise by 0.002 per step, but the per-family steps scatter
+    around 0: the primary endpoint is not supported, and the note keeps reading (a)."""
+    spread = (-0.12, 0.10, -0.06, 0.09, 0.0, 0.05, -0.08, 0.11, -0.03, 0.02, -0.09, 0.01)   # mean 0
+    rows = []
+    for i, fam in enumerate(TEST):
+        step = 0.002 + 0.2 * spread[i]
+        for form in ("A", "B"):
+            for K, dl in ((0, 0.0), (2, 0.15), (4, 0.15 + step), (8, 0.15 + 2 * step)):
+                for name, fd in [("lang_dom", "lang_dom")] + [(f"rand_{j:02d}", "rand") for j in range(4)]:
+                    rows.append(dict(tag=f"{fam}{form}:K{K}:C1", family=fam, formulation=form, K=K, C="C1", kind="standard",
+                                     inject="depth", direction=name, dir_family=fd, eps=0.05,
+                                     lam=0.05 + (dl if fd == "lang_dom" else 0.0), audit_rel_err=1e-7))
+    write_run(tmp_path, "D", {"damage": pd.DataFrame(rows)}, frozen_dose=0.05)
+    df = PE.evaluate([tmp_path], n_boot=2000, seed=0)["results"].set_index("id")
+    assert df.loc["P.lang.K8", "verdict"] == "supported" and df.loc["P.did.K8", "verdict"] == "supported"
+    assert df.loc["P.mono", "verdict"] == "not_supported" and df.loc["P.mono", "estimate"] == 0.0
+    assert "point estimates monotone (reading (a), not the rule): True" in df.loc["P.mono", "deviation_note"]
+    assert df.loc["P", "verdict"] == "not_supported"
+    assert "monotone False" in df.loc["P", "deviation_note"] and "point estimates monotone True" in df.loc["P", "deviation_note"]
+    assert "6.10" in df.loc["P", "rule"]
+
+
 def test_primary_verdict_follows_the_interval_like_damage_boot(tmp_path):
     """One minimum-effect rule: the primary verdict of prereg_eval and the confirmatory rows of
     stage D's damage_boot judge the same interval the same way (ci_low >= 0.05), never the

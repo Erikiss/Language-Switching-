@@ -21,9 +21,10 @@ Familien-Cluster-Bootstraps (10 000 Ziehungen) auf den Testfamilien F01–F12 ×
   Die untere Grenze des Intervalls liegt bei 0,069–0,074, also über dem Mindesteffekt 0,05. Gegenüber
   Zufallsrichtungen bleibt ein Unterschied von 0,102–0,109 (Intervalle klar über 0).
 * **Aber:** H1 verlangt auch „monoton in K“. Der Effekt ist bei K = 2 schon voll da und wächst danach nicht
-  weiter. Die Regel im Code vergleicht Punktschätzer; danach ist der Endpunkt bei ε 0,05 und 0,1 gestützt und
-  bei ε 0,01 nicht gestützt. Diese Aufteilung ist Rauschen: Kein Zuwachs von K = 2 auf 4 oder von 4 auf 8 ist
-  von 0 unterscheidbar. Wie „monoton“ zu lesen ist, legt die Präregistrierung nicht fest (§2.3).
+  weiter: Kein Zuwachs von K = 2 auf 4 oder von 4 auf 8 ist von 0 unterscheidbar. Nach der am 28.10.2026
+  festgelegten Lesart (PREREGISTRATION 6.10: Anstieg mit Intervall belegt) ist der **Primärendpunkt bei allen
+  drei Dosen nicht gestützt**. Ergebnis: **Wechseleffekt bestätigt, Dosis-Wirkung über K nicht bestätigt,
+  H1 als Ganzes nicht gestützt** (§2.3).
 * **Sekundär gestützt** (BH über 28 Tests): 1, 4, 5 (ein Messwert), 10 (i) mit SAE bei 98k (neu), 10 (ii),
   10 (iii), 14 bei der höheren Dosis (mit starkem Vorbehalt, §3). **Nicht gestützt:** 6 (Vorzeichen
   umgekehrt), 13. **Offen:** 2, 3 (überwiegend), 14 bei der niedrigeren Dosis.
@@ -60,11 +61,14 @@ FVU = 0,198 (Grenze 0,4) und ist damit dort zertifiziert (Notebook 01 auf Konto 
 Δλ = λ(K, `lang_dom`) − λ(K = 0, `lang_dom`), Zelle C1, Tiefen-Injektion, K = 8; DiD = Δλ(`lang_dom`) −
 Δλ(`rand`, Mittel über 32 Zufallsrichtungen).
 
-| Dosis ε | Δλ `lang_dom` (K = 8) | Δλ `rand` | DiD | Δλ bei K = 2 / 4 / 8 | P(monoton) im Bootstrap | Urteil (Regel im Code) |
-|---|---|---|---|---|---|---|
-| 0,01 | 0,0949 [0,0705; 0,1183] | −0,0070 [−0,0260; 0,0106] | 0,1019 [0,0875; 0,1174] | 0,0915 / 0,1010 / 0,0949 | 0,147 | **nicht gestützt** (nicht monoton) |
-| 0,05 | 0,0993 [0,0736; 0,1248] | −0,0101 [−0,0293; 0,0079] | 0,1094 [0,0910; 0,1289] | 0,0915 / 0,0993 / 0,0993 | 0,258 | **gestützt** |
-| 0,1 | 0,0941 [0,0690; 0,1184] | −0,0105 [−0,0296; 0,0077] | 0,1046 [0,0856; 0,1246] | 0,0882 / 0,0918 / 0,0941 | 0,236 | **gestützt** |
+| Dosis ε | Δλ `lang_dom` (K = 8) | Δλ `rand` | DiD | Δλ bei K = 2 / 4 / 8 | P(monoton) im Bootstrap | Urteil nach 6.10 (b) | Urteil nach Punktschätzern (a) |
+|---|---|---|---|---|---|---|---|
+| 0,01 | 0,0949 [0,0705; 0,1183] | −0,0070 [−0,0260; 0,0106] | 0,1019 [0,0875; 0,1174] | 0,0915 / 0,1010 / 0,0949 | 0,147 | **nicht gestützt** | nicht gestützt |
+| 0,05 | 0,0993 [0,0736; 0,1248] | −0,0101 [−0,0293; 0,0079] | 0,1094 [0,0910; 0,1289] | 0,0915 / 0,0993 / 0,0993 | 0,258 | **nicht gestützt** | gestützt |
+| 0,1 | 0,0941 [0,0690; 0,1184] | −0,0105 [−0,0296; 0,0077] | 0,1046 [0,0856; 0,1246] | 0,0882 / 0,0918 / 0,0941 | 0,236 | **nicht gestützt** | gestützt |
+
+Die Spalte (a) ist das, was der Bericht auf Drive vom 28.10., 04:55 UTC, noch ausweist; er wurde vor der
+Festlegung erzeugt. Seit diesem Stand rechnet `lsne/prereg_eval.py` nach (b).
 
 Einseitige p-Werte nach Bonferroni über die drei Dosen: 0,0003 für Δλ und für DiD bei jeder Dosis.
 
@@ -98,10 +102,10 @@ Zuwächse zwischen den K-Stufen (Δλ `lang_dom`):
 * `lang_dom` ist auf allen Standardvarianten gefittet, die Testfamilien eingeschlossen.
 * Gerechnet wurden nur die Dosen 0,01 / 0,05 / 0,1; 0,001 / 0,0025 / 0,005 / 0,02 fehlen (Nachtrag 6.3).
 
-### 2.3 Offene Entscheidung: Lesart von „monoton in K“
+### 2.3 Entscheidung: Lesart von „monoton in K“ (28.10.2026)
 
 PREREGISTRATION §2 verlangt „Δλ > 0 und monoton in K, und größer als derselbe Kontrast mit `rand`“, legt
-aber nicht fest, wie Monotonie geprüft wird. Drei Lesarten:
+aber nicht fest, wie Monotonie geprüft wird. Drei Lesarten wurden erwogen:
 
 | Lesart | Ergebnis |
 |---|---|
@@ -109,10 +113,9 @@ aber nicht fest, wie Monotonie geprüft wird. Drei Lesarten:
 | (b) Anstieg mit Intervall belegt (Zuwächse > 0) | bei keiner Dosis erfüllt → H1 nicht gestützt |
 | (c) kein belegter Abfall (kein Zuwachs signifikant < 0) | bei allen 3 Dosen erfüllt → H1 gestützt |
 
-Empfehlung: (b) als konfirmatorische Lesart, weil sie nach Sichtung der Daten die strengste ist und keine
-der Lesarten das Ergebnis begünstigen soll. Dann lautet das Ergebnis: **Wechseleffekt bestätigt,
-Dosis-Wirkung über K nicht bestätigt, H1 als Ganzes nicht gestützt.** Die Entscheidung wird, sobald
-getroffen, als datierter Nachtrag in PREREGISTRATION §6 eingetragen.
+Festgelegt ist (b), als datierter Nachtrag 6.10 in `docs/PREREGISTRATION.md`. Gewählt wurde die strengste
+Lesart, weil die Festlegung erst nach Sichtung der Daten erfolgt und das Ergebnis nicht begünstigen soll.
+Ergebnis: **Wechseleffekt bestätigt, Dosis-Wirkung über K nicht bestätigt, H1 als Ganzes nicht gestützt.**
 
 ## 3. Sekundäre Endpunkte (BH-Gruppe, m = 28)
 
@@ -211,7 +214,7 @@ als „nicht getestet“, weil es dort nur Stufe H gibt.
 
 ## 8. Offene Entscheidungen
 
-1. **Primärendpunkt, Monotonie** (§2.3): Lesart (a), (b) oder (c). Empfehlung (b).
+1. ~~Primärendpunkt, Monotonie~~: entschieden am 28.10.2026, Lesart (b) (§2.3, PREREGISTRATION 6.10).
 2. **Primärendpunkt, Achse:** ob die `lang_dom`-Achse trotz verfehltem Entrauschungs-Test an Layer 4 gilt.
 3. **Primärendpunkt, Kontrolle der Tokensprache** vor einer Bestätigung (z. B. K = 0 mit deutschem Token an
    der Injektionsstelle).

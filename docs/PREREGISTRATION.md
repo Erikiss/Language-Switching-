@@ -155,5 +155,14 @@ Zahlen in `docs/RESULTS_RUN1.md` §4.
 9. **Endpunkt 15:** Der nach Regel 16 fällige Gegenpol `books` wurde in Lauf 1 nicht
    angewandt; Endpunkt 15 ist für Lauf 1 explorativ.
 
-Noch offene Entscheidungen (Liste in `docs/RESULTS_RUN1.md` §5.5) werden, sobald getroffen,
-hier mit Datum ergänzt.
+10. **Primärendpunkt, „monoton in K“** (festgelegt am 28.10.2026, nach Sichtung der Auswertung
+    in `docs/RESULTS_PREREG.md`): Monotonie gilt als gezeigt, wenn das 95-%-Intervall von Δλ beim
+    ersten K > 0 und das Intervall jedes Zuwachses Δλ(K_i) − Δλ(K_i−1) zwischen aufeinanderfolgenden
+    K (0 → 2 → 4 → 8) über 0 liegen. Steigende Punktschätzer allein genügen nicht; sie werden als
+    Sensitivität berichtet. Von drei erwogenen Lesarten (Punktschätzer steigend; Anstieg mit
+    Intervall belegt; kein belegter Abfall) ist das die strengste. Sie wurde gewählt, weil die
+    Festlegung erst nach Sichtung der Daten erfolgt und das Ergebnis nicht begünstigen soll.
+    Umgesetzt in `lsne/prereg_eval.py` (`P.mono`, `PRIMARY_MONO_RULE`).
+
+Noch offene Entscheidungen (Listen in `docs/RESULTS_RUN1.md` §5.5 und `docs/RESULTS_PREREG.md` §8)
+werden, sobald getroffen, hier mit Datum ergänzt.
