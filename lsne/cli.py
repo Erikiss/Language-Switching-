@@ -7,7 +7,7 @@
         [--ttt-corpus DIR] [--ttt-checkpoints step4000,step98000,step143000] \\
         [--transplant-source rotated_self|self|model@rev] [--atlas-dir DIR]
     python -m lsne.cli run --stage D --d-control token_language --d-main-run <root>/D/<model>@<rev> \\
-        --out <LSNE>/runs_ctl [--model ... --revision ...]
+        --out <LSNE>/runs_ctl [--model ... --revision ...] [--d-allow-platform-mismatch]
     python -m lsne.cli merge --root runs --out merged/
 
 ``run`` loads the model once, runs the requested stages in order (``all`` = A B C D E F
@@ -27,10 +27,20 @@ model/revision only); the per-stage durations are printed at the end.
 injection-site language (PREREGISTRATION section 6, amendment 11;
 :mod:`lsne.experiments.stage_d_control`): stage D alone, with the main stage-D run's directions,
 doses and depth bank, written to ``<out>/D/<model>@<rev>`` under its own root (``runs_ctl``).  The
-run is refused before the model is loaded when that directory is the main run's or lies inside it,
-when ``<out>`` is a ``runs`` folder, lies in the main run's root or holds the main run, or when the
-directory holds a stage-D run other than this control; a refused control run writes nothing, and
-the error manifest of a failed one carries the control marks, so a restart resumes it.
+run is refused before the model is loaded, with nothing written (:func:`check_d_control`), when
+that directory is the main run's or lies inside it, when ``<out>`` is a ``runs`` folder (also
+through a link or ``..``), lies in the main run's root or holds the main run, when the directory
+holds a stage-D run other than this control, when the main run is no ok stage-D run of the same
+model with its depth bank, when ``--families`` selects no test formulation, and when torch or
+transformers differ from the main run's versions (at eps 0.01 the replication audit of 6.11 (b)
+needs bit-identical lambda; ``--d-allow-platform-mismatch`` runs anyway and records the
+differences in the manifest's ``platform_mismatch``).  Two guards need the model and refuse after
+it is loaded: the depth bank's site and a selection whose variants all drop out (K / C levels,
+section-4 exclusions).  They too stop the run before it writes into its directory, which is
+created only when the run writes there and removed again if a refusal leaves it empty; the run
+report in ``<out>`` records the refusal.  The error manifest of a failed control run carries the
+control marks, so a restart resumes it (from checkpoints of the same platform and code version
+only).
 
 ``merge`` concatenates all same-named csv files below ``--root`` (any depth, including
 the stage-F sub-run directories of all shards) into ``<out>/<name>.csv`` with the
@@ -107,6 +117,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "needs --d-main-run and its own --out root, e.g. <LSNE>/runs_ctl")
     r.add_argument("--d-main-run", default=None,
                    help="with --d-control: directory of the main stage-D run (<root>/D/<model>@<revision>)")
+    r.add_argument("--d-allow-platform-mismatch", action="store_true",
+                   help="with --d-control: run although torch / transformers differ from the main run's versions "
+                        "(recorded in the manifest's platform_mismatch; the replication audit 6.11 (b) will likely fail)")
     r.add_argument("--no-progress", action="store_true")
 
     m = sub.add_parser("merge", help="merge csv tables of several run directories")
@@ -168,13 +181,19 @@ def make_config(args: argparse.Namespace) -> tuple[RunConfig, C.Limits]:
 # run
 # --------------------------------------------------------------------------------------
 def run_stages(cfg: RunConfig, limits: C.Limits, stages: Sequence[str], mb=None, **kw) -> dict[str, dict]:
-    """Run ``stages`` in order on one loaded model; returns ``{stage: {status, run_dir, seconds, error}}``."""
+    """Run ``stages`` in order on one loaded model; returns ``{stage: {status, run_dir, seconds, error}}``.
+
+    The stage-D control run (``kw['d_control']``) gets its run directory only when it writes into
+    it; a refused one (:class:`~lsne.experiments.stage_d_control.ControlRunError`) writes no error
+    files, and its run directory is removed if it is empty
+    (:func:`~lsne.experiments.stage_d_control.remove_empty_run_dir`), never otherwise."""
     if mb is None:
         mb = load_model(cfg.model)
     ctx: dict = {}
     report: dict[str, dict] = {}
     for st in stages:
-        rd = RunDir(cfg.out_root, st, cfg.model)
+        control = st == "D" and bool(kw.get("d_control"))
+        rd = RunDir(cfg.out_root, st, cfg.model, mkdir=not control)
         t0 = time.perf_counter()
         print(f"[lsne] stage {st} ({STAGE_TITLES[st]}) -> {rd.path}", flush=True)
         try:
@@ -188,9 +207,12 @@ def run_stages(cfg: RunConfig, limits: C.Limits, stages: Sequence[str], mb=None,
                 print(f"[lsne]   substage {st}/{name} FAILED: {err}", file=sys.stderr, flush=True)
         except Exception as e:  # noqa: BLE001 - keep the other stages running
             refused = isinstance(e, SDC.ControlRunError)
-            if not refused:         # a refused control run wrote nothing; its directory may hold a main run
+            if refused:             # a refused control run wrote nothing; its directory may hold a main run
+                if control:         # so it is removed only when empty
+                    SDC.remove_empty_run_dir(rd.path)
+            else:
                 C.write_error(rd, st, e, cfg, mb)
-                if st == "D" and kw.get("d_control"):
+                if control:
                     SDC.mark_error_manifest(rd, kw["d_control"])
             report[st] = dict(status="error", run_dir=str(rd.path), seconds=time.perf_counter() - t0, tables=[],
                               error=repr(e))
@@ -211,12 +233,20 @@ def duration_summary(report: dict[str, dict]) -> str:
     return "\n".join(lines)
 
 
-def check_d_control(cfg: RunConfig, stages: Sequence[str], control: Optional[str], main_run: Optional[str]) -> None:
-    """``--d-control`` / ``--d-main-run``: both or neither, stage D alone, a run directory
-    ``<out>/D/<model>@<rev>`` that is neither the main run's (nor inside it) nor one holding another
-    stage-D run, an ``<out>`` that is no ``runs`` folder and is separate from the main run's root,
-    and an ok main stage-D run of the same model with its depth bank (the guards of
-    :mod:`lsne.experiments.stage_d_control`); SystemExit before the model is loaded."""
+def check_d_control(cfg: RunConfig, stages: Sequence[str], control: Optional[str], main_run: Optional[str],
+                    allow_platform_mismatch: bool = False) -> None:
+    """``--d-control`` / ``--d-main-run`` / ``--d-allow-platform-mismatch``: the first two both or
+    neither, the flag only with them, stage D alone, a run directory ``<out>/D/<model>@<rev>`` that
+    is neither the main run's (nor inside it) nor one holding another stage-D run, an ``<out>``
+    that is no ``runs`` folder and is separate from the main run's root, an ok main stage-D run of
+    the same model with its depth bank, a test formulation among the selected families and, unless
+    ``allow_platform_mismatch``, the main run's torch and transformers versions (the guards of
+    :mod:`lsne.experiments.stage_d_control`); SystemExit before the model is loaded and before
+    anything is written.  The guards that need the model (the bank's site, a selection whose
+    variants all drop out) refuse in the run itself."""
+    if allow_platform_mismatch and not control:
+        raise SystemExit("[lsne] --d-allow-platform-mismatch belongs to a stage-D control run: use it with --d-control "
+                         "and --d-main-run")
     if not (control and main_run):
         raise SystemExit("[lsne] --d-control and --d-main-run go together: a stage-D control run needs the "
                          "directory of the main stage-D run")
@@ -225,7 +255,9 @@ def check_d_control(cfg: RunConfig, stages: Sequence[str], control: Optional[str
     try:
         SDC.check_control(control)
         SDC.check_run_dir(RunDir(cfg.out_root, "D", cfg.model, mkdir=False).path, main_run, cfg.out_root)
-        SDC.main_run_inputs(cfg, main_run)
+        main = SDC.main_run_inputs(cfg, main_run)
+        SDC.check_formulations(cfg)
+        SDC.check_platform(main["manifest"], bool(allow_platform_mismatch))
     except SDC.ControlRunError as e:
         raise SystemExit(f"[lsne] control run refused: {e}") from e
 
@@ -233,12 +265,13 @@ def check_d_control(cfg: RunConfig, stages: Sequence[str], control: Optional[str
 def cmd_run(args: argparse.Namespace) -> int:
     cfg, limits = make_config(args)
     stages = parse_stages(args.stage)
-    if args.d_control or args.d_main_run:
-        check_d_control(cfg, stages, args.d_control, args.d_main_run)
+    if args.d_control or args.d_main_run or args.d_allow_platform_mismatch:
+        check_d_control(cfg, stages, args.d_control, args.d_main_run, args.d_allow_platform_mismatch)
     kw = dict(axis_npz=args.axis_npz, shard_index=int(args.shard_index), shard_count=int(args.shard_count),
               ttt_corpus=args.ttt_corpus, transplant_source=args.transplant_source, atlas_dir=args.atlas_dir, worst_head=args.worst_head,
               ttt_checkpoints=([s.strip() for s in args.ttt_checkpoints.split(",") if s.strip()] if args.ttt_checkpoints else None),
-              d_control=args.d_control, d_main_run=args.d_main_run)
+              d_control=args.d_control, d_main_run=args.d_main_run,
+              d_allow_platform_mismatch=bool(args.d_allow_platform_mismatch))
     if args.pairs:
         kw["pairs"] = parse_pairs(args.pairs, cfg)
     elif args.smoke:
@@ -246,7 +279,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     kw["f_stages"] = list(limits.f_stages)
     print(f"[lsne] model {cfg.model.tag()} device={cfg.model.device} stages={''.join(stages)} out={cfg.out_root}"
           f"{' SMOKE' if limits.is_smoke else ''}"
-          f"{f' CONTROL {args.d_control} of {args.d_main_run}' if args.d_control else ''}", flush=True)
+          f"{f' CONTROL {args.d_control} of {args.d_main_run}' if args.d_control else ''}"
+          f"{' (platform mismatch allowed)' if args.d_allow_platform_mismatch else ''}", flush=True)
     report = run_stages(cfg, limits, stages, **kw)
     summary_path = Path(cfg.out_root) / f"run_report_{cfg.model.tag().replace(':', '_').replace('@', '_')}.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)

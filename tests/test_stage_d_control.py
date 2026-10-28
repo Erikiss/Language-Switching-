@@ -6,12 +6,17 @@ CPU, pythia-14m, family F01).
 * ``u9D`` (control 3): K = 2, C ``u9D``, unit mask EEEEEEEEDE at C1, checked against K = 0;
 * the primary site (``u9`` at K = 0 and C1) reproduces stage D's ``depth`` rows of the main run
   bit for bit, from the main run's bank, directions, doses and batch layout;
-* the guards refuse before anything is written, and never touch the main run;
-* the manifest carries the fields the evaluation (``lsne.prereg_eval``, key ``D_ctl``) reads;
+* the guards refuse before anything is written, and never touch the main run; other torch /
+  transformers versions than the main run's are refused unless allowed, and then recorded;
+* a restart resumes only checkpoints of the same platform (torch, transformers, attention
+  implementation) and code version;
+* the manifest carries the fields the evaluation (``lsne.prereg_eval``, key ``D_ctl``) reads, and
+  the SHA-256 of the evaluation code;
 * stage D's own injections are unchanged.
 """
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import shutil
@@ -21,7 +26,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+import torch
+import transformers
 
+import lsne
 from lsne import stimuli
 from lsne.cli import main as cli_main
 from lsne.cli import run_stages
@@ -30,6 +38,7 @@ from lsne.experiments import common as C
 from lsne.experiments import stage_d_control as SDC
 from lsne.experiments import stage_d_noneq as SD
 from lsne.io import RunDir, read_manifest, write_manifest
+from lsne.model import load_model
 
 FAMILY = "F01"
 #: Directions of the fake main run in its manifest order (``ent``: its float32 norm is not exactly
@@ -58,6 +67,11 @@ def _family(tag: str) -> stimuli.Family:
 def _snapshot(d: Path) -> dict:
     """Every file below ``d`` with its bytes (to show that nothing in a directory changed)."""
     return {str(p.relative_to(d)): p.read_bytes() for p in sorted(Path(d).rglob("*")) if p.is_file()}
+
+
+def _eval_code_sha256() -> str:
+    """SHA-256 of ``lsne/prereg_eval.py`` of the package under test."""
+    return hashlib.sha256((Path(lsne.__file__).resolve().parent / "prereg_eval.py").read_bytes()).hexdigest()
 
 
 def _write_main_run(path, mb, bank, **over) -> Path:
@@ -241,7 +255,11 @@ def test_control_run_tables_sites_and_manifest(ctl_run, mb, tok, depth_bank):
     # the replication platform next to the environment's own OS string (which it must not replace)
     rp = m["replication_platform"]
     assert rp["device"] == "cpu" and rp["main_torch"] == mm["torch_version"] and rp["main_platform"] == mm["platform"]
+    assert rp["torch"] == str(torch.__version__) and rp["gpu"] == "" and rp["cuda"] == str(torch.version.cuda or "")
+    assert rp["transformers"] == str(transformers.__version__) and rp["main_transformers"] == mm["transformers_version"]
     assert isinstance(m["platform"], str) and m["platform"] and m["platform"] == mm["platform"]
+    # same software as the main run; the evaluation code it was run with (lsne/prereg_eval.py)
+    assert m["platform_mismatch"] == [] and m["eval_code_sha256"] == _eval_code_sha256()
 
     # its own checkpoints are gone; the main run (manifest, bank, its checkpoints) is untouched
     assert not (rd / "_resume").exists() and not (rd / "directions_depth.npz").exists()
@@ -290,11 +308,21 @@ def test_guards_refuse_before_writing(mb, depth_bank, tmp_path):
     link.symlink_to(main, target_is_directory=True)
     refused(link, "is the main stage-D run directory")
     refused(RunDir(main, "D", mb.spec, mkdir=False).path, "lies inside the main stage-D run directory")     # --out <main>
-    # the root (--out): a runs folder (here of another account), or one that holds the main run
-    for root in (tmp_path / "LSNE_B" / "runs", tmp_path):
+    # the root (--out): a runs folder (here of another account; also through a link or '..'), or one
+    # that holds the main run
+    (tmp_path / "LSNE_C" / "runs").mkdir(parents=True)
+    alias = tmp_path / "ctl_alias"
+    alias.symlink_to(tmp_path / "LSNE_C" / "runs", target_is_directory=True)
+    for root in (tmp_path / "LSNE_B" / "runs", tmp_path, alias, tmp_path / "LSNE_C" / "runs" / "x" / ".."):
         with pytest.raises(SDC.ControlRunError, match="is a runs folder, lies inside the root of the main"):
             SD.run(replace(cfg, out_root=str(root)), mb, RunDir(root, "D", mb.spec, mkdir=False).path, **kw)
         assert not (root / "D").exists()
+    assert not any((tmp_path / "LSNE_C" / "runs").iterdir())
+    # a root of its own, also through a link, is accepted
+    (tmp_path / "LSNE_C" / "runs_ctl").mkdir()
+    (tmp_path / "ctl_ok").symlink_to(tmp_path / "LSNE_C" / "runs_ctl", target_is_directory=True)
+    for root in (tmp_path / "LSNE_C" / "runs_ctl", tmp_path / "ctl_ok", tmp_path / "LSNE_C" / "runs" / ".." / "runs_ctl"):
+        SDC.check_run_dir(RunDir(root, "D", mb.spec, mkdir=False).path, main, root)
     for status in ("ok", "error"):
         other = tmp_path / f"other_{status}"
         write_manifest(other, stage="D", status=status)
@@ -314,6 +342,117 @@ def test_guards_refuse_before_writing(mb, depth_bank, tmp_path):
     (nobank / "directions_depth_meta.json").unlink()
     refused(rd, "no depth bank", d_main_run=str(nobank))
     assert _snapshot(main) == before and not any(rd.iterdir())
+
+
+# --------------------------------------------------------------------------------------
+# platform, provenance and resume
+# --------------------------------------------------------------------------------------
+def test_platform_mismatches_and_their_guard(monkeypatch):
+    """torch / transformers of this run against the main run's manifest: one readable string per
+    difference, nothing for equal versions or for a field the main manifest lacks; refused unless
+    allowed (the message names the differences and the flag)."""
+    here = dict(torch_version=str(torch.__version__), transformers_version=str(transformers.__version__))
+    assert SDC.platform_mismatches(here) == [] and SDC.check_platform(here, allow=False) == []
+    for main in ({}, dict(torch_version=None, transformers_version=""), dict(platform="Linux"), None):
+        assert SDC.platform_mismatches(main) == [] and SDC.check_platform(main, allow=False) == []
+    monkeypatch.setattr(torch, "__version__", "2.12.0+cu130")
+    monkeypatch.setattr(transformers, "__version__", "5.21.0")
+    main = dict(torch_version="2.11.0+cu130", transformers_version="5.20.2", platform="Linux")
+    want = ["torch 2.12.0+cu130 instead of 2.11.0+cu130 (main run)", "transformers 5.21.0 instead of 5.20.2 (main run)"]
+    assert SDC.platform_mismatches(main) == want
+    assert SDC.platform_mismatches(dict(transformers_version="5.21.0", torch_version="2.11.0+cu130")) == want[:1]
+    assert SDC.platform_mismatches(dict(transformers_version="5.20.2")) == want[1:]        # no torch_version: not compared
+    with pytest.raises(SDC.ControlRunError) as e:
+        SDC.check_platform(main, allow=False)
+    assert all(w in str(e.value) for w in want) and "--d-allow-platform-mismatch" in str(e.value)
+    assert SDC.check_platform(main, allow=True) == want
+
+
+def test_platform_mismatch_refused_in_the_run_and_recorded_when_allowed(mb, depth_bank, tmp_path):
+    """A main run on other transformers: the run refuses before it writes anything; with
+    ``d_allow_platform_mismatch`` it runs and records the difference (``platform_mismatch``, the
+    main run's version in ``replication_platform``) and the evaluation code's SHA-256."""
+    main = _write_main_run(RunDir(tmp_path / "runs", "D", mb.spec).path, mb, depth_bank, transformers_version="4.0.0")
+    before = _snapshot(main)
+    cfg = RunConfig(model=mb.spec, families=[f"{FAMILY}A"], out_root=str(tmp_path / "runs_ctl"), limit_variants=3)
+    rd = RunDir(cfg.out_root, "D", cfg.model, mkdir=False).path
+    kw = dict(ctx={}, limits=C.Limits.smoke(progress=False), d_control="token_language", d_main_run=str(main))
+    want = [f"transformers {transformers.__version__} instead of 4.0.0 (main run)"]
+    with pytest.raises(SDC.ControlRunError, match=r"instead of 4\.0\.0 \(main run\).*--d-allow-platform-mismatch"):
+        SD.run(cfg, mb, rd, **kw)
+    assert not Path(cfg.out_root).exists()
+    SD.run(cfg, mb, rd, **dict(kw, d_allow_platform_mismatch=True))
+    m = read_manifest(rd)
+    assert m["status"] == "ok" and m["platform_mismatch"] == want and m["eval_code_sha256"] == _eval_code_sha256()
+    assert m["replication_platform"]["main_transformers"] == "4.0.0"
+    assert m["replication_platform"]["transformers"] == m["transformers_version"] == str(transformers.__version__)
+    assert _snapshot(main) == before
+
+
+def test_eval_code_sha256_of_the_evaluation_module(monkeypatch, tmp_path):
+    """``eval_code_sha256``: the SHA-256 of lsne/prereg_eval.py next to the package's modules, ''
+    when it cannot be read."""
+    assert SDC.EVAL_CODE == Path(lsne.__file__).resolve().parent / "prereg_eval.py"
+    assert SDC.eval_code_sha256() == _eval_code_sha256() == SDC.file_sha256(SDC.EVAL_CODE)
+    monkeypatch.setattr(SDC, "EVAL_CODE", tmp_path / "missing" / "prereg_eval.py")
+    assert SDC.eval_code_sha256() == ""
+
+
+def test_resume_only_from_the_same_platform_and_code(mb, depth_bank, tmp_path, monkeypatch):
+    """Checkpoints of an interrupted control run are resumed by a restart on the same platform and
+    code; another torch version, attention implementation (sdpa vs eager: another kernel) or git
+    sha changes the resume signature, and the restart discards them instead of mixing them with
+    its own chunks.  Every restart ends with the tables of an uninterrupted run."""
+    main = _write_main_run(RunDir(tmp_path / "runs", "D", mb.spec).path, mb, depth_bank)
+    monkeypatch.setattr(C, "RESUME_CHUNK", 1)                   # one variant per checkpoint: 3 chunks
+    cfg = RunConfig(model=mb.spec, families=[f"{FAMILY}A"], out_root=str(tmp_path / "runs_ctl"), limit_variants=3)
+    limits = C.Limits.smoke(progress=False)
+    kw = dict(d_control="token_language", d_main_run=str(main))
+    ref_cfg = replace(cfg, out_root=str(tmp_path / "ref_ctl"))
+    assert run_stages(ref_cfg, limits, ["D"], mb=mb, **kw)["D"]["status"] == "ok"
+    ref = pd.read_csv(RunDir(ref_cfg.out_root, "D", mb.spec, mkdir=False).path / "damage_ctl.csv")
+    assert read_manifest(RunDir(ref_cfg.out_root, "D", mb.spec, mkdir=False))["resumed_checkpoints"] == 0
+    rd = RunDir(cfg.out_root, "D", cfg.model, mkdir=False).path
+    real = SDC.control_damage_tables
+
+    def interrupted(mb_):
+        calls = []
+
+        def flaky(*a, **k):
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("session lost after the first checkpoint")
+            return real(*a, **k)
+
+        with monkeypatch.context() as mp:
+            mp.setattr(SDC, "control_damage_tables", flaky)
+            assert run_stages(cfg, limits, ["D"], mb=mb_, **kw)["D"]["status"] == "error"
+        assert sorted(p.name for p in (rd / "_resume").glob("*.pkl")) == ["damage_ctl_00000.pkl"]
+
+    def restart(mb_, **extra) -> dict:
+        assert run_stages(cfg, limits, ["D"], mb=mb_, **kw, **extra)["D"]["status"] == "ok"
+        pd.testing.assert_frame_equal(pd.read_csv(rd / "damage_ctl.csv"), ref, check_exact=True)
+        assert not (rd / "_resume").exists()
+        return read_manifest(rd)
+
+    interrupted(mb)
+    assert restart(mb)["resumed_checkpoints"] == 1                # same platform and code: resumed
+    interrupted(mb)
+    with monkeypatch.context() as mp:                            # another torch: refused unless allowed, then fresh
+        mp.setattr(torch, "__version__", "0.0.1+other")
+        assert SDC.run_platform(mb)["torch"] == "0.0.1+other"
+        m = restart(mb, d_allow_platform_mismatch=True)
+    assert m["resumed_checkpoints"] == 0
+    assert m["platform_mismatch"] == [f"torch 0.0.1+other instead of {torch.__version__} (main run)"]
+    sdpa = load_model(replace(mb.spec, attn_implementation="sdpa"))
+    assert SDC.run_platform(sdpa)["attn"] == "sdpa" and SDC.run_platform(mb)["attn"] == "eager"
+    assert SDC.attn_implementation(sdpa) == "sdpa" and SDC.run_platform(mb)["device"] == "cpu" and SDC.gpu_name(mb) == ""
+    interrupted(sdpa)                                            # started with another attention kernel
+    assert restart(mb)["resumed_checkpoints"] == 0
+    interrupted(mb)
+    with monkeypatch.context() as mp:                            # another code version
+        mp.setattr(SDC, "git_sha", lambda *a, **k: "f" * 40)
+        assert restart(mb)["resumed_checkpoints"] == 0
 
 
 def test_default_stage_d_injections_unchanged(mb, tok, depth_bank):
@@ -340,7 +479,10 @@ def test_default_stage_d_injections_unchanged(mb, tok, depth_bank):
 # --------------------------------------------------------------------------------------
 def test_cli_control_run_and_refusals(mb, depth_bank, tmp_path):
     """``--d-control`` / ``--d-main-run`` reach the control run (``<out>/D/<model>@<rev>``); wrong
-    combinations and the main run's root as ``--out`` stop before the model is loaded."""
+    combinations, the main run's root as ``--out``, a selection without a test formulation and a
+    main run on other torch / transformers versions stop before the model is loaded and before
+    anything is created; ``--d-allow-platform-mismatch`` (only with ``--d-control``) runs anyway
+    and records the differences."""
     main = _write_main_run(RunDir(tmp_path / "LSNE" / "runs", "D", mb.spec).path, mb, depth_bank)
     before = _snapshot(main)
     ctl_root = tmp_path / "LSNE" / "runs_ctl"
@@ -349,30 +491,81 @@ def test_cli_control_run_and_refusals(mb, depth_bank, tmp_path):
     ctl = ["--d-control", "token_language", "--d-main-run", str(main)]
     for argv, match in ((["--stage", "D", "--out", str(ctl_root), "--d-control", "token_language"], "go together"),
                         (["--stage", "D", "--out", str(ctl_root), "--d-main-run", str(main)], "go together"),
+                        (["--stage", "D", "--out", str(ctl_root), "--d-allow-platform-mismatch"],
+                         "belongs to a stage-D control"),
+                        (["--stage", "D", "--out", str(ctl_root), "--d-main-run", str(main), "--d-allow-platform-mismatch"],
+                         "belongs to a stage-D control"),
                         (["--stage", "D,E", "--out", str(ctl_root)] + ctl, "stage D alone"),
                         (["--stage", "D", "--out", str(tmp_path / "LSNE" / "runs")] + ctl, "main stage-D run directory"),
                         (["--stage", "D", "--out", str(main)] + ctl, "lies inside the main stage-D run directory"),
                         (["--stage", "D", "--out", str(tmp_path / "LSNE")] + ctl, "holds it"),
-                        (["--stage", "D", "--out", str(tmp_path / "LSNE_B" / "runs")] + ctl, "is a runs folder")):
+                        (["--stage", "D", "--out", str(tmp_path / "LSNE_B" / "runs")] + ctl, "is a runs folder"),
+                        (["--stage", "D", "--out", str(ctl_root), "--families", "DEV01"] + ctl, "no test formulation")):
         with pytest.raises(SystemExit, match=match):
             cli_main(base + argv)
     with pytest.raises(SystemExit):                                          # argparse: not a known control
         cli_main(base + ["--stage", "D", "--out", str(ctl_root), "--d-control", "tokens", "--d-main-run", str(main)])
-    assert not ctl_root.exists() and _snapshot(main) == before
+    assert not ctl_root.exists() and not (tmp_path / "LSNE_B").exists() and _snapshot(main) == before
 
     assert cli_main(base + ["--stage", "D", "--out", str(ctl_root)] + ctl) == 0
     rd = ctl_root / "D" / main.name
     m = read_manifest(rd)
     assert m["status"] == "ok" and m["control"] == "token_language" and m["main_run"]["path"] == str(main.resolve())
+    assert m["platform_mismatch"] == [] and m["eval_code_sha256"] == _eval_code_sha256()
     d = pd.read_csv(rd / "damage_ctl.csv")
     assert set(d["tag"]) == {f"{FAMILY}A:K0:C1", f"{FAMILY}A:K8:C1", f"{FAMILY}A:K2:u9D"}
     assert set(d["inject"]) == {"u9", "u10"} and (d["inject_token"] == ".").all()
     assert _snapshot(main) == before
 
+    # a main run on other transformers: refused before anything is created; run with the flag and recorded
+    other = _write_main_run(RunDir(tmp_path / "LSNE_old" / "runs", "D", mb.spec).path, mb, depth_bank,
+                            transformers_version="4.0.0")
+    other_root = tmp_path / "LSNE_old" / "runs_ctl"
+    argv = base + ["--stage", "D", "--out", str(other_root), "--d-control", "token_language", "--d-main-run", str(other)]
+    with pytest.raises(SystemExit, match=r"refused: .*transformers \S+ instead of 4\.0\.0 \(main run\).*"
+                                         r"--d-allow-platform-mismatch"):
+        cli_main(argv)
+    assert not other_root.exists()
+    assert cli_main(argv + ["--d-allow-platform-mismatch"]) == 0
+    m = read_manifest(other_root / "D" / other.name)
+    assert m["status"] == "ok" and m["replication_platform"]["main_transformers"] == "4.0.0"
+    assert m["platform_mismatch"] == [f"transformers {transformers.__version__} instead of 4.0.0 (main run)"]
+
+
+def test_refusal_in_the_run_leaves_no_empty_run_directory(mb, depth_bank, tmp_path):
+    """A guard that can refuse only after the model is loaded (here: no control variant left at
+    K = 16) leaves no run directory behind: the control run gets it only when it writes there, and
+    an empty one is removed; a directory with anything in it, its parents, links and files stay."""
+    main = _write_main_run(RunDir(tmp_path / "runs", "D", mb.spec).path, mb, depth_bank)
+    cfg = RunConfig(model=mb.spec, families=[f"{FAMILY}A"], out_root=str(tmp_path / "runs_ctl"), k_levels=(16,))
+    limits = C.Limits.smoke(progress=False)
+    kw = dict(d_control="token_language", d_main_run=str(main))
+    rd = RunDir(cfg.out_root, "D", cfg.model, mkdir=False).path
+    rep = run_stages(cfg, limits, ["D"], mb=mb, **kw)
+    assert rep["D"]["status"] == "error" and "no control variant left" in rep["D"]["error"]
+    assert not Path(cfg.out_root).exists()
+    rd.mkdir(parents=True)                                          # an empty run directory from before
+    assert run_stages(cfg, limits, ["D"], mb=mb, **kw)["D"]["status"] == "error"
+    assert not rd.exists() and rd.parent.is_dir()                   # only the run directory itself goes
+    rd.mkdir()
+    (rd / "notes.txt").write_text("keep", encoding="utf-8")
+    assert run_stages(cfg, limits, ["D"], mb=mb, **kw)["D"]["status"] == "error"
+    assert _snapshot(rd) == {"notes.txt": b"keep"}
+    # remove_empty_run_dir: an empty directory only
+    empty, link, file = tmp_path / "empty", tmp_path / "link", tmp_path / "file"
+    empty.mkdir()
+    link.symlink_to(empty, target_is_directory=True)
+    file.write_text("x", encoding="utf-8")
+    assert not SDC.remove_empty_run_dir(link) and link.is_symlink() and empty.is_dir()
+    assert not SDC.remove_empty_run_dir(file) and file.exists()
+    assert not SDC.remove_empty_run_dir(rd) and not SDC.remove_empty_run_dir(tmp_path / "missing")
+    assert SDC.remove_empty_run_dir(empty) and not empty.exists()
+
 
 def test_failed_control_run_restarts_and_refusal_writes_nothing(mb, depth_bank, tmp_path, monkeypatch):
     """A control run that fails after its guards leaves an error manifest with the control marks, so
-    the restart is not refused as a main run; a refused run writes no error manifest at all."""
+    the restart is not refused as a main run; a refused run writes no error manifest at all and
+    creates no run directory (not even an empty one inside the main run's directory)."""
     main = _write_main_run(RunDir(tmp_path / "runs", "D", mb.spec).path, mb, depth_bank)
     before = _snapshot(main)
     cfg = RunConfig(model=mb.spec, families=[f"{FAMILY}A"], out_root=str(tmp_path / "runs_ctl"), limit_variants=3)
@@ -394,7 +587,10 @@ def test_failed_control_run_restarts_and_refusal_writes_nothing(mb, depth_bank, 
     assert run_stages(cfg, limits, ["D"], mb=mb, **kw)["D"]["status"] == "ok"
     assert read_manifest(rd)["status"] == "ok" and not (rd / "error.txt").exists()
     assert not SDC.mark_error_manifest(rd)                         # only an error manifest gets the marks
-    # refused (the main run's root as the output root): no error.txt, no error manifest in the main run
+    # refused (the main run's root as the output root): no error.txt, no error manifest in the main run;
+    # the main run's directory as the output root: no run directory is created inside it
     rep = run_stages(replace(cfg, out_root=str(tmp_path / "runs")), limits, ["D"], mb=mb, **kw)
     assert rep["D"]["status"] == "error" and "main stage-D run directory" in rep["D"]["error"]
-    assert _snapshot(main) == before
+    rep = run_stages(replace(cfg, out_root=str(main)), limits, ["D"], mb=mb, **kw)
+    assert rep["D"]["status"] == "error" and "lies inside the main stage-D run directory" in rep["D"]["error"]
+    assert _snapshot(main) == before and not (main / "D").exists()

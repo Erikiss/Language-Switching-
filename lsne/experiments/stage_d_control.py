@@ -56,11 +56,28 @@ Tables:
                           rows ``P.ctl*``)
 
 Safety: the run refuses (:class:`ControlRunError`, raised before anything is written) to work in
-the main run's directory or inside it, under a root that is a ``runs`` folder, lies in the main
-run's root or holds the main run, or in any directory that holds a stage-D run other than this
-control; to start without an ok main stage-D run of the same model, revision and dtype with its
-depth bank; and to start without a control variant.  Its checkpoints (``_resume``, own signature)
-stay in its own directory.
+the main run's directory or inside it, under a root that is a ``runs`` folder (also through a link
+or ``runs/x/..``), lies in the main run's root or holds the main run, or in any directory that
+holds a stage-D run other than this control; to start without an ok main stage-D run of the same
+model, revision and dtype with its depth bank, with that bank at another site than this model's
+depth site, or without a control variant; and to start when torch or transformers differ from the
+main run's versions (:func:`check_platform`: at eps 0.01 the replication audit 6.11 (b) needs
+bit-identical lambda; ``kw['d_allow_platform_mismatch']`` / ``--d-allow-platform-mismatch`` runs
+anyway and records the differences).  The CLI (``lsne.cli.check_d_control``) applies these guards
+before it loads the model, except two that need the model or its tokenizer: the bank's site and a
+selection whose variants all drop out (K / C levels, section-4 exclusions; a selection without a
+test formulation is refused before the load).  These raise in :func:`run`, still before anything
+is written; the CLI does not create the run directory of a control run (the run creates it when
+it writes), removes it if a refusal leaves it empty (:func:`remove_empty_run_dir`), and records
+the refusal in its run report in ``--out``.  Its checkpoints (``_resume``) stay in its own
+directory; their signature holds the run's inputs, its platform (:func:`run_platform`: torch,
+CUDA, device, GPU, transformers, attention implementation) and the git sha of the code, so a
+restart on another platform or code version starts over instead of mixing chunks of both.
+
+Provenance in the manifest: ``replication_platform`` (:func:`platform_info`), ``platform_mismatch``
+(:func:`check_platform`, [] when none) and ``eval_code_sha256``, the SHA-256 of
+``lsne/prereg_eval.py`` at the time of the run (:func:`eval_code_sha256`): the evaluation code is
+frozen once the control has run, and the evaluation can show that it is that code.
 """
 from __future__ import annotations
 
@@ -75,11 +92,12 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import torch
+import transformers
 
 from .. import stimuli
 from ..config import HookSite, RunConfig
 from ..dynamics import DAMAGE_BATCH_SIZE
-from ..io import MANIFEST_NAME, read_manifest
+from ..io import MANIFEST_NAME, PACKAGE_ROOT, git_sha, read_manifest
 from ..model import ModelBundle
 from . import common as C
 from . import stage_d_noneq as SD
@@ -115,11 +133,17 @@ SITE_RULES = {
 CHECK_COLS = ("tag", "family", "formulation", "K", "C", "step", "problem", "excluded")
 #: Columns ``damage_ctl`` adds to the D1 damage table (placed after ``inject_klass``).
 EXTRA_COLS = ("inject_token_id", "site_gap")
+#: Software compared with the main run (:func:`platform_mismatches`): name -> field of its manifest
+#: (:func:`lsne.io.environment_info`).
+PLATFORM_FIELDS = {"torch": "torch_version", "transformers": "transformers_version"}
+#: The evaluation code of the control (``lsne/prereg_eval.py``; manifest ``eval_code_sha256``).
+EVAL_CODE = Path(__file__).resolve().parent.parent / "prereg_eval.py"
 
 
 class ControlRunError(ValueError):
     """A stage-D control run that must not start.  Raised before anything is written into the
-    run directory, which may hold a main stage-D run (the CLI then leaves it untouched)."""
+    run directory, which may hold a main stage-D run: the CLI then leaves it untouched (and
+    removes it only when it is empty, :func:`remove_empty_run_dir`)."""
 
 
 # --------------------------------------------------------------------------------------
@@ -154,7 +178,9 @@ def check_run_dir(run_dir, main_dir, out_root=None) -> None:
     ``directions_depth.npz`` (a main stage-D run writes it before its checkpoints and its manifest,
     so an interrupted main run is recognised too).  With ``out_root`` (``--out``, the root of
     ``run_dir``) also a root that is a ``runs`` folder (a main-run root, of this account or
-    another), lies inside the main run's root or holds the main run.  Reads only."""
+    another; by its name or by the name it resolves to, so a link to a ``runs`` folder or
+    ``runs/x/..`` counts), lies inside the main run's root or holds the main run (paths resolved,
+    the main run's too).  Reads only."""
     rd, md = Path(os.fspath(run_dir)), Path(os.fspath(main_dir))
     if _same_dir(rd, md):
         raise ControlRunError(f"the control run directory {rd} is the main stage-D run directory; "
@@ -164,8 +190,9 @@ def check_run_dir(run_dir, main_dir, out_root=None) -> None:
                               f"give the control run its own root (--out .../runs_ctl)")
     if out_root is not None:
         root = Path(os.fspath(out_root))
-        main_root = md.parent.parent if md.parent.name == "D" else md          # <main root>/D/<model>@<revision>
-        if root.name == "runs" or _inside(root, main_root) or _inside(md, root):
+        mdr = md.resolve()
+        main_root = mdr.parent.parent if mdr.parent.name == "D" else mdr          # <main root>/D/<model>@<revision>
+        if "runs" in (root.name, root.resolve().name) or _inside(root, main_root) or _inside(md, root):
             raise ControlRunError(f"the control run root {root} is a runs folder, lies inside the root of the main stage-D "
                                   f"run {md} or holds it; give the control run its own root (--out .../runs_ctl)")
     if (rd / MANIFEST_NAME).exists():
@@ -183,12 +210,70 @@ def check_run_dir(run_dir, main_dir, out_root=None) -> None:
                               f"its checkpoints); a control run never writes there")
 
 
+def remove_empty_run_dir(run_dir) -> bool:
+    """Remove ``run_dir`` if it is an empty directory (not a link): all that a refused control run
+    may leave behind (:class:`ControlRunError`).  A directory with anything in it, a link, a file
+    and the parent directories stay untouched.  True when it was removed."""
+    d = Path(os.fspath(run_dir))
+    try:
+        if d.is_symlink() or not d.is_dir() or any(d.iterdir()):
+            return False
+        d.rmdir()
+    except OSError:
+        return False
+    return True
+
+
+def platform_mismatches(main_manifest: dict) -> list[str]:
+    """One readable string per difference between this run's software and the main stage-D run's,
+    e.g. ``"torch 2.12.0+cu130 instead of 2.11.0+cu130 (main run)"``; [] when there is none.
+    Compared (:data:`PLATFORM_FIELDS`): ``torch.__version__`` with the main manifest's
+    ``torch_version`` and ``transformers.__version__`` with its ``transformers_version``, each
+    only when the main manifest has the field (a missing or empty one compares nothing).  The GPU
+    type cannot be compared: the main manifest records none."""
+    m = main_manifest if isinstance(main_manifest, dict) else {}
+    here = dict(torch=str(torch.__version__), transformers=str(transformers.__version__))
+    out: list[str] = []
+    for name, key in PLATFORM_FIELDS.items():
+        main = m.get(key)
+        if main is not None and str(main) != "" and here[name] != str(main):
+            out.append(f"{name} {here[name]} instead of {main} (main run)")
+    return out
+
+
+def check_platform(main_manifest: dict, allow: bool) -> list[str]:
+    """:func:`platform_mismatches` of the main run's manifest (manifest ``platform_mismatch``);
+    :class:`ControlRunError` naming them unless ``allow`` (``--d-allow-platform-mismatch``,
+    ``kw['d_allow_platform_mismatch']``).  At eps 0.01 the replication audit of 6.11 (b)
+    (|dlam| <= 1e-3 at ``u9`` / C1) asks in practice for bit-identical lambda: another attention
+    kernel alone (eager vs sdpa) moved lambda by up to 1.8e-2 on pythia-160m (25 of 32 rows above
+    1e-3), and another torch or transformers build changes the kernels and their round-off."""
+    diffs = platform_mismatches(main_manifest)
+    if diffs and not allow:
+        raise ControlRunError(
+            f"the software of this run differs from the main stage-D run's: {'; '.join(diffs)}. The replication audit of "
+            f"PREREGISTRATION 6.11 (b) (|dlam| <= 1e-3 at the pre-registered site, eps 0.01) needs bit-identical lambda, "
+            f"which another version does not give: install the main run's versions, or pass --d-allow-platform-mismatch "
+            f"to run anyway (the differences are recorded in the manifest's platform_mismatch)")
+    return diffs
+
+
 def file_sha256(path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for block in iter(lambda: f.read(1 << 20), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def eval_code_sha256() -> str:
+    """Manifest ``eval_code_sha256``: SHA-256 (hex) of the bytes of ``lsne/prereg_eval.py``
+    (:data:`EVAL_CODE`, next to this package's modules) now, '' if the file cannot be read.  The
+    evaluation code is frozen once the control has run; this records which code that is."""
+    try:
+        return file_sha256(EVAL_CODE)
+    except OSError:
+        return ""
 
 
 def load_main_bank(main_dir) -> C.DirectionBank:
@@ -282,6 +367,16 @@ def control_formulations(cfg: RunConfig) -> list[str]:
             if f.kind == "standard" and C.prereg_split(f.family_id, f.formulation) == "test"]
 
 
+def check_formulations(cfg: RunConfig) -> list[str]:
+    """:func:`control_formulations` of ``cfg``; :class:`ControlRunError` when there is none (no
+    control variant possible).  Needs no model: the CLI checks it before it loads one."""
+    tags = control_formulations(cfg)
+    if not tags:
+        raise ControlRunError(f"no test formulation (F01-F12 x A, B) among the selected families "
+                              f"({', '.join(map(str, cfg.families)) if cfg.families else 'all'}): no control variant")
+    return tags
+
+
 def design_filters(cfg: RunConfig, main_cfg: Optional[dict] = None) -> list[str]:
     """The settings of ``cfg`` that narrow the control design, every test formulation the main run
     selects x every cell (``main_cfg``: the ``cfg`` of the main run's manifest; None: the whole
@@ -327,11 +422,9 @@ def control_variants(cfg: RunConfig, mb: ModelBundle, ctx: Optional[dict] = None
     variants as a main run limited alike.  ``checks`` (``damage_ctl_checks``,
     :data:`CHECK_COLS`): the regular check rows of the control set (as the regular builder's,
     also of variants its limit drops) and one row per ``u9D`` variant built or excluded.
-    :class:`ControlRunError` when no test formulation is selected or no variant is left."""
-    tags = control_formulations(cfg)
-    if not tags:
-        raise ControlRunError(f"no test formulation (F01-F12 x A, B) among the selected families "
-                              f"({', '.join(map(str, cfg.families)) if cfg.families else 'all'}): no control variant")
+    :class:`ControlRunError` when no test formulation is selected (:func:`check_formulations`)
+    or no variant is left."""
+    tags = check_formulations(cfg)
     cfg = replace(cfg, families=tags)
     variants, checks = C.get_variants(cfg, mb, ctx)
     keep = [v for v in variants if not C.is_original(v) and in_control_set(v.family_id, v.formulation, v.K, v.C)]
@@ -409,17 +502,43 @@ def control_damage_tables(mb: ModelBundle, variants, bank: C.DirectionBank, dir_
     return damage, profile
 
 
-def platform_info(mb: ModelBundle, main_manifest: dict) -> dict:
-    """Manifest ``replication_platform``: torch / CUDA build and device of this run next to the main
-    run's torch version and OS (``main_platform``; this run's OS is the manifest's own ``platform``).
-    The replication of the primary site is exact on the same platform; another build changes
-    round-off, and lambda at the smallest dose moves by up to ~5e-3 under round-off-level input
-    changes (pythia-160m, measured on CPU), which is above the 1e-3 bound of the audit."""
-    gpu = ""
+def gpu_name(mb: ModelBundle) -> str:
+    """Name of the CUDA device the model runs on ('' on a CPU or without CUDA)."""
     if mb.device.type == "cuda" and torch.cuda.is_available():
-        gpu = torch.cuda.get_device_name(mb.device)
-    return dict(torch=str(torch.__version__), cuda=str(torch.version.cuda or ""), device=str(mb.device), gpu=gpu,
-                main_torch=str(main_manifest.get("torch_version", "")), main_platform=str(main_manifest.get("platform", "")))
+        return str(torch.cuda.get_device_name(mb.device))
+    return ""
+
+
+def attn_implementation(mb: ModelBundle) -> str:
+    """Attention implementation of the loaded model: its config's ``_attn_implementation`` (what
+    the forward pass uses), else ``mb.spec.attn_implementation``; '' if unknown."""
+    impl = getattr(getattr(mb.model, "config", None), "_attn_implementation", None)
+    if not impl:
+        impl = getattr(mb.spec, "attn_implementation", None)
+    return str(impl or "")
+
+
+def run_platform(mb: ModelBundle) -> dict:
+    """The platform of this run in the resume signature (:func:`run`): ``torch``, ``cuda`` (build),
+    ``device`` (type), ``gpu`` (:func:`gpu_name`), ``transformers`` and ``attn``
+    (:func:`attn_implementation`).  Each of them changes the round-off of lambda beyond the 1e-3 of
+    the replication audit, so checkpoints of another platform are never resumed."""
+    return dict(torch=str(torch.__version__), cuda=str(torch.version.cuda or ""), device=str(mb.device.type),
+                gpu=gpu_name(mb), transformers=str(transformers.__version__), attn=attn_implementation(mb))
+
+
+def platform_info(mb: ModelBundle, main_manifest: dict) -> dict:
+    """Manifest ``replication_platform``: torch / CUDA build, device, GPU and transformers of this
+    run next to the main run's torch, transformers and OS (``main_torch``, ``main_transformers``,
+    ``main_platform``; this run's OS is the manifest's own ``platform``; the main manifest records
+    no GPU).  The replication of the primary site is exact on the same platform; another build
+    changes round-off, and lambda at the smallest dose moves by up to ~5e-3 under round-off-level
+    input changes and by up to 1.8e-2 with another attention kernel (pythia-160m, measured on
+    CPU), both above the 1e-3 bound of the audit (:func:`check_platform`)."""
+    return dict(torch=str(torch.__version__), cuda=str(torch.version.cuda or ""), device=str(mb.device), gpu=gpu_name(mb),
+                transformers=str(transformers.__version__), main_torch=str(main_manifest.get("torch_version", "")),
+                main_transformers=str(main_manifest.get("transformers_version", "")),
+                main_platform=str(main_manifest.get("platform", "")))
 
 
 def control_contrasts(damage: pd.DataFrame) -> pd.DataFrame:
@@ -434,11 +553,16 @@ def control_contrasts(damage: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------------------
 def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFrame]:
     """The control run (see the module notes): ``kw['d_control']`` must be ``"token_language"``,
-    ``kw['d_main_run']`` the main stage-D run directory.  Every guard (:func:`check_control`,
-    :func:`check_run_dir`, :func:`main_run_inputs`, the bank's site) raises
+    ``kw['d_main_run']`` the main stage-D run directory, ``kw['d_allow_platform_mismatch']``
+    (default False) lets it run on other torch / transformers versions than the main run's.
+    Every guard (:func:`check_control`, :func:`check_run_dir`, :func:`main_run_inputs`,
+    :func:`check_platform`, the bank's site, :func:`control_variants`) raises
     :class:`ControlRunError` before anything is written.  Resumable like stage D in
-    ``<run_dir>/_resume`` (own signature, chunks of
-    :data:`~lsne.experiments.common.RESUME_CHUNK` variants; ``kw['resume']=False`` disables it)."""
+    ``<run_dir>/_resume`` (chunks of :data:`~lsne.experiments.common.RESUME_CHUNK` variants;
+    ``kw['resume']=False`` disables it); the signature holds the run's inputs, its platform
+    (:func:`run_platform`) and the git sha of the code (:func:`lsne.io.git_sha`), so the
+    checkpoints of a run on another platform or code version are discarded
+    (:class:`~lsne.experiments.common.Resume`), never mixed with this run's chunks."""
     t0 = time.perf_counter()
     control = check_control(kw.get("d_control"))
     main_dir = kw.get("d_main_run")
@@ -446,6 +570,7 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
         raise ControlRunError("the control run needs the main stage-D run directory (kw['d_main_run'], --d-main-run)")
     check_run_dir(run_dir, main_dir, cfg.out_root)
     main = main_run_inputs(cfg, main_dir)
+    mismatch = check_platform(main["manifest"], bool(kw.get("d_allow_platform_mismatch", False)))
     dsite = C.depth_site(mb)
     dbank = main["bank"]
     if dbank.site != dsite:
@@ -454,13 +579,14 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
     lattice_dirs, doses, batch = main["lattice_dirs"], main["doses"], main["batch_size"]
     limits = replace(C.get_limits(cfg, kw), damage_batch_size=batch)     # the manifest records the layout used
     variants, checks = control_variants(cfg, mb, kw.get("ctx"))
+    chunk = int(C.RESUME_CHUNK)
     sig = C.resume_signature(stage="D_ctl", version=RESUME_VERSION, tags=[v.tag for v in variants],
                              model=mb.spec.tag(), dtype=mb.spec.dtype, depth_site=dsite.key, bank=main["bank_sha256"],
                              lattice_dirs=lattice_dirs, doses=doses, batch_size=batch, sites=SITE_RULES,
-                             chunk=C.RESUME_CHUNK)
+                             chunk=chunk, platform=run_platform(mb), git_sha=git_sha(PACKAGE_ROOT) or "")
     res = C.Resume(run_dir, sig, enabled=bool(kw.get("resume", True)))
     damage, profile = res.chunked("damage_ctl", variants, lambda vs: control_damage_tables(
-        mb, vs, dbank, lattice_dirs, doses, enabled=limits.progress, batch_size=batch))
+        mb, vs, dbank, lattice_dirs, doses, enabled=limits.progress, batch_size=batch), chunk=chunk)
     tables = {"damage_ctl": damage, "damage_ctl_profile": profile, "damage_ctl_checks": checks,
               "damage_ctl_contrasts": control_contrasts(damage)}
     mm = main["manifest"]
@@ -476,6 +602,7 @@ def run(cfg: RunConfig, mb: ModelBundle, run_dir, **kw) -> dict[str, pd.DataFram
                          design_filters=design_filters(cfg, mm.get("cfg")),
                          n_excluded=int(checks["excluded"].astype(bool).sum()) if len(checks) else 0,
                          resumed_checkpoints=len(res.loaded), audit=C.audit_summary(damage),
-                         replication_platform=platform_info(mb, mm))
+                         replication_platform=platform_info(mb, mm), platform_mismatch=mismatch,
+                         eval_code_sha256=eval_code_sha256())
     res.clear()
     return out

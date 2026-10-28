@@ -3,16 +3,23 @@
 Tiny synthetic run directories with the real table schemas of the stages (column lists
 taken from the stage code) check the primary statistic (C1 restriction, K=0 reference,
 rand DiD, monotonicity, the D1 audit), the token-language control of PREREGISTRATION 6.11
-(three worlds of the control run, its audits, its key ``D_ctl`` and its gate on P), the
-family-mean cluster bootstrap, the test split (F01-F12 x {A, B}), the constant-series rule of
-contrast 10 (ii), the BH grouping over the secondary group, the G0 gate, the selection of runs
-under several roots (two accounts, a parent folder, superseded and failed runs) and the
-handling of missing stages and tables.  Everything runs on CPU without a model.
+(three worlds of the control run, its audits down to the (direction, dose) pairs inside the
+cells, the same audits for notebook 14 (``control_audits_for``), its key ``D_ctl``, the choice
+of a valid one among several control runs, and its gate on P), the family-mean cluster
+bootstrap, the test split (F01-F12 x {A, B}), the constant-series rule of contrast 10 (ii), the
+BH grouping over the secondary group, the G0 gate, the selection of runs under several roots
+(two accounts, a parent folder, superseded and failed runs), the handling of missing stages and
+tables, the version of the evaluation code in its outputs and the archive of an earlier report.
+Everything runs on CPU without a model.
 """
 from __future__ import annotations
 
+import hashlib
+import io
 import json
+import os
 import zlib
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -542,8 +549,15 @@ def test_token_control_wechsel_leaves_p_unchanged(tmp_path):
         assert df.loc[a, "verdict"] == "supported" and df.loc[a, "role"] == "audit", a
     assert df.loc["audit.D1ctl.rep", "estimate"] == 0.0
     assert df.loc["audit.D1ctl.rep", "n_rows"] == int(((ctl["inject"] == "u9") & (ctl["C"] == "C1")).sum())
+    site = df.loc["audit.D1ctl.site", "deviation_note"]
+    assert df.loc["audit.D1ctl.site", "estimate"] == 0.0
+    assert "lam not finite: 0, duplicate (tag, site, direction, eps): 0, outside the control cells: 0)" in site
+    assert "cells of the design missing: 0 of 360" in site                     # the excluded u9D variant is excused
+    assert "(tag, site) of the design without exactly the 12 (direction, eps) pairs of u9 / K=0 / C1 (finite lam): 0 of 359" in site
+    assert "used instead" not in " ".join(res["runs"]["note"].astype(str))    # one control run: nothing to choose
     # caveats: the control rows carry the control's caveat, P its reworded one
     assert PE.caveat_keys("P.ctl1.lang.K8@0.05") == ["P.ctl"] and PE.endpoint_key("P.ctl2@0.05") == "P.ctl"
+    assert "1 token before the shared tail instead of 8-12 (confirmation set;" in PE.CAVEATS["P.ctl"]
     assert PE.CAVEATS["P.ctl"] in s["deviation_note"] and PE.CAVEATS["P"] not in s["deviation_note"]
     assert PE.CAVEATS["P"] in p["deviation_note"] and 'the same "."' in PE.CAVEATS["P"]
     md = PE.markdown_report(res)
@@ -700,18 +714,8 @@ def _edit_first(x: pd.DataFrame, mask: pd.Series, col: str, value=None, add=None
     return x
 
 
-def _drop_first(x: pd.DataFrame, mask: pd.Series) -> pd.DataFrame:
-    """A copy of ``x`` without the first row in ``mask``."""
-    return x.drop(index=x.index[mask.to_numpy()][0])
-
-
-def _f05_u9_c1(x: pd.DataFrame) -> pd.Series:
-    """The pre-registered site (u9, C1) of family F05 at the exploratory dose 0.5 (no P.ctl row reads it)."""
-    return (x["inject"] == "u9") & (x["C"] == "C1") & (x["family"] == "F05") & (x["eps"] == 0.5)
-
-
 #: One broken validity condition of 6.11 per case: (audit row, change of damage_ctl, manifest fields,
-#: text of the audit note).
+#: text of the audit note); every other audit passes.
 CTL_BREAKS = {
     "write": ("audit.D1ctl", lambda x: _edit_first(x, x["inject"] == "u10", "audit_rel_err", 2e-4), {},
               "rows > 1e-4: 1 of"),
@@ -719,16 +723,40 @@ CTL_BREAKS = {
                                                                  "lam", add=0.002), {}, "|difference| > 1e-3 or not finite: 1"),
     "replication_pos": ("audit.D1ctl.rep", lambda x: _edit_first(x, (x["inject"] == "u9") & (x["K"] == 0), "inject_pos", add=1),
                         {}, "different inject_pos: 1"),
-    # a control row whose tag the main run does not have / a row of P without its control row
-    "replication_missing": ("audit.D1ctl.rep", lambda x: _edit_first(x, _f05_u9_c1(x), "tag", "F05A:K0:C1x"), {},
-                            "missing in the main run: 1"),
-    "replication_uncovered": ("audit.D1ctl.rep", lambda x: _drop_first(x, _f05_u9_c1(x)), {},
-                              "in the confirmation set without a control row: 1 of"),
-    # a row outside the cells of the design / a cell of the design without rows
+    # a control variant whose tag the main run does not have (all its rows at u9: the site audit sees a complete variant) /
+    # rows of P without their control row (a direction left out everywhere: every (tag, site) still holds exactly the
+    # (direction, dose) pairs of u9 / K=0 / C1, so only the replication audit sees it)
+    "replication_missing": ("audit.D1ctl.rep",
+                            lambda x: x.assign(tag=x["tag"].mask((x["tag"] == "F05A:K0:C1") & (x["inject"] == "u9"), "F05A:K0:C1x")),
+                            {}, "missing in the main run: 12"),
+    "replication_uncovered": ("audit.D1ctl.rep", lambda x: x[x["direction"] != "rand_03"], {},
+                              "in the confirmation set without a control row: 192 of 1152"),
+    # a row outside the cells of the design / a cell of the design without rows / a K=0 row of another C level (it would
+    # enter the K=0 reference at u9)
     "site_cell": ("audit.D1ctl.site", lambda x: _edit_first(x, (x["inject"] == "u9") & (x["C"] == "C2"), "C", "seg"), {},
                   "outside the control cells: 1)"),
     "site_design_cell": ("audit.D1ctl.site", lambda x: x[x["tag"] != "F03B:K4:C3"], {},
                          "cells of the design missing: 1 of 360 (24 formulations of the confirmation set, e.g. F03B K=4 C3 at u9)"),
+    "site_k0_cell": ("audit.D1ctl.site", lambda x: pd.concat([x, x[(x["tag"] == "F04A:K0:C1") & (x["inject"] == "u9")
+                                                                   & (x["direction"] == "lang_dom") & (x["eps"] == 0.05)]
+                                                              .assign(tag="F04A:K0:C2", C="C2", lam=0.9)], ignore_index=True),
+                     {}, "outside the control cells: 1)"),
+    # gaps inside the cells (review finding eval-2): a dose of one u10 cell, a direction at every u10 row, the lang_dom
+    # rows of one formulation, a lam that is not finite (dropped silently by the finite filter of the statistic)
+    "site_dose": ("audit.D1ctl.site", lambda x: x[~((x["tag"] == "F03A:K8:C1") & (x["inject"] == "u10") & (x["eps"] == 0.05))],
+                  {}, "(tag, site) of the design without exactly the 12 (direction, eps) pairs of u9 / K=0 / C1 (finite lam): 1 of 360 "
+                      "(pairs missing: 6, not in the reference: 0; e.g. F03A:K8:C1 at u10)"),
+    "site_direction": ("audit.D1ctl.site", lambda x: x[~((x["inject"] == "u10") & (x["direction"] == "rand_03"))], {},
+                       "(finite lam): 96 of 360 (pairs missing: 192, not in the reference: 0;"),
+    "site_lang_dom": ("audit.D1ctl.site", lambda x: x[~((x["tag"] == "F03A:K8:C1") & (x["inject"] == "u10")
+                                                       & (x["direction"] == "lang_dom"))], {},
+                      "(finite lam): 1 of 360 (pairs missing: 2, not in the reference: 0; e.g. F03A:K8:C1 at u10)"),
+    "site_nan": ("audit.D1ctl.site", lambda x: _edit_first(x, (x["family"] == "F03") & (x["inject"] == "u9") & (x["C"] == "C2")
+                                                           & (x["direction"] == "lang_dom") & (x["eps"] == 0.05), "lam", np.nan),
+                 {}, "lam not finite: 1,"),
+    "site_duplicate": ("audit.D1ctl.site", lambda x: pd.concat([x, x[(x["tag"] == "F06B:K8:C3") & (x["direction"] == "rand_01")]
+                                                               .assign(lam=0.9)], ignore_index=True), {},
+                       "duplicate (tag, site, direction, eps): 2,"),
     "site_token": ("audit.D1ctl.site", lambda x: _edit_first(x, x["inject"] == "u10", "inject_token", ","), {},
                    "token != '.': 1,"),
     "site_language": ("audit.D1ctl.site", lambda x: _edit_first(x, (x["inject"] == "u9") & (x["C"] == "C3"), "inject_lang", "D"),
@@ -743,19 +771,27 @@ CTL_BREAKS = {
 @pytest.mark.parametrize("case", sorted(CTL_BREAKS))
 def test_a_failed_control_audit_invalidates_the_control_and_caps_p(tmp_path, case):
     """6.11 validity: a write audit over 1e-4, a replication off by more than 1e-3 or at another
-    position, a site that breaks the token / language / unit / distance rule, or a manifest
-    without the marks (or a smoke run) makes the control run invalid: every P.ctl row is
-    not_interpretable (the rule outcome stays in the note) and P is capped at open."""
+    position, a site that breaks the token / language / unit / distance rule, a cell, a dose, a
+    direction or a lang_dom row missing inside the design, a lam that is not finite, a duplicate
+    row, or a manifest without the marks (or a smoke run) makes the control run invalid: every
+    P.ctl row is not_interpretable (the rule outcome stays in the note) and P is capped at open.
+    control_audits_for (notebook 14) gives the same audit rows."""
     audit, brk, man, text = CTL_BREAKS[case]
     dmg = damage_table()
-    write_run(tmp_path / "runs", "D", {"damage": dmg})
-    write_ctl_run(tmp_path / "runs_ctl", brk(damage_ctl_table(dmg, "wechsel")), **man)
+    main = write_run(tmp_path / "runs", "D", {"damage": dmg})
+    ctl_dir = write_ctl_run(tmp_path / "runs_ctl", brk(damage_ctl_table(dmg, "wechsel")), **man)
     df = PE.evaluate([tmp_path / "runs", tmp_path / "runs_ctl"], n_boot=200)["results"].set_index("id")
     audits = df[df.index.str.startswith("audit.D1ctl")]
     assert len(audits) == 4 and set(audits.index[audits["verdict"] != "supported"]) == {audit}
-    assert df.loc[audit, "verdict"] == "not_supported" and text in df.loc[audit, "deviation_note"]
+    assert df.loc[audit, "verdict"] == "not_supported" and text in df.loc[audit, "deviation_note"], df.loc[audit, "deviation_note"]
     if case == "replication_lam":
         assert df.loc[audit, "estimate"] == pytest.approx(0.002)
+    if case == "site_nan":                                     # the row breaks a rule and its (tag, site) lacks a pair
+        assert df.loc[audit, "estimate"] == 2.0 and "(finite lam): 1 of 360 (pairs missing: 1," in df.loc[audit, "deviation_note"]
+    nb14 = {r["id"]: r for r in PE.control_audits_for(main, ctl_dir)}
+    assert list(nb14) == list(PE.CTL_AUDIT_IDS) and not PE.control_valid(nb14.values())
+    for a in PE.CTL_AUDIT_IDS:
+        assert (nb14[a]["verdict"], nb14[a]["deviation_note"]) == (df.loc[a, "verdict"], df.loc[a, "deviation_note"]), a
     rows = df[df.index.str.startswith("P.ctl")]
     assert len(rows) == 18 and (rows["verdict"] == "not_interpretable").all()
     note = rows.loc["P.ctl@0.05", "deviation_note"]
@@ -819,6 +855,190 @@ def test_a_control_run_of_the_whole_design_is_preferred_over_a_narrowed_one(tmp_
     assert PE.StageRun(stage="D", path=a, root=a, manifest=mark).partial
     assert not PE.StageRun(stage="D", path=a, root=a, manifest=dict(mark, design_filters=[])).partial
     assert not PE.StageRun(stage="D", path=a, root=a, manifest=dict(design_filters=["families"])).partial
+
+
+#: The time of a second control run, made after the first (CTL_TIME), e.g. in account B.
+CTL_LATER = "2026-10-29T09:00:00+00:00"
+
+
+def _rep_off(ctl: pd.DataFrame, by: float = 2e-3) -> pd.DataFrame:
+    """``damage_ctl`` whose pre-registered site (u9, C1, K=8) is off by ``by`` from the main run, as
+    on another platform (round-off at the smallest dose exceeds the 1e-3 of 6.11 (b))."""
+    m = (ctl["inject"] == "u9") & (ctl["C"] == "C1") & (ctl["K"] == 8)
+    return ctl.assign(lam=ctl["lam"].where(~m, ctl["lam"] + by))
+
+
+def _ctl_path(parent: Path) -> str:
+    """The control-run directory below a parent folder such as ``MyDrive/LSNE``."""
+    return str(parent / "runs_ctl" / "D" / TAG)
+
+
+def test_a_newer_control_run_that_fails_its_audits_never_displaces_a_valid_one(tmp_path, monkeypatch):
+    """Review finding eval-1: a valid control run in account A and a newer one of the whole design in
+    account B whose replication of the main run is off by 2e-3 (another platform).  select_runs
+    prefers the newer run; the evaluation goes through both in that order and uses the first whose
+    four audits pass (A's), so P keeps its rule outcome (6.11 caps P only without a valid control
+    run).  The runs table, the audit.D1ctl.run note and the evaluation's notes say why; the main
+    run's damage table is read once."""
+    a, b = tmp_path / "LSNE", tmp_path / "LSNE_B"
+    dmg = damage_table()
+    write_run(a / "runs", "D", {"damage": dmg})
+    ctl = damage_ctl_table(dmg)
+    write_ctl_run(a / "runs_ctl", ctl)
+    write_ctl_run(b / "runs_ctl", _rep_off(ctl), timestamp=CTL_LATER)
+    pa, pb = _ctl_path(a), _ctl_path(b)
+    assert str(PE.select_runs(PE.discover_runs([a, b])[0])["D_ctl"].path) == pb      # select_runs alone: the newer run
+    reads = []
+    read = PE.read_table
+    monkeypatch.setattr(PE, "read_table", lambda d, name, columns=None: reads.append((str(d), name)) or read(d, name, columns))
+    res = PE.evaluate([a, b], n_boot=300, seed=1)
+    assert reads.count((str(a / "runs" / "D" / TAG), "damage")) == 1
+    runs = res["runs"].set_index("path")
+    assert runs.loc[pa, "used"] and not runs.loc[pb, "used"]
+    assert (f"newer control run not used: fails audit.D1ctl.rep not_supported (PREREGISTRATION 6.11); the evaluation uses {pa}"
+            in runs.loc[pb, "note"])
+    assert runs.loc[pa, "note"].startswith("used instead of the control run(s) preferred by select_runs that fail their audits: "
+                                          f"{pb} (audit.D1ctl.rep not_supported); the first control run")
+    assert "superseded" not in runs.loc[pa, "note"]
+    df = res["results"].set_index("id")
+    assert (df.loc[list(PE.CTL_AUDIT_IDS), "verdict"] == "supported").all()
+    assert runs.loc[pa, "note"] in df.loc["audit.D1ctl.run", "deviation_note"]
+    assert df.loc["P.ctl@0.05", "verdict"] == "supported" and df.loc["P@0.05", "verdict"] == "supported"
+    assert "Wechsel; rule outcome without the control: supported" in df.loc["P@0.05", "deviation_note"]
+    assert f"control run {pa}: used instead of the control run(s)" in " ".join(res["meta"]["notes"])
+    assert "## Hinweise zu den Wurzelverzeichnissen und zur Auswahl der Läufe" in PE.markdown_report(res)
+    # used alone, account B's run is no valid control
+    alone = PE.evaluate([a / "runs", b], n_boot=300, seed=1)["results"].set_index("id")
+    assert alone.loc["audit.D1ctl.rep", "verdict"] == "not_supported" and alone.loc["P@0.05", "verdict"] == "open"
+
+
+def test_the_newest_valid_control_run_is_used_whatever_its_outcome(tmp_path):
+    """Only the four validity audits choose among control runs, never an outcome or estimate: a
+    newer valid run is used over an older invalid one (select_runs' choice; the older one is not
+    even audited), and over an older valid one whose outcome would leave P unchanged although its
+    own outcome ("lokal") makes P not interpretable."""
+    a, b = tmp_path / "LSNE", tmp_path / "LSNE_B"
+    dmg = damage_table()
+    write_run(a / "runs", "D", {"damage": dmg})
+    pa, pb = _ctl_path(a), _ctl_path(b)
+    write_ctl_run(a / "runs_ctl", _rep_off(damage_ctl_table(dmg)))                       # older, invalid
+    write_ctl_run(b / "runs_ctl", damage_ctl_table(dmg), timestamp=CTL_LATER)            # newer, valid
+    res = PE.evaluate([a, b], n_boot=300, seed=1)
+    runs, df = res["runs"].set_index("path"), res["results"].set_index("id")
+    sel = f"the first of the 2 ok control runs ({PE.CTL_RUN_ORDER}); it passes all four audits (PREREGISTRATION 6.11)"
+    assert runs.loc[pb, "used"] and runs.loc[pb, "note"] == sel and runs.loc[pa, "note"] == f"superseded by the newer run {pb}"
+    assert (df.loc[list(PE.CTL_AUDIT_IDS), "verdict"] == "supported").all()
+    assert df.loc["audit.D1ctl.run", "deviation_note"].endswith(sel) and f"control run {pb}: {sel}" in res["meta"]["notes"]
+    assert df.loc["P@0.05", "verdict"] == "supported"
+    write_ctl_run(a / "runs_ctl", damage_ctl_table(dmg, "wechsel"))                       # older, valid: P unchanged
+    write_ctl_run(b / "runs_ctl", damage_ctl_table(dmg, "lokal"), timestamp=CTL_LATER)   # newer, valid: P not interpretable
+    res = PE.evaluate([a, b], n_boot=300, seed=1)
+    runs, df = res["runs"].set_index("path"), res["results"].set_index("id")
+    assert runs.loc[pb, "used"] and runs.loc[pa, "note"] == f"superseded by the newer run {pb}"
+    assert df.loc["P.ctl@0.05", "verdict"] == "not_supported" and df.loc["P@0.05", "verdict"] == "not_interpretable"
+
+
+def test_without_a_valid_control_run_the_newest_is_evaluated_and_p_is_capped(tmp_path):
+    """No ok control run passes its audits (the older one's replication is off, the newer one lacks
+    a dose in a cell): select_runs' choice, the newest, is evaluated, every P.ctl row is not
+    interpretable and P is at most open; the notes name every failed audit."""
+    a, b = tmp_path / "LSNE", tmp_path / "LSNE_B"
+    dmg = damage_table()
+    write_run(a / "runs", "D", {"damage": dmg})
+    ctl = damage_ctl_table(dmg)
+    pa, pb = _ctl_path(a), _ctl_path(b)
+    write_ctl_run(a / "runs_ctl", _rep_off(ctl))
+    write_ctl_run(b / "runs_ctl", ctl[~((ctl["tag"] == "F03A:K8:C1") & (ctl["inject"] == "u10") & (ctl["eps"] == 0.05))],
+                  timestamp=CTL_LATER)
+    res = PE.evaluate([a, b], n_boot=300, seed=1)
+    runs, df = res["runs"].set_index("path"), res["results"].set_index("id")
+    assert runs.loc[pb, "used"]
+    assert runs.loc[pa, "note"] == f"superseded by the newer run {pb}; fails audit.D1ctl.rep not_supported"
+    sel = ("none of the 2 ok control runs passes all four audits (this one: audit.D1ctl.site not_supported): the one "
+           f"preferred by select_runs ({PE.CTL_RUN_ORDER}) is evaluated, so there is no valid control run (PREREGISTRATION 6.11)")
+    assert runs.loc[pb, "note"] == sel and sel in df.loc["audit.D1ctl.run", "deviation_note"]
+    assert df.loc["audit.D1ctl.site", "verdict"] == "not_supported" and df.loc["audit.D1ctl.rep", "verdict"] == "supported"
+    rows = df[df.index.str.startswith("P.ctl")]
+    assert len(rows) == 18 and (rows["verdict"] == "not_interpretable").all()
+    assert df.loc["P@0.05", "verdict"] == "open"
+    assert "no valid control run; rule outcome without the control: supported" in df.loc["P@0.05", "deviation_note"]
+
+
+def test_narrowed_smoke_or_failed_control_runs_never_displace_a_valid_whole_design_run(tmp_path):
+    """The order of select_runs stays: a newer narrowed (design_filters), smoke or failed control run
+    never displaces a valid run of the whole design, also when the newest run of the whole design
+    fails its audits.  Without a valid run of the whole design, a narrowed run is used only if it
+    passes the audits (it covers every row of P and every cell); a smoke run never passes."""
+    roots = {k: tmp_path / f"LSNE_{k}" for k in "ABCDE"}
+    dmg = damage_table()
+    write_run(roots["A"] / "runs", "D", {"damage": dmg})
+    ctl = damage_ctl_table(dmg)
+    write_ctl_run(roots["A"] / "runs_ctl", ctl)                                                    # whole design, valid
+    write_ctl_run(roots["B"] / "runs_ctl", _rep_off(ctl), timestamp=CTL_LATER)                     # whole design, invalid
+    write_ctl_run(roots["C"] / "runs_ctl", ctl, timestamp="2026-10-30T09:00:00+00:00", design_filters=["limit_variants"])
+    write_ctl_run(roots["D"] / "runs_ctl", ctl, timestamp="2026-10-30T10:00:00+00:00", limits=dict(n_boot=200, is_smoke=True))
+    write_ctl_run(roots["E"] / "runs_ctl", ctl, timestamp="2026-10-30T11:00:00+00:00", status="error")
+    p = {k: _ctl_path(r) for k, r in roots.items()}
+    res = PE.evaluate(list(roots.values()), n_boot=200, seed=1)
+    runs, df = res["runs"].set_index("path"), res["results"].set_index("id")
+    assert [k for k in "ABCDE" if runs.loc[p[k], "used"]] == ["A"]
+    assert runs.loc[p["B"], "note"].startswith("newer control run not used: fails audit.D1ctl.rep not_supported")
+    for k in "CD":
+        assert runs.loc[p[k], "note"] == (f"superseded by {p['A']}, the first control run ({PE.CTL_RUN_ORDER}) that passes all "
+                                          "four audits")
+    assert runs.loc[p["E"], "note"] == "status 'error': not used"
+    assert df.loc["P.ctl@0.05", "verdict"] == "supported" and df.loc["P@0.05", "verdict"] == "supported"
+    # without A's run: the narrowed run C passes its audits (it covers everything) and is used, the smoke run D never
+    res = PE.evaluate([roots["A"] / "runs"] + [roots[k] for k in "BCDE"], n_boot=200, seed=1)
+    runs, df = res["runs"].set_index("path"), res["results"].set_index("id")
+    assert [k for k in "BCDE" if runs.loc[p[k], "used"]] == ["C"]
+    assert runs.loc[p["C"], "note"].startswith(f"used instead of the control run(s) preferred by select_runs that fail their "
+                                               f"audits: {p['B']} (audit.D1ctl.rep not_supported)")
+    assert (df.loc[list(PE.CTL_AUDIT_IDS), "verdict"] == "supported").all()
+    assert "design narrowed by cfg (limit_variants)" in df.loc["audit.D1ctl.run", "deviation_note"]
+    # the smoke run alone with the invalid one: no valid control run, select_runs' choice (B, a full run) is evaluated
+    res = PE.evaluate([roots["A"] / "runs", roots["B"], roots["D"]], n_boot=200, seed=1)
+    runs = res["runs"].set_index("path")
+    assert runs.loc[p["B"], "used"] and "none of the 2 ok control runs passes all four audits" in runs.loc[p["B"], "note"]
+    assert runs.loc[p["D"], "note"] == f"superseded by a full run {p['B']}; fails audit.D1ctl.run not_supported"
+
+
+def test_control_audits_for_reads_two_run_directories_as_the_evaluation(tmp_path):
+    """Notebook 14 prints control_audits_for(main run, control run): the rows the evaluation writes
+    for that pair, by the same code (control_audits), on the same confirmation set.  A missing,
+    unreadable or failed manifest gives not_tested / not_supported rows, never an exception."""
+    dmg = damage_table()
+    main = write_run(tmp_path / "runs", "D", {"damage": dmg})
+    ctl = damage_ctl_table(dmg)
+    ctl_dir = write_ctl_run(tmp_path / "runs_ctl", ctl)
+    rows = PE.control_audits_for(main, ctl_dir)
+    df = PE.evaluate([tmp_path / "runs", tmp_path / "runs_ctl"], n_boot=100)["results"].set_index("id")
+    assert [r["id"] for r in rows] == list(PE.CTL_AUDIT_IDS) and PE.control_valid(rows)
+    for r in rows:
+        e = df.loc[r["id"]]
+        assert (r["verdict"], r["deviation_note"], r["n_rows"], r["source"]) == (e["verdict"], e["deviation_note"], e["n_rows"],
+                                                                                 e["source"]), r["id"]
+        assert r["estimate"] == pytest.approx(e["estimate"], nan_ok=True)
+    site = {r["id"]: r for r in PE.control_audits_for(str(main), str(ctl_dir), families=TEST[:2])}["audit.D1ctl.site"]
+    assert "cells of the design missing: 0 of 60 (4 formulations of the confirmation set)" in site["deviation_note"]
+    # no control run there, an unreadable or a failed manifest, no main run: rows, never an exception
+    gone = {r["id"]: r for r in PE.control_audits_for(main, tmp_path / "nowhere" / "D" / TAG)}
+    assert list(gone) == ["audit.D1ctl", "audit.D1ctl.run"] and gone["audit.D1ctl"]["verdict"] == "not_tested"
+    assert gone["audit.D1ctl.run"]["verdict"] == "not_supported"
+    assert "status 'missing' instead of 'ok'" in gone["audit.D1ctl.run"]["deviation_note"]
+    (ctl_dir / "manifest.json").write_text("{not json", encoding="utf-8")
+    broken = {r["id"]: r for r in PE.control_audits_for(main, ctl_dir)}
+    assert broken["audit.D1ctl.rep"]["verdict"] == "supported" and not PE.control_valid(broken.values())
+    assert "status 'unreadable' instead of 'ok'" in broken["audit.D1ctl.run"]["deviation_note"]
+    write_ctl_run(tmp_path / "runs_ctl", ctl, status="error")
+    failed = {r["id"]: r for r in PE.control_audits_for(main, ctl_dir)}
+    assert failed["audit.D1ctl.run"]["verdict"] == "not_supported"
+    assert "status 'error' instead of 'ok'" in failed["audit.D1ctl.run"]["deviation_note"]
+    write_ctl_run(tmp_path / "runs_ctl", ctl)
+    nomain = {r["id"]: r for r in PE.control_audits_for(tmp_path / "elsewhere" / "D" / TAG, ctl_dir)}
+    assert nomain["audit.D1ctl.rep"]["verdict"] == "not_tested" and "has status 'missing', not 'ok'" in nomain["audit.D1ctl.rep"][
+        "deviation_note"]
+    assert PE.control_audits(PE.EvalContext(tables=PE.Tables({}))) == []
 
 
 def test_a_control_run_older_than_amendment_611_fails_the_run_audit(tmp_path):
@@ -1296,6 +1516,92 @@ def test_missing_stages_are_not_tested_and_outputs_are_written(tmp_path):
     md = (out / "prereg_results.md").read_text(encoding="utf-8")
     assert md.startswith("# Präregistrierte Auswertung") and "## Primärer Endpunkt" in md and "## BH-Gruppierung" in md
     assert (out / "prereg_runs.csv").exists() and json.loads((out / "prereg_meta.json").read_text())["n_boot"] == 50
+
+
+def test_the_evaluation_records_its_code_and_the_run_audit_compares_it(tmp_path):
+    """Review finding CRIT-2: the meta (prereg_meta.json, report header) carries the commit of the
+    checkout and the sha256 of prereg_eval.py; audit.D1ctl.run compares that hash with the control
+    manifest's eval_code_sha256 (the file at control-run time) and shows a platform mismatch the
+    run was computed despite, in its note only: never a verdict."""
+    from lsne import io as lsne_io
+
+    sha = hashlib.sha256(Path(PE.__file__).read_bytes()).hexdigest()
+    assert PE.PREREG_EVAL_SHA256 == sha
+    dmg = damage_table()
+    write_run(tmp_path / "runs", "D", {"damage": dmg})
+    ctl = damage_ctl_table(dmg)
+    roots = [tmp_path / "runs", tmp_path / "runs_ctl"]
+    write_ctl_run(tmp_path / "runs_ctl", ctl, eval_code_sha256=sha, platform_mismatch=[])
+    res = PE.evaluate(roots, n_boot=100)
+    meta = res["meta"]
+    git = lsne_io.git_sha(Path(PE.__file__).resolve().parent.parent)
+    assert meta["prereg_eval_sha256"] == sha and meta["git_sha"] == ("" if git == "unknown" else git)
+    assert PE.code_version() == dict(git_sha=meta["git_sha"], prereg_eval_sha256=sha)
+    assert (f"- Code der Auswertung: Git {meta['git_sha'][:7] or 'unbekannt'}, prereg_eval.py SHA-256 {sha[:12]}"
+            in PE.markdown_report(res))
+    saved = json.loads(PE.write_outputs(res, tmp_path / "out")["meta"].read_text(encoding="utf-8"))
+    assert saved["prereg_eval_sha256"] == sha and saved["git_sha"] == meta["git_sha"]
+    run = res["results"].set_index("id").loc["audit.D1ctl.run"]
+    assert run["verdict"] == "supported" and "platform mismatch" not in run["deviation_note"]
+    assert f"evaluation code identical to the one at control-run time ({sha[:12]})" in run["deviation_note"]
+    other = "0" * 64
+    mismatch = ["torch 2.4.0+cu121 instead of 2.11.0+cu130 (main run)", "transformers 4.46.0 instead of 5.20.2 (main run)"]
+    platform = dict(torch="2.4.0+cu121", cuda="12.1", device="cuda:0", gpu="NVIDIA L4", main_torch="2.11.0+cu130",
+                    main_platform="Linux", transformers="4.46.0", main_transformers="5.20.2")
+    for man, texts in ((dict(eval_code_sha256=other, platform_mismatch=mismatch, replication_platform=platform),
+                        [f"evaluation code differs from the one at control-run time ({other[:12]} vs {sha[:12]}): a change "
+                         "after the control run is a deviation from PREREGISTRATION 6.11",
+                         "platform: torch 2.4.0+cu121, transformers 4.46.0, NVIDIA L4 (main run: torch 2.11.0+cu130, "
+                         "transformers 5.20.2); run computed despite a platform mismatch: torch 2.4.0+cu121 instead of "
+                         "2.11.0+cu130 (main run), transformers 4.46.0 instead of 5.20.2 (main run)"]),
+                       ({}, ["the control manifest records no eval_code_sha256"])):
+        write_ctl_run(tmp_path / "runs_ctl", ctl, **man)
+        df = PE.evaluate(roots, n_boot=100)["results"].set_index("id")
+        for text in texts:
+            assert text in df.loc["audit.D1ctl.run", "deviation_note"]
+        assert (df.loc[list(PE.CTL_AUDIT_IDS), "verdict"] == "supported").all()
+        assert df.loc["P.ctl@0.05", "verdict"] == "supported" and df.loc["P@0.05", "verdict"] == "supported"
+
+
+def test_write_outputs_archives_an_earlier_report(tmp_path):
+    """Review finding CRIT-3: a second evaluation into the same folder first moves the files of the
+    first one to archive/<its timestamp>/ (the reference report of 28.10.2026 07:07 UTC stays byte
+    for byte); an existing archive folder is never reused, and without a readable prereg_meta.json
+    the newest modification time of the files names the folder."""
+    write_run(tmp_path / "runs", "D", {"damage": damage_table()})
+    out = tmp_path / "prereg_eval" / TAG
+    files = list(PE.OUTPUT_FILES.values())
+    first = PE.evaluate([tmp_path / "runs"], n_boot=100, seed=0)
+    first["meta"]["timestamp"] = "2026-10-28T07:07:12+00:00"
+    p1 = PE.write_outputs(first, out)
+    assert p1["archive"] is None and not (out / PE.ARCHIVE_DIR).exists()
+    assert json.loads(p1["meta"].read_text(encoding="utf-8"))["previous_evaluation_archive"] is None
+    old = {n: (out / n).read_bytes() for n in files}
+    second = PE.evaluate([tmp_path / "runs"], n_boot=200, seed=1)
+    p2 = PE.write_outputs(second, out)
+    arch = out / "archive" / "2026-10-28T07-07-12Z"
+    assert p2["archive"] == arch and sorted(p.name for p in arch.iterdir()) == sorted(files)
+    assert {n: (arch / n).read_bytes() for n in files} == old                   # the first report, byte for byte
+    assert {k: v for k, v in p2.items() if k != "archive"} == {k: out / n for k, n in PE.OUTPUT_FILES.items()}
+    meta = json.loads((out / "prereg_meta.json").read_text(encoding="utf-8"))
+    assert meta["n_boot"] == 200 and meta["previous_evaluation_archive"] == str(arch)
+    assert pd.read_csv(out / "prereg_results.csv").equals(pd.read_csv(io.StringIO(second["results"].to_csv(index=False))))
+    # the same evaluation written twice more: the folder of its first copy exists, the second copy gets a suffix
+    stamp = PE._parse_utc(second["meta"]["timestamp"]).strftime("%Y-%m-%dT%H-%M-%SZ")
+    p3, p4 = PE.write_outputs(second, out), PE.write_outputs(second, out)
+    assert (p3["archive"].name, p4["archive"].name) == (stamp, f"{stamp}_2")
+    assert {n: (arch / n).read_bytes() for n in files} == old                   # never touched again
+    # no readable prereg_meta.json: the files' modification time
+    (out / "prereg_meta.json").write_text("{", encoding="utf-8")
+    t = datetime(2026, 10, 28, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    for n in files:
+        os.utime(out / n, (t, t))
+    assert PE.write_outputs(second, out)["archive"].name == "2026-10-28T10-00-00Z"
+    # a timestamp that is no ISO time is made filename-safe
+    m = json.loads((out / "prereg_meta.json").read_text(encoding="utf-8"))
+    (out / "prereg_meta.json").write_text(json.dumps(dict(m, timestamp="28.10.2026 11:15 Uhr")), encoding="utf-8")
+    assert PE.write_outputs(second, out)["archive"].name == "28.10.2026-11-15-Uhr"
+    assert len(list((out / "archive").iterdir())) == 5 and sorted(p.name for p in out.iterdir()) == sorted(files + ["archive"])
 
 
 def test_missing_table_and_error_rows(tmp_path):

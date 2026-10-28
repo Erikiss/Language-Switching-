@@ -14,10 +14,13 @@ one root the newest manifest is used and the others are listed as superseded; st
 into the stand-in run and the trace-source run (``manifest.source.kind == "trace"``), stage D
 into the main run and the token-language control run (``manifest.control ==
 "token_language"``, key ``D_ctl``, PREREGISTRATION 6.11), so a control run never replaces the
-main run (and a control run narrowed by cfg filters never one of the whole design).  Only the
-stages in :data:`EVAL_STAGES` are opened: the scale sweep (stage F and its sub-runs
-``F/<model>@<rev>/shard*/...``) is never touched, so a sweep that is still running is not
-disturbed.
+main run (and a control run narrowed by cfg filters never one of the whole design).  Of several
+ok control runs the first in that order (whole design before narrowed, newest first) whose four
+validity audits pass is used (:func:`select_control_run`; only the audits decide, never an
+outcome), so a newer invalid run, e.g. one made later on another platform, never displaces a
+valid one.  Only the stages in :data:`EVAL_STAGES` are opened: the scale sweep (stage F and its
+sub-runs ``F/<model>@<rev>/shard*/...``) is never touched, so a sweep that is still running is
+not disturbed.
 
 Confirmation set and statistic (PREREGISTRATION sections 1-2): test families F01-F12 x
 formulations {A, B}; per family the mean of the per-formulation quantity, then the mean over
@@ -63,9 +66,13 @@ Endpoints (``id`` column)
               "lokal" makes a supported or open P ``not_interpretable``, "offen" or no valid
               control run caps it at "open".  Validity: ``audit.D1ctl`` (write audit),
               ``audit.D1ctl.rep`` (lam at the pre-registered site within 1e-3 of the main run,
-              and a control row for every row of P), ``audit.D1ctl.site`` (sites and every cell
-              of the design) and ``audit.D1ctl.run`` (manifest marks, run newer than the
-              amendment); a failed audit makes every ``P.ctl*`` row ``not_interpretable``.
+              and a control row for every row of P), ``audit.D1ctl.site`` (sites, every cell of
+              the design, and in every cell the (direction, dose) pairs of the pre-registered
+              site with a finite lam) and ``audit.D1ctl.run`` (manifest marks, run newer than the
+              amendment; its note compares the evaluation code with the one at control-run time);
+              one implementation, :func:`control_audits` (notebook 14 prints the same rows,
+              :func:`control_audits_for`); a failed audit makes every ``P.ctl*`` row
+              ``not_interpretable``.
 ``audit.*``   section 4 run validity: max / quantiles of ``audit_rel_err`` and the number of
               rows > 1e-4 in stage D ``damage`` (``audit.D1``) and stage C ``grid``
               (``audit.C``); a failed D1 audit makes the primary rows ``not_interpretable``.
@@ -81,18 +88,23 @@ Endpoints (``id`` column)
 ``S11``-``S18`` copied from their tables, with the known caveats as deviation notes.
 
 Outputs (``--out``): ``prereg_results.csv`` (one row per endpoint and sub-row, columns
-:data:`RESULT_COLS` + :data:`EXTRA_COLS`), ``prereg_results.md`` (German headings) and
-``prereg_runs.csv`` (every run directory found, used or not, :data:`RUN_COLS`).
+:data:`RESULT_COLS` + :data:`EXTRA_COLS`), ``prereg_results.md`` (German headings),
+``prereg_runs.csv`` (every run directory found, used or not, :data:`RUN_COLS`) and
+``prereg_meta.json`` (settings, BH grouping and the version of the evaluation code: ``git_sha``,
+``prereg_eval_sha256``).  The files of an earlier evaluation in ``--out`` are moved to
+``archive/<its timestamp>/`` first, never overwritten (:func:`write_outputs`).
 """
 from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import re
+import shutil
 import sys
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
@@ -100,7 +112,7 @@ import numpy as np
 import pandas as pd
 
 from .config import DOSES
-from .io import MANIFEST_NAME
+from .io import MANIFEST_NAME, git_sha
 from .stats import bh_correct, bootstrap_p_two_sided, cluster_bootstrap, paired_contrast
 
 # --------------------------------------------------------------------------------------
@@ -136,6 +148,21 @@ ROOT_CHILDREN = ("runs", "runs_trace", "runs_ctl")
 AMENDMENT_611 = dict(id="6.11", commit="2ce9c71f4d0f902fdb504785c4d934b662e46f5b", utc="2026-10-28T08:05:51+00:00")
 #: ``manifest.control`` of that control run (stage D, ``runs_ctl``); such a run is keyed ``D_ctl``.
 CTL_CONTROL = "token_language"
+
+
+def _file_sha256(path) -> str:
+    """sha256 hex of a file's bytes ('' when it cannot be read)."""
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+#: sha256 of this module's source, taken at import (the code that runs): ``prereg_eval_sha256`` of
+#: the evaluation's meta (``prereg_meta.json``, report header); ``audit.D1ctl.run`` compares it with
+#: the control manifest's ``eval_code_sha256`` (these bytes at control-run time), since a change of
+#: the evaluation after the control run is a deviation from PREREGISTRATION 6.11.
+PREREG_EVAL_SHA256: str = _file_sha256(__file__)
 #: Mirrors of the stage constants (tests/test_prereg_eval.py keeps them equal to the stage
 #: modules; this module stays importable without torch).
 PREREG_PATCH_CLASS = "delim"                                       # experiments.common
@@ -172,9 +199,10 @@ CAVEATS: dict[str, str] = {
     "P.dev": ("injection at the last German token (stimuli.last_switched_position), not at the pre-registered "
               "last token of unit 9; K=0 reference at the C1 site, so dlam mixes injection distance and condition"),
     "P.ctl": ("unit-defined sites (the \".\" ending unit 9 / unit 10, common.unit_last_position), not the last German "
-              "token; control 2's site is 1 token before the shared tail instead of 6-14 (distance confound, so it decides "
-              "only together with control 1); control 1 changes C (C2 / C3 move the final switch inside unit 9, before the "
-              "site); directions from the bank of the main stage-D run (directions_depth.npz), no refit"),
+              "token; control 2's site is 1 token before the shared tail instead of 8-12 (confirmation set; distance "
+              "confound, so it decides only together with control 1); control 1 changes C (C2 / C3 move the final switch "
+              "inside unit 9, before the site); directions from the bank of the main stage-D run (directions_depth.npz), "
+              "no refit"),
     "S3": ("R = (logp_patched - logp_mixed) / (logp_mono - logp_mixed) is ill-conditioned for formulations with "
            "|T| ~ 0; the ws class is empty under the GPT-NeoX BPE, so delim = punct + boundary; direction from "
            "DESIGN 4.1 (R_ws+punct+boundary > R_random)"),
@@ -232,12 +260,15 @@ CAVEATS: dict[str, str] = {
 # --------------------------------------------------------------------------------------
 @dataclass
 class StageRun:
-    """One ``<root>/<stage>/<model>@<revision>/`` directory with its manifest."""
+    """One ``<root>/<stage>/<model>@<revision>/`` directory with its manifest.  ``note`` collects
+    what discovery and selection found (runs table); ``selection`` says why a control run was used
+    among several ok ones (:func:`select_control_run`; also in its ``audit.D1ctl.run`` note)."""
     stage: str
     path: Path
     root: Path
     manifest: dict = field(default_factory=dict)
     note: str = ""
+    selection: str = ""
 
     @property
     def kind(self) -> str:
@@ -334,6 +365,27 @@ def resolve_roots(roots: Sequence) -> tuple[list[Path], list[str]]:
     return out, notes
 
 
+def _read_run(path, stage: str = "D", root=None) -> StageRun:
+    """The run in one ``<root>/<stage>/<model>@<revision>`` directory, its ``manifest.json`` read
+    as :func:`discover_runs` reads it: an unreadable manifest gives status ``unreadable``, a
+    missing one status ``missing``, an ok manifest next to an ``error.txt`` a note; ``root``
+    defaults to the folder two levels up."""
+    d = Path(path)
+    root = d.parent.parent if root is None else Path(root)
+    mp = d / MANIFEST_NAME
+    if not mp.is_file():
+        return StageRun(stage=stage, path=d, root=root, manifest={"status": "missing"}, note=f"no {MANIFEST_NAME} in {d}")
+    try:
+        man = json.loads(mp.read_text(encoding="utf-8"))
+        run = StageRun(stage=stage, path=d, root=root, manifest=man if isinstance(man, dict) else {})
+        if run.status == "ok" and (d / "error.txt").exists():
+            run.note = "stale error.txt of an earlier attempt next to the ok manifest (ignored)"
+        return run
+    except Exception as e:  # noqa: BLE001 - a broken manifest must not stop the evaluation
+        return StageRun(stage=stage, path=d, root=root, manifest={"status": "unreadable"},
+                        note=f"manifest unreadable: {type(e).__name__}")
+
+
 def discover_runs(roots: Sequence, model: str = DEFAULT_MODEL, revision: str = DEFAULT_REVISION) -> tuple[list[StageRun], list[str]]:
     """Every ``<root>/<stage>/<model>@<revision>/manifest.json`` of the stages in
     :data:`EVAL_STAGES` below the resolved roots (any status; an unreadable manifest is
@@ -344,41 +396,44 @@ def discover_runs(roots: Sequence, model: str = DEFAULT_MODEL, revision: str = D
     for root in resolved:
         for stage in EVAL_STAGES:
             d = root / stage / tag
-            mp = d / MANIFEST_NAME
-            if not mp.is_file():
-                continue
-            try:
-                man = json.loads(mp.read_text(encoding="utf-8"))
-                run = StageRun(stage=stage, path=d, root=root, manifest=man if isinstance(man, dict) else {})
-                if run.status == "ok" and (d / "error.txt").exists():
-                    run.note = "stale error.txt of an earlier attempt next to the ok manifest (ignored)"
-                runs.append(run)
-            except Exception as e:  # noqa: BLE001 - a broken manifest must not stop the evaluation
-                runs.append(StageRun(stage=stage, path=d, root=root, manifest={"status": "unreadable"},
-                                     note=f"manifest unreadable: {type(e).__name__}"))
+            if (d / MANIFEST_NAME).is_file():
+                runs.append(_read_run(d, stage, root))
     return runs, notes
+
+
+def _run_rank(r: StageRun) -> tuple:
+    """Preference of :func:`select_runs` among the ok runs of one key (highest first): a full run
+    before a smoke / limited one, a control run of the whole design before a narrowed one, then
+    the newest manifest."""
+    return (not r.reduced, not r.partial, r.timestamp)
+
+
+def _superseded_note(r: StageRun, by: StageRun) -> str:
+    """The note :func:`select_runs` gives an ok run ``r`` that ``by`` supersedes."""
+    why = ("a full run" if r.reduced and not by.reduced else
+           "a control run of the whole design" if r.partial and not by.partial else "the newer run")
+    return f"superseded by {why} {by.path}"
 
 
 def select_runs(runs: Sequence[StageRun]) -> dict[str, StageRun]:
     """The run used per key (stage letter, ``L_trace``, ``D_ctl``): the newest ok manifest, a
     full run before a smoke / limited one, a control run of the whole design before a narrowed
-    one (:attr:`StageRun.partial`); the other runs get a note (superseded / not ok)."""
+    one (:attr:`StageRun.partial`); the other runs get a note (superseded / not ok).  Among
+    several ok control runs :func:`evaluate` then uses the first in this order that passes its
+    validity audits (:func:`select_control_run`)."""
     chosen: dict[str, StageRun] = {}
     by_key: dict[str, list[StageRun]] = {}
     for r in runs:
         by_key.setdefault(r.key, []).append(r)
     for key, rs in by_key.items():
-        ok = sorted((r for r in rs if r.status == "ok"), key=lambda r: (not r.reduced, not r.partial, r.timestamp),
-                    reverse=True)
+        ok = sorted((r for r in rs if r.status == "ok"), key=_run_rank, reverse=True)
         if ok:
             chosen[key] = ok[0]
             for r in ok[1:]:
-                why = ("a full run" if r.reduced and not ok[0].reduced else
-                       "a control run of the whole design" if r.partial and not ok[0].partial else "the newer run")
-                r.note = (r.note + "; " if r.note else "") + f"superseded by {why} {ok[0].path}"
+                r.note = _join(r.note, _superseded_note(r, ok[0]))
         for r in rs:
             if r.status != "ok":
-                r.note = (r.note + "; " if r.note else "") + f"status {r.status!r}: not used"
+                r.note = _join(r.note, f"status {r.status!r}: not used")
     return chosen
 
 
@@ -424,11 +479,14 @@ def read_table(run_dir, name: str, columns: Optional[Sequence[str]] = None) -> O
 
 
 class Tables:
-    """Tables of the selected runs, read once (``get``) and cached."""
+    """Tables of the selected runs, read once (``get``) and cached by run directory, so that a
+    copy with another run for one key (:meth:`with_run`: the candidates of
+    :func:`select_control_run`) shares the tables already read of every other run (the main
+    stage-D ``damage`` is read once)."""
 
-    def __init__(self, chosen: dict[str, StageRun]):
+    def __init__(self, chosen: dict[str, StageRun], cache: Optional[dict] = None):
         self.chosen = chosen
-        self._cache: dict = {}
+        self._cache: dict = {} if cache is None else cache
 
     def run(self, key: str) -> Optional[StageRun]:
         return self.chosen.get(key)
@@ -437,10 +495,20 @@ class Tables:
         run = self.run(key)
         if run is None:
             return None
-        ck = (key, name, tuple(columns) if columns is not None else None)
+        ck = (str(run.path), name, tuple(columns) if columns is not None else None)
         if ck not in self._cache:
             self._cache[ck] = read_table(run.path, name, columns)
         return self._cache[ck]
+
+    def with_run(self, key: str, run: StageRun) -> "Tables":
+        """These tables with ``run`` as the run of ``key`` (the cache is shared)."""
+        return Tables({**self.chosen, key: run}, cache=self._cache)
+
+    def forget(self, run: StageRun) -> None:
+        """Drop the cached tables of ``run`` (a control run that is not used)."""
+        p = str(run.path)
+        for ck in [k for k in self._cache if k[0] == p]:
+            del self._cache[ck]
 
     def source(self, key: str, name: str) -> str:
         run = self.run(key)
@@ -1127,6 +1195,136 @@ def _parse_utc(ts) -> Optional[_dt.datetime]:
     return t.replace(tzinfo=_dt.timezone.utc) if t.tzinfo is None else t.astimezone(_dt.timezone.utc)
 
 
+#: The validity audits of the control run (PREREGISTRATION 6.11 (a)-(d)); it is valid iff all four pass.
+CTL_AUDIT_IDS = ("audit.D1ctl", "audit.D1ctl.rep", "audit.D1ctl.site", "audit.D1ctl.run")
+#: The order in which :func:`select_control_run` goes through several ok control runs (that of :func:`select_runs`).
+CTL_RUN_ORDER = "full before smoke / limited, whole design before narrowed, newest first"
+
+
+def control_audits(ctx: EvalContext) -> list[dict]:
+    """The validity audits of the control run ``ctx.tables.run("D_ctl")`` (PREREGISTRATION 6.11
+    (a)-(d)) against the main stage-D run ``ctx.tables.run("D")`` on the confirmation set of
+    ``ctx``: ``audit.D1ctl`` (write audit over the whole ``damage_ctl``), ``audit.D1ctl.rep``
+    (:func:`_ctl_replication_audit`), ``audit.D1ctl.site`` (:func:`_ctl_site_audit`) and
+    ``audit.D1ctl.run`` (:func:`_ctl_run_audit`).  ``damage_ctl`` missing or without a damage
+    column: ``audit.D1ctl`` not_tested and ``audit.D1ctl.run``; ``[]`` without a control run.  The
+    one implementation of these rules: :func:`token_control_rows` (whose ``P.ctl*`` rows are
+    ``not_interpretable`` unless every audit passes, :func:`control_valid`),
+    :func:`select_control_run` and notebook 14 (:func:`control_audits_for`) use it."""
+    run = ctx.tables.run("D_ctl")
+    if run is None:
+        return []
+    dmg = ctx.tables.get("D_ctl", "damage_ctl", DAMAGE_CTL_COLS)
+    src = ctx.tables.source("D_ctl", "damage_ctl")
+    run_audit = _ctl_run_audit(ctx, run)
+    if _missing_cols(dmg, DAMAGE_COLS):
+        return [not_tested("audit.D1ctl", CTL_AUDIT_NAME, "D", "damage_ctl table unusable", role="audit"), run_audit]
+    a_all = audit_summary(dmg["audit_rel_err"])
+    by_inj = "; ".join(f"{inj}: max {_g(audit_summary(g['audit_rel_err'])['max'], 3)}"
+                       for inj, g in dmg.groupby("inject", sort=True))
+    return [audit_row("audit.D1ctl", CTL_AUDIT_NAME, "D", a_all, src, by_inj), _ctl_replication_audit(ctx, dmg, src),
+            _ctl_site_audit(ctx, dmg, src), run_audit]
+
+
+def control_valid(audits: Sequence[dict]) -> bool:
+    """A valid control run (PREREGISTRATION 6.11): every audit of :data:`CTL_AUDIT_IDS` among
+    ``audits`` (:func:`control_audits`) is there and supported."""
+    v = {a["id"]: a["verdict"] for a in audits}
+    return all(v.get(i) == "supported" for i in CTL_AUDIT_IDS)
+
+
+def control_audits_for(main_dir, ctl_dir, model: str = DEFAULT_MODEL, revision: str = DEFAULT_REVISION,
+                       families: Sequence[str] = TEST_FAMILIES, formulations: Sequence[str] = TEST_FORMULATIONS) -> list[dict]:
+    """:func:`control_audits` of the control run in ``ctl_dir`` against the main stage-D run in
+    ``main_dir`` (both ``<root>/D/<model>@<revision>`` directories) on the confirmation set
+    ``families`` x ``formulations``: the rows the evaluation (notebook 13) writes for that pair,
+    by the same code, for notebook 14.  The manifests are read as :func:`discover_runs` reads
+    them; a missing or unreadable one gives a run with status ``missing`` / ``unreadable``, so the
+    audits come out not_tested / not_supported instead of raising."""
+    main, ctl = _read_run(main_dir, "D"), _read_run(ctl_dir, "D")
+    ctx = EvalContext(tables=Tables({"D": main, "D_ctl": ctl}), model=model, revision=revision,
+                      families=tuple(families), formulations=tuple(formulations))
+    return control_audits(ctx)
+
+
+def select_control_run(ctx: EvalContext, runs: Sequence[StageRun]) -> Optional[StageRun]:
+    """The control run the evaluation uses (key ``D_ctl``), set in ``ctx.tables``; returns it.
+
+    PREREGISTRATION 6.11 caps P only without a *valid* control run, but :func:`select_runs`
+    takes the newest one, which may fail its audits (e.g. a later whole-design run in account B
+    on another platform: replication off by more than 1e-3) while an older one is valid.  With
+    more than one ok control run, the candidates are gone through in the order of
+    :func:`select_runs` (:data:`CTL_RUN_ORDER`), their four validity audits computed
+    (:func:`control_audits`; the tables of the main run are read once) and the first whose audits
+    all pass is used; if none passes, select_runs' choice stays (no valid control run).  Only
+    these audits decide, never an outcome or estimate of ``P.ctl``.  The runs-table notes of the
+    candidates say why, and the run used gets the reason as :attr:`StageRun.selection` (also in
+    its ``audit.D1ctl.run`` note and the evaluation's notes).  With one candidate (or none)
+    nothing changes."""
+    chosen = ctx.tables.chosen
+    first = chosen.get("D_ctl")
+    cands = sorted((r for r in runs if r.key == "D_ctl" and r.status == "ok"), key=_run_rank, reverse=True)
+    if first is None or len(cands) < 2:
+        return first
+    cands = [first] + [r for r in cands if r is not first]
+    failed: list[tuple[StageRun, str]] = []
+    used: Optional[StageRun] = None
+    for r in cands:
+        try:
+            rows = control_audits(replace(ctx, tables=ctx.tables.with_run("D_ctl", r)))
+            why = ", ".join(f"{a['id']} {a['verdict']}" for a in rows if a["verdict"] != "supported")
+            ok = control_valid(rows)
+        except Exception as e:  # noqa: BLE001 - a candidate whose audits cannot be computed is no valid control run
+            ok, why = False, f"audits not computable ({type(e).__name__}: {e})"
+        if ok:
+            used = r
+            break
+        failed.append((r, why or "audits incomplete"))
+    for r in cands:
+        if r is not (used or first):
+            ctx.tables.forget(r)                        # the tables of a control run that is not used
+    if used is first:                                   # select_runs' choice is valid: it stays, the note says so
+        first.selection = (f"the first of the {len(cands)} ok control runs ({CTL_RUN_ORDER}); it passes all four audits "
+                           "(PREREGISTRATION 6.11)")
+        first.note = _join(first.note, first.selection)
+        return first
+    if used is None:                                    # no valid control run: select_runs' choice stays
+        for r, why in failed[1:]:
+            r.note = _join(r.note, f"fails {why}")
+        first.selection = (f"none of the {len(cands)} ok control runs passes all four audits (this one: "
+                           f"{failed[0][1]}): the one preferred by select_runs ({CTL_RUN_ORDER}) is evaluated, "
+                           "so there is no valid control run (PREREGISTRATION 6.11)")
+        first.note = _join(first.note, first.selection)
+        return first
+    t_used = _parse_utc(used.timestamp)
+    after = False
+    for r in cands:
+        if r is not first:
+            r.note = _note_without(r.note, _superseded_note(r, first))       # select_runs' note, rewritten here
+        if r is used:
+            after = True
+        elif after:
+            r.note = _join(r.note, f"superseded by {used.path}, the first control run ({CTL_RUN_ORDER}) that passes all "
+                                   "four audits")
+    for r, why in failed:
+        t = _parse_utc(r.timestamp)
+        newer = "newer " if t is not None and t_used is not None and t > t_used else ""
+        r.note = _join(r.note, f"{newer}control run not used: fails {why} (PREREGISTRATION 6.11); the evaluation uses "
+                               f"{used.path}, the first control run ({CTL_RUN_ORDER}) that passes all four audits")
+    used.selection = ("used instead of the control run(s) preferred by select_runs that fail their audits: "
+                      + ", ".join(f"{r.path} ({why})" for r, why in failed)
+                      + f"; the first control run ({CTL_RUN_ORDER}) that passes all four audits (PREREGISTRATION 6.11 "
+                        "caps P only without a valid control run)")
+    used.note = _join(used.note, used.selection)
+    chosen["D_ctl"] = used
+    return used
+
+
+def _note_without(note: str, part: str) -> str:
+    """``note`` (parts joined by "; ") without the part ``part``."""
+    return "; ".join(p for p in str(note).split("; ") if p and p != part)
+
+
 def token_control_rows(ctx: EvalContext) -> list[dict]:
     """Token-language control of the primary endpoint (PREREGISTRATION 6.11) from ``damage_ctl``
     of the control run (key ``D_ctl``): the statistic and the rules of P (confirmation set,
@@ -1135,28 +1333,23 @@ def token_control_rows(ctx: EvalContext) -> list[dict]:
     against K = 0 at the same site of the same run.  Control 1 = C2 and C3 pooled at u9,
     control 2 = C1 at u10 (K = 8 main, 2 and 4 reported), control 3 = ``u9D`` at u9 (reported
     only).  Per pre-registered dose (suffix as P's) ``P.ctl`` holds the outcome "Wechsel" /
-    "lokal" / "offen".  ``audit.D1ctl`` (write audit), ``.rep`` (replication of the main run at
-    the pre-registered site and a control row for every row of P), ``.site`` (sites and the
-    cells of the design) and ``.run`` decide the run's validity: an audit that does not pass
-    makes every ``P.ctl*`` row ``not_interpretable``.  No row enters the BH group;
-    :func:`apply_token_control` applies the outcome to P."""
+    "lokal" / "offen".  The validity audits of :func:`control_audits` (``audit.D1ctl`` write
+    audit, ``.rep`` replication of the main run at the pre-registered site and a control row for
+    every row of P, ``.site`` sites, cells and (direction, dose) pairs of the design, ``.run``
+    manifest) decide the run's validity: an audit that does not pass makes every ``P.ctl*`` row
+    ``not_interpretable``.  No row enters the BH group; :func:`apply_token_control` applies the
+    outcome to P."""
     run = ctx.tables.run("D_ctl")
     if run is None:
         return [_no_run("P.ctl", CTL_NAME, "D", "D_ctl", ctx, role="primary_control", rule=CTL_RULE)]
+    # ---- validity of the control run (PREREGISTRATION 6.11 (a)-(d)), over the whole table
+    audits = control_audits(ctx)
     dmg = ctx.tables.get("D_ctl", "damage_ctl", DAMAGE_CTL_COLS)
     src = ctx.tables.source("D_ctl", "damage_ctl")
-    run_audit = _ctl_run_audit(ctx, run)
     miss = _missing_cols(dmg, DAMAGE_COLS)
     if miss:
         return [_no_table("P.ctl", CTL_NAME, "D", "damage_ctl", ctx, key="D_ctl", cols=miss if dmg is not None else (),
-                          role="primary_control", rule=CTL_RULE),
-                not_tested("audit.D1ctl", CTL_AUDIT_NAME, "D", "damage_ctl table unusable", role="audit"), run_audit]
-    # ---- validity of the control run (PREREGISTRATION 6.11 (a)-(d)), over the whole table
-    a_all = audit_summary(dmg["audit_rel_err"])
-    by_inj = "; ".join(f"{inj}: max {_g(audit_summary(g['audit_rel_err'])['max'], 3)}"
-                       for inj, g in dmg.groupby("inject", sort=True))
-    audits = [audit_row("audit.D1ctl", CTL_AUDIT_NAME, "D", a_all, src, by_inj), _ctl_replication_audit(ctx, dmg, src),
-              _ctl_site_audit(ctx, dmg, src), run_audit]
+                          role="primary_control", rule=CTL_RULE)] + audits
     # ---- confirmation set, per site
     d = ctx.split(_standard(dmg)).copy()
     d = d[np.isfinite(pd.to_numeric(d["lam"], errors="coerce"))]
@@ -1189,9 +1382,8 @@ def token_control_rows(ctx: EvalContext) -> list[dict]:
         rows.append(not_tested("P.ctl", CTL_NAME, "D",
                                _join("no lang_dom rows of the confirmation set at a pre-registered dose (u9 / u10) in "
                                      "damage_ctl", dose_note, ctx.split_note), role="primary_control", rule=CTL_RULE))
-    failed = [a for a in audits if a["verdict"] != "supported"]
-    if failed:
-        why = ", ".join(f"{a['id']} {a['verdict']}" for a in failed)
+    if not control_valid(audits):
+        why = ", ".join(f"{a['id']} {a['verdict']}" for a in audits if a["verdict"] != "supported")
         for r in rows:
             lit = r["verdict"]
             if re.fullmatch(r"P\.ctl(@.+)?", r["id"]) and lit in CTL_VERDICT_OUTCOME:
@@ -1295,8 +1487,9 @@ def _ctl_replication_audit(ctx: EvalContext, dmg: pd.DataFrame, src: str) -> dic
     at the same position, and its lam lies within :data:`CTL_REP_TOL` of it; and every ``depth``
     row of the main run at that site in the confirmation set (C1, K 0/2/4/8: the rows of P) has
     its control row, so the control covers the families, formulations, directions and doses of
-    P (a control run narrowed by cfg filters or limits does not).  The estimate is the largest
-    absolute difference."""
+    P (a control run narrowed by cfg filters or limits does not).  Not tested without an ok main
+    run (:func:`control_audits_for` may name a directory without one).  The estimate is the
+    largest absolute difference."""
     name = "D1 control run: replication of the pre-registered site (u9, C1) against the main stage-D run"
     rule = ("control run valid iff every control row at u9 / C1 (K 0/2/4/8) has the main run's depth row (same tag, direction, "
             "eps) at the same inject_pos with |lam_ctl - lam_main| <= 1e-3, and every depth row of the main run at C1 (K 0/2/4/8) "
@@ -1315,6 +1508,8 @@ def _ctl_replication_audit(ctx: EvalContext, dmg: pd.DataFrame, src: str) -> dic
     drun = ctx.tables.run("D")
     if drun is None:
         return row("not_tested", "no main stage-D run under the given roots")
+    if drun.status != "ok":                           # control_audits_for: a main run without an ok manifest
+        return row("not_tested", f"the main stage-D run {drun.path} has status {drun.status!r}, not 'ok'")
     need = ["tag", "family", "formulation", "K", "C", "inject", "direction", "eps", "lam", "inject_pos"]
     m = ctx.tables.get("D", "damage", DAMAGE_READ_COLS)
     miss = _missing_cols(m, need)
@@ -1362,81 +1557,153 @@ def _ctl_replication_audit(ctx: EvalContext, dmg: pd.DataFrame, src: str) -> dic
 
 
 def _ctl_site_audit(ctx: EvalContext, dmg: pd.DataFrame, src: str) -> dict:
-    """``audit.D1ctl.site`` (PREREGISTRATION 6.11 (c) and the design of controls 1-3): every row
-    injects at ".", its language mark is E at u10 and at u9 for K = 0 and C2 / C3, D at u9 for
-    C1 (K > 0) and u9D, its unit is 9 at u9 and 10 at u10, and ``site_gap`` (tail_start -
-    inject_pos) is the formulation's K = 0 gap at u9 and 1 at u10; and every formulation of the
-    confirmation set in the run has every cell of :data:`CTL_DESIGN` at its site (a variant
-    excluded by section 4 in ``damage_ctl_checks`` excused), so no control lacks a C level or a
-    K.  The estimate is the number of rows that break a rule plus the number of missing cells."""
-    name = "D1 control run: injection sites (cells of the design, '.' token, language mark, unit, distance to the tail)"
-    rule = ("control run valid iff every row injects at the token '.', inject_lang is E at u10 and at u9 for K=0 and C2 / C3 "
-            "and D at u9 for C1 (K>0) and u9D, inject_unit is 9 at u9 and 10 at u10, site_gap (tail_start - inject_pos) "
-            "equals the formulation's K=0 gap at u9 and 1 at u10 (PREREGISTRATION 6.11 (c)), and every formulation of the "
-            "confirmation set in the run has every cell of the design (u9: K=0, C1 / C2 / C3 at K 2/4/8 and u9D; u10: K=0 and "
-            "C1 at K 2/4/8; a variant excluded by section 4 in damage_ctl_checks excused)")
-    need = ["family", "formulation", "K", "C", "inject"] + CTL_SITE_COLS
+    """``audit.D1ctl.site`` (PREREGISTRATION 6.11 (c) and the design of controls 1-3).  Every row
+    lies in a cell (site, K, C) of :data:`CTL_DESIGN`, is a standard variant, injects at ".", has a
+    finite lam and is the only row of its (tag, site, direction, dose); its language mark is E at
+    u10 and at u9 for K = 0 and C2 / C3, D at u9 for C1 (K > 0) and u9D, its unit is 9 at u9 and 10
+    at u10, and ``site_gap`` (tail_start - inject_pos) is the formulation's K = 0 gap at u9 and 1 at
+    u10.  Every formulation of the confirmation set in the run has every cell of the design at its
+    site (a variant excluded by section 4 in ``damage_ctl_checks`` excused), and every (tag, site)
+    of the design in the confirmation set holds, with a finite lam, exactly the (direction, dose)
+    pairs of the u9 / K = 0 / C1 rows (which ``audit.D1ctl.rep`` ties two-sided to the main run's
+    depth rows).  So no control lacks a C level, a K, a dose, a direction or the lang_dom row of a
+    formulation, no row of the K = 0 reference comes from outside the design, and no row is dropped
+    silently by the finite filter of :func:`token_control_rows` (a correct run has a finite lam
+    everywhere: an OLS slope over the snapshots after the depth site, D clipped at 1e-12).  The
+    estimate is the number of rows that break a rule plus the missing cells plus the incomplete
+    (tag, site) pairs."""
+    name = ("D1 control run: injection sites (cells of the design, '.' token, language mark, unit, distance to the tail, "
+            "(direction, dose) pairs)")
+    rule = ("control run valid iff every row lies in a cell of the design (u9: K=0, C1 / C2 / C3 at K 2/4/8 and u9D at K=2; u10: "
+            "K=0 and C1 at K 2/4/8), is a standard variant, injects at the token '.', has a finite lam and occurs once per (tag, "
+            "site, direction, eps), inject_lang is E at u10 and at u9 for K=0 and C2 / C3 and D at u9 for C1 (K>0) and u9D, "
+            "inject_unit is 9 at u9 and 10 at u10, site_gap (tail_start - inject_pos) equals the formulation's K=0 gap at u9 and "
+            "1 at u10 (PREREGISTRATION 6.11 (c)), every formulation of the confirmation set in the run has every cell of the "
+            "design (a variant excluded by section 4 in damage_ctl_checks excused), and every (tag, site) of the design in the "
+            "confirmation set holds, with a finite lam, exactly the (direction, eps) pairs of the u9 / K=0 / C1 rows")
+    need = ["tag", "family", "formulation", "K", "C", "kind", "inject", "direction", "eps", "lam"] + CTL_SITE_COLS
     miss = _missing_cols(dmg, need)
     if miss or dmg.empty:
         why = f"columns {miss} missing in damage_ctl" if miss else "damage_ctl is empty"
         return make_row("audit.D1ctl.site", name, role="audit", stage="D", rule=rule, verdict="not_tested", source=src,
                         note=_join(why, "control run not validated (PREREGISTRATION 6.11 (c))"))
-    x = dmg.assign(family=dmg["family"].astype(str), formulation=dmg["formulation"].astype(str))
-    inj, Cc = x["inject"].astype(str).to_numpy(), x["C"].astype(str).to_numpy()
+    x = dmg.reset_index(drop=True)
+    x = x.assign(tag=x["tag"].astype(str), family=x["family"].astype(str), formulation=x["formulation"].astype(str),
+                 inject=x["inject"].astype(str), direction=x["direction"].astype(str),
+                 eps=pd.to_numeric(x["eps"], errors="coerce").round(10))
+    inj, Cc = x["inject"].to_numpy(), x["C"].astype(str).to_numpy()
     K = pd.to_numeric(x["K"], errors="coerce").to_numpy(dtype=float)
+    Ki = np.where(np.isfinite(K) & (K == np.round(K)), K, -1).astype(int)
     u9, u10 = inj == "u9", inj == "u10"
-    english = u10 | (u9 & ((K == 0) | np.isin(Cc, CTL1_C)))
-    german = u9 & (((Cc == PRIMARY_C) & (K > 0)) | (Cc == CTL3_C))
+    design = {(s, k, c) for s, cells in CTL_DESIGN.items() for k, c in cells}
+    cell = np.fromiter(((s, k, c) in design for s, k, c in zip(inj, Ki, Cc)), dtype=bool, count=len(x))
+    english = cell & (u10 | (u9 & ((K == 0) | np.isin(Cc, CTL1_C))))
+    german = cell & u9 & (((Cc == PRIMARY_C) & (K > 0)) | (Cc == CTL3_C))
     exp_lang = np.where(english, "E", np.where(german, "D", ""))
-    cell = exp_lang != ""                                       # a row inside the control design
     bad_tok = x["inject_token"].astype(str).to_numpy() != CTL_TOKEN
     bad_lang = cell & (x["inject_lang"].astype(str).to_numpy() != exp_lang)
     unit = pd.to_numeric(x["inject_unit"], errors="coerce").to_numpy(dtype=float)
     bad_unit = ~(unit == np.where(u9, 9.0, np.where(u10, 10.0, np.nan)))
     gap = pd.to_numeric(x["site_gap"], errors="coerce").to_numpy(dtype=float)
-    ref = pd.Series(gap[u9 & (K == 0)]).groupby([x["family"].to_numpy()[u9 & (K == 0)],
-                                                  x["formulation"].to_numpy()[u9 & (K == 0)]]).first().to_dict()
-    exp_gap = np.array([1.0 if b10 else ref.get((f, fo), np.nan) if b9 else np.nan
+    k0 = u9 & (K == 0)
+    gap0 = pd.Series(gap[k0]).groupby([x["family"].to_numpy()[k0], x["formulation"].to_numpy()[k0]]).first().to_dict()
+    exp_gap = np.array([1.0 if b10 else gap0.get((f, fo), np.nan) if b9 else np.nan
                         for b9, b10, f, fo in zip(u9, u10, x["family"], x["formulation"])], dtype=float)
     bad_gap = ~(gap == exp_gap)
-    bad = bad_tok | bad_lang | bad_unit | bad_gap | ~cell
+    bad_kind = x["kind"].astype(str).to_numpy() != "standard"
+    lam_ok = np.isfinite(pd.to_numeric(x["lam"], errors="coerce").to_numpy(dtype=float))
+    pair_key = ["tag", "inject", "direction", "eps"]
+    bad_dup = x.duplicated(pair_key, keep="first").to_numpy()
+    bad = bad_tok | bad_lang | bad_unit | bad_gap | bad_kind | ~lam_ok | bad_dup | ~cell
     # every cell of the design for every formulation of the confirmation set in the run (section-4 exclusions excused)
-    have = set(zip(x["family"], x["formulation"], inj, np.nan_to_num(K, nan=-1).astype(int), Cc))
+    have = set(zip(x["family"], x["formulation"], inj, Ki, Cc))
     chk = ctx.tables.get("D_ctl", "damage_ctl_checks")
     excused: set = set()
     if not _missing_cols(chk, ["family", "formulation", "K", "C", "excluded"]):
         ex = chk[chk["excluded"].map(_flag) == True]  # noqa: E712
         excused = set(zip(ex["family"].astype(str), ex["formulation"].astype(str),
                           pd.to_numeric(ex["K"], errors="coerce").fillna(-1).astype(int), ex["C"].astype(str)))
-    forms = sorted(set(zip(*(ctx.split(x)[c] for c in ("family", "formulation")))))
+    conf = x.index.isin(ctx.split(x).index)                                 # the confirmation set
+    forms = sorted(set(zip(x.loc[conf, "family"], x.loc[conf, "formulation"])))
     gone = [(f, fo, s, k, c) for f, fo in forms for s, cells in CTL_DESIGN.items() for k, c in cells
             if (f, fo, s, k, c) not in have and (f, fo, k, c) not in excused]
+    # every (tag, site) of the design in the confirmation set: the (direction, dose) pairs of u9 / K=0 / C1, lam finite
+    ref = x.loc[conf & u9 & (Ki == 0) & (Cc == PRIMARY_C), ["direction", "eps"]].drop_duplicates()
+    sites = x.loc[conf & cell, ["tag", "inject"]].drop_duplicates().set_index(["tag", "inject"])
+    got = x.loc[conf & cell & lam_ok, pair_key].drop_duplicates()
+    n_got = got.groupby(["tag", "inject"]).size().reindex(sites.index, fill_value=0)
+    n_in = got.merge(ref, on=["direction", "eps"]).groupby(["tag", "inject"]).size().reindex(sites.index, fill_value=0)
+    n_missing, n_extra = len(ref) - n_in, n_got - n_in
+    inc = ((n_missing > 0) | (n_extra > 0)).to_numpy()
+    n_inc = int(inc.sum())
     ids = ""
     if "inject_token_id" in x.columns:
         tid = sorted({int(t) for t in pd.to_numeric(x["inject_token_id"], errors="coerce").dropna()})
         ids = f"token ids at the sites: {', '.join(str(t) for t in tid[:5])}" + (" ..." if len(tid) > 5 else "")
-    n_bad = int(bad.sum()) + len(gone)
+    n_bad = int(bad.sum()) + len(gone) + n_inc
     note = _join(f"{len(x)} rows; rows breaking a rule: {int(bad.sum())} (token != '.': {int(bad_tok.sum())}, language mark: "
-                 f"{int(bad_lang.sum())}, unit: {int(bad_unit.sum())}, site_gap: {int(bad_gap.sum())}, outside the control "
-                 f"cells: {int((~cell).sum())})",
+                 f"{int(bad_lang.sum())}, unit: {int(bad_unit.sum())}, site_gap: {int(bad_gap.sum())}, kind != standard: "
+                 f"{int(bad_kind.sum())}, lam not finite: {int((~lam_ok).sum())}, duplicate (tag, site, direction, eps): "
+                 f"{int(bad_dup.sum())}, outside the control cells: {int((~cell).sum())})",
                  f"cells of the design missing: {len(gone)} of {len(forms) * sum(map(len, CTL_DESIGN.values()))} "
                  f"({len(forms)} formulations of the confirmation set" + (", e.g. " + ", ".join(
-                     f"{f}{fo} K={k} {c} at {s}" for f, fo, s, k, c in gone[:3]) if gone else "") + ")", ids,
+                     f"{f}{fo} K={k} {c} at {s}" for f, fo, s, k, c in gone[:3]) if gone else "") + ")",
+                 f"(tag, site) of the design without exactly the {len(ref)} (direction, eps) pairs of u9 / K=0 / C1 (finite lam): "
+                 f"{n_inc} of {len(sites)}"
+                 + (f" (pairs missing: {int(n_missing[inc].sum())}, not in the reference: {int(n_extra[inc].sum())}; e.g. "
+                    + ", ".join(f"{t} at {s}" for t, s in sites.index[inc][:3]) + ")" if n_inc else ""), ids,
                  "control run not validated (PREREGISTRATION 6.11 (c))" if n_bad else "")
     return make_row("audit.D1ctl.site", name, role="audit", stage="D", rule=rule, estimate=float(n_bad), n_rows=len(x),
                     verdict="not_supported" if n_bad else "supported", note=note, source=src)
 
 
+def _eval_code_note(manifest: dict) -> str:
+    """Whether this evaluation runs the code of ``lsne/prereg_eval.py`` the control run saw (the
+    control manifest's ``eval_code_sha256`` against :data:`PREREG_EVAL_SHA256`); a note only."""
+    rec = str(manifest.get("eval_code_sha256") or "").strip().lower()
+    if not rec:
+        return "the control manifest records no eval_code_sha256"
+    if not PREREG_EVAL_SHA256:
+        return f"evaluation code not compared (this prereg_eval.py is unreadable; at control-run time {rec[:12]})"
+    if rec == PREREG_EVAL_SHA256:
+        return f"evaluation code identical to the one at control-run time ({rec[:12]})"
+    return (f"evaluation code differs from the one at control-run time ({rec[:12]} vs {PREREG_EVAL_SHA256[:12]}): a change "
+            "after the control run is a deviation from PREREGISTRATION 6.11")
+
+
+def _platform_note(manifest: dict) -> str:
+    """The control run's platform next to the main run's (manifest ``replication_platform``) and
+    the software differences from the main run the run was computed despite (``platform_mismatch``,
+    ``--d-allow-platform-mismatch``); a note only (6.11 (b) holds in practice only on the main
+    run's platform: lambda at the smallest dose moves by more than 1e-3 under round-off changes)."""
+    rp = manifest.get("replication_platform")
+    rp = rp if isinstance(rp, dict) else {}
+    own = [f"{k} {rp[k]}" for k in ("torch", "transformers") if rp.get(k)] + [str(rp.get("gpu") or rp.get("device") or "")]
+    main = [f"{k[5:]} {rp[k]}" for k in ("main_torch", "main_transformers") if rp.get(k)]
+    pm = manifest.get("platform_mismatch")
+    items = [pm] if isinstance(pm, str) else list(pm) if isinstance(pm, (list, tuple)) else []
+    items = [str(i) for i in items if str(i).strip()]
+    return _join(f"platform: {', '.join(p for p in own if p)}" + (f" (main run: {', '.join(main)})" if main else "")
+                 if any(own) else "",
+                 f"run computed despite a platform mismatch: {', '.join(items)}" if items else "")
+
+
 def _ctl_run_audit(ctx: EvalContext, run: StageRun) -> dict:
-    """``audit.D1ctl.run`` (PREREGISTRATION 6.11 (d)): the manifest carries ``control =
-    "token_language"`` and ``amendment = "6.11"``, the run is younger than the amendment commit
-    (:data:`AMENDMENT_611`) and is no smoke / limited run."""
+    """``audit.D1ctl.run`` (PREREGISTRATION 6.11 (d)): the run finished (manifest status ``ok``),
+    its manifest carries ``control = "token_language"`` and ``amendment = "6.11"``, the run is
+    younger than the amendment commit (:data:`AMENDMENT_611`) and is no smoke / limited run.  The
+    note (never the verdict) adds whether the evaluation code equals the one at control-run time
+    (:func:`_eval_code_note`), the run's platform and a platform mismatch it was computed despite
+    (:func:`_platform_note`) and why this control run was selected among several
+    (:attr:`StageRun.selection`)."""
     name = "D1 control run: manifest marks and age"
-    rule = (f"control run valid iff its manifest says control = '{CTL_CONTROL}' and amendment = '{AMENDMENT_611['id']}', it "
-            f"is younger than the commit of amendment 6.11 ({AMENDMENT_611['commit'][:7]}, {AMENDMENT_611['utc']}) and it is "
-            "no smoke / limited run (PREREGISTRATION 6.11 (d))")
+    rule = (f"control run valid iff it finished (status 'ok'), its manifest says control = '{CTL_CONTROL}' and amendment = "
+            f"'{AMENDMENT_611['id']}', it is younger than the commit of amendment 6.11 ({AMENDMENT_611['commit'][:7]}, "
+            f"{AMENDMENT_611['utc']}) and it is no smoke / limited run (PREREGISTRATION 6.11 (d))")
     m = run.manifest
     bad = []
+    if run.status != "ok":                            # control_audits_for: a failed, missing or unreadable manifest
+        bad.append(f"status {run.status!r} instead of 'ok'")
     if m.get("control") != CTL_CONTROL:
         bad.append(f"control {m.get('control')!r} instead of {CTL_CONTROL!r}")
     if str(m.get("amendment", "")) != AMENDMENT_611["id"]:
@@ -1456,10 +1723,11 @@ def _ctl_run_audit(ctx: EvalContext, run: StageRun) -> dict:
     note = _join("; ".join(bad), "control run not validated (PREREGISTRATION 6.11 (d))" if bad else "",
                  (f"design narrowed by cfg ({', '.join(str(f) for f in filters)}): valid only where it covers the rows of P "
                   "(audit.D1ctl.rep) and every cell of the design (audit.D1ctl.site)") if filters else "",
-                 f"run {run.timestamp or '?'}, git {str(m.get('git_sha') or '?')[:7]}",
+                 f"run {run.timestamp or '?'}, git {str(m.get('git_sha') or '?')[:7]}", _eval_code_note(m), _platform_note(m),
                  (f"main run in the manifest: {mr.get('path', '?')} ({mr.get('timestamp', '?')}, git "
                   f"{str(mr.get('git_sha') or '?')[:7]})") if mr else "the manifest names no main run",
-                 f"main stage-D run of this evaluation: {drun.path}" if drun is not None else "no main stage-D run")
+                 f"main stage-D run of this evaluation: {drun.path}" if drun is not None else "no main stage-D run",
+                 run.selection)
     return make_row("audit.D1ctl.run", name, role="audit", stage="D", rule=rule, verdict="not_supported" if bad else "supported",
                     n_rows=1, note=note, source=f"{run.label()}/{MANIFEST_NAME}")
 
@@ -2368,6 +2636,14 @@ def _guard(fn: Callable[[], list[dict]], id: str, name: str, stage: str, role: s
         return [not_tested(id, name, stage, f"evaluation error: {type(e).__name__}: {e} ({tb})", role=role)]
 
 
+def code_version() -> dict:
+    """The version of the evaluation code: ``git_sha`` (:func:`lsne.io.git_sha` of the checkout
+    that holds this module, '' when unavailable) and ``prereg_eval_sha256``
+    (:data:`PREREG_EVAL_SHA256`, which also covers changes not committed)."""
+    sha = git_sha(Path(__file__).resolve().parent.parent)
+    return dict(git_sha="" if sha == "unknown" else sha, prereg_eval_sha256=PREREG_EVAL_SHA256)
+
+
 def evaluate(roots: Sequence, model: str = DEFAULT_MODEL, revision: str = DEFAULT_REVISION, n_boot: int = DEFAULT_N_BOOT,
              seed: int = 0, frozen_dose: Optional[float] = None, families: Sequence[str] = TEST_FAMILIES,
              formulations: Sequence[str] = TEST_FORMULATIONS) -> dict:
@@ -2375,13 +2651,22 @@ def evaluate(roots: Sequence, model: str = DEFAULT_MODEL, revision: str = DEFAUL
 
     Returns ``dict(results, runs, bh, meta)``: the results table (:data:`RESULT_COLS` +
     :data:`EXTRA_COLS`), the run table (:data:`RUN_COLS`), the BH grouping and the
-    evaluation settings.  ``families`` / ``formulations`` override the confirmation set
+    evaluation settings with the version of this code (``git_sha``, ``prereg_eval_sha256``,
+    :func:`code_version`).  The runs are those of :func:`select_runs`, the control run that of
+    :func:`select_control_run`.  ``families`` / ``formulations`` override the confirmation set
     (tests and smoke runs only; the override is noted on every recomputed row)."""
     runs, notes = discover_runs(roots, model, revision)
     chosen = select_runs(runs)
     ctx = EvalContext(tables=Tables(chosen), model=model, revision=revision, n_boot=int(n_boot), seed=int(seed),
                       frozen_dose=(None if frozen_dose is None else float(frozen_dose)), families=tuple(families),
                       formulations=tuple(formulations))
+    sel_notes: list[str] = []                           # the evaluation's notes (meta, report), not runs-table rows
+    try:
+        ctl = select_control_run(ctx, runs)             # PREREGISTRATION 6.11: a valid control run if there is one
+        if ctl is not None and ctl.selection:
+            sel_notes.append(f"control run {ctl.path}: {ctl.selection}")
+    except Exception as e:  # noqa: BLE001 - never stops the evaluation: select_runs' choice stays
+        sel_notes.append(f"choice among the control runs failed ({type(e).__name__}: {e}): select_runs' choice is used")
     rows: list[dict] = []
     rows += _guard(lambda: primary_rows(ctx), "P", PRIMARY_NAME, "D", role="primary")
     rows += _guard(lambda: token_control_rows(ctx), "P.ctl", CTL_NAME, "D", role="primary_control")
@@ -2408,7 +2693,7 @@ def evaluate(roots: Sequence, model: str = DEFAULT_MODEL, revision: str = DEFAUL
                                     "stage-D manifest" if frozen is not None else None),
                 families=list(ctx.families), formulations=list(ctx.formulations),
                 roots=[str(r) for r in roots], timestamp=_dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
-                notes=list(notes))
+                notes=list(notes) + sel_notes, **code_version())
     return dict(results=df, runs=runs_table(runs, chosen, notes), bh=bh, meta=meta)
 
 
@@ -2450,8 +2735,10 @@ def markdown_report(res: dict) -> str:
     dose = (f"eingefroren {_eps_key(meta['frozen_dose'])} ({meta.get('frozen_dose_source')})" if meta["frozen_dose"] is not None
             else "keine auf DEV eingefrorene Dosis vermerkt: alle präregistrierten Dosen berichtet")
     out = [f"# Präregistrierte Auswertung LS-NEQ: {meta['model']}@{meta['revision']}", ""]
+    sha, src_sha = str(meta.get("git_sha") or ""), str(meta.get("prereg_eval_sha256") or "")
     out += [f"Erzeugt {meta['timestamp']} von `python -m lsne.prereg_eval` aus den vorhandenen Laufverzeichnissen "
             "(keine GPU-Stufe neu gerechnet).", "",
+            f"- Code der Auswertung: Git {sha[:7] or 'unbekannt'}, prereg_eval.py SHA-256 {src_sha[:12] or 'unbekannt'}",
             f"- Bestätigungsmenge: Familien {', '.join(meta['families'])} × Formulierungen {', '.join(meta['formulations'])}",
             "- Statistik: Mittel der Familienmittel; 95 %-Perzentilintervall eines Familien-Cluster-Bootstraps "
             f"({meta['n_boot']} Ziehungen, Seed {meta['seed']}); p zweiseitig (einseitig, wo eine Richtung präregistriert ist)",
@@ -2504,22 +2791,84 @@ def markdown_report(res: dict) -> str:
         out += ["", "## Bekannte Einschränkungen (in `deviation_note` jeder Zeile)", ""]
         out += [f"- **{k}**: {_md_cell(CAVEATS[k])}" for k in keys]
     if meta["notes"]:
-        out += ["", "## Hinweise zu den Wurzelverzeichnissen", ""] + [f"- {n}" for n in meta["notes"]]
+        out += ["", "## Hinweise zu den Wurzelverzeichnissen und zur Auswahl der Läufe", ""] + [f"- {n}" for n in meta["notes"]]
     out.append("")
     return "\n".join(out)
 
 
-def write_outputs(res: dict, out_dir) -> dict[str, Path]:
-    """``prereg_results.csv``, ``prereg_results.md``, ``prereg_runs.csv`` and ``prereg_meta.json`` in ``out_dir``."""
+#: The files :func:`write_outputs` writes into ``--out`` (key -> name).
+OUTPUT_FILES = dict(results="prereg_results.csv", markdown="prereg_results.md", runs="prereg_runs.csv",
+                    meta="prereg_meta.json")
+#: Subfolder of ``--out`` that keeps the files of earlier evaluations (``archive/<stamp>/``).
+ARCHIVE_DIR = "archive"
+
+
+def _archive_stamp(d: Path, files: Sequence[Path]) -> str:
+    """Folder name of an earlier evaluation in ``d``: the UTC timestamp of its ``prereg_meta.json``
+    (``2026-10-28T07-07-12Z``; an unparsable one made filename-safe), else the newest
+    modification time of its ``files``."""
+    raw = ""
+    try:
+        raw = str(json.loads((d / OUTPUT_FILES["meta"]).read_text(encoding="utf-8")).get("timestamp") or "")
+    except Exception:  # noqa: BLE001 - no or no readable meta: the files' mtime
+        pass
+    t = _parse_utc(raw) if raw else None
+    if t is None and raw:
+        safe = re.sub(r"[^0-9A-Za-z._+-]+", "-", raw).strip("-.")
+        if safe:
+            return safe
+    if t is None:
+        mtimes = []
+        for p in files:
+            try:
+                mtimes.append(p.stat().st_mtime)
+            except OSError:
+                pass
+        t = (_dt.datetime.fromtimestamp(max(mtimes), _dt.timezone.utc) if mtimes else _dt.datetime.now(_dt.timezone.utc))
+    return t.strftime("%Y-%m-%dT%H-%M-%SZ")
+
+
+def archive_outputs(out_dir) -> Optional[Path]:
+    """Move the files of an earlier evaluation in ``out_dir`` (:data:`OUTPUT_FILES`) into
+    ``<out_dir>/archive/<stamp>/`` (:func:`_archive_stamp`; an existing folder is never reused or
+    overwritten: ``<stamp>_2``, ``<stamp>_3``, ...).  Returns that folder, None when there was
+    nothing to archive."""
+    d = Path(out_dir)
+    old = [d / n for n in OUTPUT_FILES.values() if (d / n).is_file()]
+    if not old:
+        return None
+    stamp = _archive_stamp(d, old)
+    k = 1
+    while True:
+        dest = d / ARCHIVE_DIR / (stamp if k == 1 else f"{stamp}_{k}")
+        try:
+            dest.mkdir(parents=True)
+            break
+        except FileExistsError:
+            k += 1
+    for p in old:
+        shutil.move(str(p), str(dest / p.name))
+    return dest
+
+
+def write_outputs(res: dict, out_dir) -> dict[str, Optional[Path]]:
+    """``prereg_results.csv``, ``prereg_results.md``, ``prereg_runs.csv`` and ``prereg_meta.json``
+    (:data:`OUTPUT_FILES`) in ``out_dir``.  The files of an earlier evaluation there are moved to
+    ``archive/<its timestamp>/`` first (:func:`archive_outputs`), so a report cited elsewhere
+    (the evaluation of 28.10.2026 07:07 UTC in docs/RESULTS_PREREG.md) is never overwritten.
+    Returns the paths by key plus ``archive`` (that folder, None when nothing was archived;
+    ``previous_evaluation_archive`` in ``prereg_meta.json``)."""
     d = Path(out_dir)
     d.mkdir(parents=True, exist_ok=True)
-    paths = dict(results=d / "prereg_results.csv", markdown=d / "prereg_results.md", runs=d / "prereg_runs.csv",
-                 meta=d / "prereg_meta.json")
+    paths: dict[str, Optional[Path]] = {k: d / n for k, n in OUTPUT_FILES.items()}
+    text = markdown_report(res)                       # rendered before anything is moved
+    archive = archive_outputs(d)
     res["results"].to_csv(paths["results"], index=False)
     res["runs"].to_csv(paths["runs"], index=False)
-    paths["markdown"].write_text(markdown_report(res), encoding="utf-8")
-    paths["meta"].write_text(json.dumps(dict(res["meta"], bh=res["bh"]), indent=1, ensure_ascii=False, default=str),
-                             encoding="utf-8")
+    paths["markdown"].write_text(text, encoding="utf-8")
+    meta = dict(res["meta"], bh=res["bh"], previous_evaluation_archive=None if archive is None else str(archive))
+    paths["meta"].write_text(json.dumps(meta, indent=1, ensure_ascii=False, default=str), encoding="utf-8")
+    paths["archive"] = archive
     return paths
 
 
@@ -2564,11 +2913,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 __all__ = [
     "TEST_FAMILIES", "TEST_FORMULATIONS", "DEV_FAMILIES", "PREREG_DOSES", "PRIMARY_K", "PRIMARY_MIN_EFFECT", "N_RAND_PREREG",
     "AUDIT_MAX_REL_ERR", "EVAL_STAGES", "EVAL_KEYS", "ROOT_CHILDREN", "AMENDMENT_611", "CTL_CONTROL", "DAMAGE_CTL_COLS",
-    "token_control_rows", "apply_token_control", "VERDICTS", "RESULT_COLS", "EXTRA_COLS", "RUN_COLS", "CAVEATS", "StageRun",
+    "CTL_AUDIT_IDS", "CTL_RUN_ORDER", "PREREG_EVAL_SHA256", "token_control_rows", "control_audits", "control_audits_for",
+    "control_valid",
+    "select_control_run", "apply_token_control", "VERDICTS", "RESULT_COLS", "EXTRA_COLS", "RUN_COLS", "CAVEATS", "StageRun",
     "resolve_roots", "discover_runs", "select_runs", "runs_table", "read_table", "split_rows", "boot_split", "p_one_sided",
     "SPLIT_TEST_NOTE", "G_SPLIT_TEST_NOTE", "NO_P_NOTE", "MIN_EFFECT_VERDICT", "table_p", "bh_verdict", "S6_TEST_SIGN",
     "family_boot", "family_delta", "min_effect_status", "primary_verdict", "secondary_verdict", "caveat_keys", "caveat_for",
-    "audit_summary", "make_row", "apply_bh", "evaluate", "markdown_report", "write_outputs", "build_parser", "main",
+    "audit_summary", "make_row", "apply_bh", "code_version", "evaluate", "markdown_report", "OUTPUT_FILES", "ARCHIVE_DIR",
+    "archive_outputs", "write_outputs", "build_parser", "main",
 ]
 
 
