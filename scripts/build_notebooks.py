@@ -189,10 +189,14 @@ def setup_cell() -> tuple[str, str]:
             REPO_DIR = str(_local)
             print("Vorhandener Checkout:", REPO_DIR)
         elif pathlib.Path(REPO_DIR, ".git").exists():
-            _sh(f"git -C {REPO_DIR} fetch -q --depth 1 origin {GIT_BRANCH} && "
-                f"git -C {REPO_DIR} checkout -q {GIT_BRANCH} && git -C {REPO_DIR} pull -q --ff-only origin {GIT_BRANCH}")
-        else:
-            _sh(f"git clone -q --depth 1 --branch {GIT_BRANCH} {GIT_URL} {REPO_DIR}")
+            # a reused runtime: move the shallow checkout to the branch tip (a fast-forward pull fails on
+            # depth-1 history and would silently keep the old code)
+            if _sh(f"git -C {REPO_DIR} fetch -q --depth 1 origin {GIT_BRANCH} && "
+                   f"git -C {REPO_DIR} checkout -q -f -B {GIT_BRANCH} FETCH_HEAD") != 0:
+                raise RuntimeError(f"{REPO_DIR} konnte nicht auf den Stand von {GIT_BRANCH} gebracht werden: "
+                                   "Laufzeit -> Sitzung trennen und löschen, dann erneut ausführen")
+        elif _sh(f"git clone -q --depth 1 --branch {GIT_BRANCH} {GIT_URL} {REPO_DIR}") != 0:
+            raise RuntimeError(f"git clone von {GIT_URL} ({GIT_BRANCH}) fehlgeschlagen")
         os.chdir(REPO_DIR)
         if REPO_DIR not in sys.path:
             sys.path.insert(0, REPO_DIR)
@@ -200,6 +204,9 @@ def setup_cell() -> tuple[str, str]:
         if _local is None or importlib.util.find_spec("lsne") is None:
             _sh(f"{sys.executable} -m pip install -q -r requirements.txt")
             _sh(f"{sys.executable} -m pip install -q -e .")
+        # modules imported by an earlier run in this runtime would shadow the updated checkout
+        for _m in [m for m in sys.modules if m == "lsne" or m.startswith("lsne.")]:
+            del sys.modules[_m]
         import lsne
         print("lsne", lsne.__version__, "aus", REPO_DIR, "| Branch", GIT_BRANCH)
         print("Git-SHA:", subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip())
